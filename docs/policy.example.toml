@@ -1,0 +1,27 @@
+# Example policy for computer-use. Copy to ~/.config/computer-use/policy.toml.
+# A missing file allows ordinary apps and still applies the built-in deny list.
+# Leave `default` commented. `default = "deny"` refuses every app that is not allowed.
+
+version = 1
+# default = "allow"
+
+# Install a listen-only event tap and pause mutating actions on real local input.
+# Absent or false does not create a tap. `computer-use resume` clears the pause.
+# pause_on_user_input = true
+
+# [[allow]]
+# bundle_id = "com.apple.Notes"
+
+# [[allow]]
+# bundle_id = "com.apple.Safari"
+# path = "/System/Volumes/Preboot/Cryptexes/App/System/Applications/Safari.app"
+
+# [[deny]]
+# bundle_id = "com.example.Untrusted"
+
+# [confirm]
+# command = "/usr/local/bin/computer-use-confirm"
+# timeout_secs = 30
+
+# [browser]
+# blocked_urls = ["https://accounts.example.com/*", "file://*"]

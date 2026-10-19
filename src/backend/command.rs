@@ -18,13 +18,46 @@ pub(crate) fn run_timeout(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let child = command.spawn().map_err(|error| {
+    let child = spawn_command(program, command)?;
+    wait_child(program, child, timeout)
+}
+
+/// Spawn `program` with `stdin_bytes`, then close stdin. Stdout is discarded.
+pub(crate) fn run_with_stdin(
+    program: &str,
+    args: &[&str],
+    stdin_bytes: &[u8],
+    timeout: Duration,
+) -> Result<Output, String> {
+    use std::io::Write;
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = spawn_command(program, command)?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(stdin_bytes);
+    }
+    wait_child(program, child, timeout)
+}
+
+fn spawn_command(program: &str, mut command: Command) -> Result<std::process::Child, String> {
+    command.spawn().map_err(|error| {
         if error.kind() == ErrorKind::NotFound {
             format!("{program} is not installed or not on PATH")
         } else {
             format!("failed to spawn {program}: {error}")
         }
-    })?;
+    })
+}
+
+fn wait_child(
+    program: &str,
+    child: std::process::Child,
+    timeout: Duration,
+) -> Result<Output, String> {
     let pid = child.id();
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {

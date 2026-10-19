@@ -58,7 +58,7 @@ Versions below were the crates.io maxima checked on 2026-10-18. Re-check once at
 | `dirs` | 6 | P2 | Cache directories. Deferred from P1 because P1 writes no cache files. Unix session paths stay explicit. |
 | `objc2-screen-capture-kit` | 0.3.2 | P4 | `SCShareableContent`, `SCContentFilter`, `SCScreenshotManager`, `SCStreamConfiguration`. |
 | `arboard` | 3.7.0 | P8 | `Clipboard::get_text`, `set_text`, `get_image`, `set_image`. MSRV 1.71. |
-| `toml` | 0.9 | P6 | `policy.toml`. Fall back to 0.8 if 0.9's `from_str` signature moved. |
+| `toml` | 0.8.23 | P6 | `policy.toml`. `Error::span()` names the line. 0.9 was not required. |
 | `chromiumoxide` | 0.9.1 | P10 | Feature `cdp` only. `Browser::connect`, page `goto`, `evaluate`, CSS query. MSRV 1.85. |
 | `tokio` | 1 | P10 | Feature `cdp` and the Linux async backends. Current-thread runtime, `block_on` from the CLI thread only. |
 | `uiautomation` | 0.25.1 | P12 | Features `control`, `pattern`. `UIAutomation`, invoke / value / scroll / text / expand-collapse. |
@@ -394,14 +394,14 @@ timeout_secs = 30
 blocked_urls = ["https://accounts.example.com/*", "file://*"]
 ```
 
-Resolution order: built-in deny, then admin policy, then user policy. Deny wins over allow. Admin policy can only add denies and raise confirmation. It cannot allow an app the built-in list refuses. `default = "deny"` means an app not listed is `policy_denied`. Ship the example file as `docs/policy.example.toml` in P6 with `default = "allow"` commented, so a missing file does not lock the user out. A missing file uses `default = "allow"` plus the built-in deny list.
+Resolution order: built-in deny, then admin policy, then user policy. Deny wins over allow. Admin policy can only add denies and raise confirmation. It cannot allow an app the built-in list refuses. Admin `allow` entries are ignored and do not grant access. `default = "deny"` means a named app that is not listed is `policy_denied`. A desktop screenshot that names no app is not denied by that default. An unscoped mutating action under `default = "deny"` is `policy_denied`. Ship the example file as `docs/policy.example.toml` in P6 with `default = "allow"` commented, so a missing file does not lock the user out. A missing file uses `default = "allow"` plus the built-in deny list. `pause_on_user_input` is false when the key is absent, so the first action does not install a tap. It becomes true when either loaded file sets it. An admin true stays true. The user file cannot turn it off. An explicit `--policy` path that is missing is `invalid_arguments`. `COMPUTER_USE_ADMIN_POLICY` set to a path that is not a file means there is no admin file. A missing admin file is not an error. A present admin file that fails to parse is `policy_denied` and fails closed. A whitespace-only file is `default = "allow"`.
 
 Built-in deny, matched on bundle id and on the canonical executable path:
 
-- Terminals: `com.apple.Terminal`, `com.googlecode.iterm2`, `dev.warp.Warp-Stable`, `org.alacritty`, `net.kovidgoyal.kitty`, `com.mitchellh.ghostty`, `com.github.wez.wezterm`, Windows Terminal, `powershell.exe`, `cmd.exe`, `wt.exe`, `gnome-terminal`, `konsole`, `xterm`, `wezterm`, `kitty`, `alacritty`.
-- Password managers: 1Password, Bitwarden, KeePassXC, Dashlane, Enpass.
+- Terminals: `com.apple.Terminal`, `com.googlecode.iterm2`, `dev.warp.Warp-Stable`, `org.alacritty`, `net.kovidgoyal.kitty`, `com.mitchellh.ghostty`, `com.github.wez.wezterm`, `co.zeit.hyper`, `app.crynta.terax`, Windows Terminal (`Microsoft.WindowsTerminal`), `powershell.exe`, `cmd.exe`, `wt.exe`, `gnome-terminal`, `konsole`, `xterm`, `wezterm`, `kitty`, `alacritty`, Hyper.
+- Password managers: 1Password, Bitwarden, KeePassXC, Dashlane, Enpass, LastPass (`com.lastpass.LastPass`, `com.lastpass.lastpassmacdesktop`), Apple Passwords (`com.apple.Passwords`).
 - `com.apple.keychainaccess`.
-- System Settings (`com.apple.systempreferences`) when the window title or AX identifier contains `Privacy` or `Security`. Other System Settings windows stay reachable unless the user denies the bundle.
+- System Settings (`com.apple.systempreferences` and `com.apple.Settings`) when the window title or AX identifier contains `Privacy` or `Security`. Those bundles are not on the hard-deny list. Other System Settings windows stay reachable unless the user denies the bundle. Activate with no window still succeeds when a privacy window exists.
 
 Identity is the canonical executable path from `NSRunningApplication.executableURL` (macOS), `QueryFullProcessImageName` (Windows), or `/proc/<pid>/exe` (Linux), after symlink resolution. A bundle id match with a path that does not match an `allow.path` is `policy_denied`. Comparison is on the canonical path, not the argv the process was started with.
 
@@ -412,7 +412,7 @@ Stdin is one JSON object: `action`, `app.bundle_id`, `app.path`, `pid`, `window_
 - Confirm: `quit`, `clipboard_set`, click or `AXPress` whose title matches `(?i)\b(delete|erase|pay|purchase|send|submit)\b`, key combos `cmd+q` and `alt+f4`.
 - No hook configured: those confirmed actions return `confirm_required` and do not run.
 
-The hook is `--confirm-cmd`, or `COMPUTER_USE_CONFIRM_CMD`, or `confirm.command` in the policy. The flag wins.
+The hook is `--confirm-cmd`, or `COMPUTER_USE_CONFIRM_CMD`, or `confirm.command` in the policy. The flag wins, then the environment, then the user file, then the admin file. `policy check` returns `allow` or `deny` only. Confirm is action-specific. Quit of an allowed app always confirms, including `--force`. Protected quit (this process, loginwindow, WindowServer) is `policy_denied` before confirm. A key event without `--element` cannot see a secure focused field, so that case is not refused as a secure-field key. `cmd+q` is Command+q. Meta or super+q does not confirm. `clipboard_set` is classified here and implemented in P8. `quit --force` uses `forceTerminate()` on macOS. Linux and Windows still return `unsupported` after a successful confirm.
 
 ### Audit line
 One JSON object per line, append-only:
@@ -424,7 +424,7 @@ One JSON object per line, append-only:
 Never write `text`, `value`, clipboard bytes, or URLs that were blocked. A refusal is audited with the error code.
 
 ### Kill switch
-On the first action of a process, if `pause_on_user_input` is true, install a listen-only `CGEventTap` (`kCGSessionEventTap`, `kCGEventTapOptionListenOnly`) for key and mouse events. Create synthetic events with `CGEventSourceSetUserData(source, 0x00C0_5EC0_0DE1)` and set `kCGEventSourceUserData` (field 43) to the same marker. The tap ignores events carrying that marker. Any other event sets `paused`. Later actions return `paused` until `computer-use resume`. If the tap cannot be created, `doctor` says so and actions still run, with `warnings: ["user-input pause unavailable"]` on each response.
+On the first action of a process, if `pause_on_user_input` is true, install a listen-only `CGEventTap` (`kCGSessionEventTap`, `kCGHeadInsertEventTap`, `kCGEventTapOptionListenOnly`) for key and mouse events. The tap lives in `src/backend/macos/input.rs`. P7 stamps synthetic events with `CGEventSource::set_user_data` and `CGEvent::set_integer_value_field` on `CGEventField::EventSourceUserData` (field 42, constant `0x00C0_5EC0_0DE1`, `policy::SYNTHETIC_EVENT_USER_DATA`). Field 43 is `kCGEventSourceUserID` and is not the marker. The tap ignores events carrying that marker. Any other real user event sets `paused`. The `paused` file next to the audit log is the cross-process source of truth. `computer-use pause` and `resume`, and the JSON actions, set and clear that file. While paused, mutating actions return `paused` after deny, so a denied tree or screenshot stays `policy_denied`. Read-only actions are not pause-blocked. If the tap cannot be created, `doctor` reports `input_monitor: false` and actions still run. The warning `user-input pause unavailable` is added only when `pause_on_user_input` is true and the tap is unavailable. Other platforms use that same warning until P12 and P13. Tests never create a real event tap.
 
 ## Test strategy used by every phase
 - Unit tests call pure functions or `StubBackend`. They do not look at the real desktop. Extend `StubBackend` in the same phase that extends the trait.
@@ -735,9 +735,17 @@ Confirm hook: spawn the command with the JSON document on stdin, `run_timeout` a
 
 Audit every allowed, denied, and failed action. Open the file with append and `O_NOFOLLOW` where the OS supports it.
 
-Kill switch: implement the tap in `src/backend/macos/input.rs` even though the rest of that file lands in P7. The tap is listen-only. `computer-use resume` clears the atomic flag. `computer-use pause` sets it.
+Kill switch: implement the tap in `src/backend/macos/input.rs` even though the rest of that file lands in P7. The tap is listen-only. `computer-use pause` and `resume` write a `paused` file next to the audit log so the flag survives a new process. The in-process atomic is only a cache.
 
-Windows and Linux honor the same TOML. Path matching uses their identity APIs. The tap is macOS-only in this phase. Other platforms set `warnings: ["user-input pause unavailable"]` until P12 and P13.
+Windows and Linux honor the same TOML. Path matching uses their identity APIs. The tap is macOS-only in this phase. Other platforms add `warnings: ["user-input pause unavailable"]` when `pause_on_user_input` is true, until P12 and P13.
+
+`quit` gains `--force` (JSON `force`, default false). macOS calls `terminate()` or `NSRunningApplication::forceTerminate()`.
+
+### Design corrections
+- The marker field is `kCGEventSourceUserData` (42), not field 43. Field 43 is `kCGEventSourceUserID`.
+- `pause_on_user_input` defaults to false. A missing policy must not install a `CGEventTap` on the first action.
+- `com.apple.Settings` uses the same privacy-pane rule as `com.apple.systempreferences`. It is not a hard deny.
+- `toml` 0.8.23 is the dependency because `Error::span()` names the line. 0.9 was unnecessary.
 
 ### CLI
 ```

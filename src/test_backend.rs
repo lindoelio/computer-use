@@ -77,6 +77,8 @@ pub struct StubBackend {
     pub capture_fault: StubCaptureFault,
     /// When true, screenshot reports `display_unavailable` before it resolves a window.
     pub block_display: bool,
+    /// Page URL returned by [`DesktopBackend::browser_url`], keyed by pid.
+    pub browser_urls: Mutex<HashMap<i32, String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -124,6 +126,7 @@ impl Default for StubBackend {
             capture_pixels: None,
             capture_fault: StubCaptureFault::None,
             block_display: false,
+            browser_urls: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -363,7 +366,7 @@ impl DesktopBackend for StubBackend {
         })
     }
 
-    fn quit(&self, app: &str) -> Result<QuitResult, ComputerError> {
+    fn quit(&self, app: &str, _force: bool) -> Result<QuitResult, ComputerError> {
         let (info, _) = self.resolve_running(app, None)?;
         if quit_is_protected(
             info.pid,
@@ -577,6 +580,54 @@ impl DesktopBackend for StubBackend {
             },
         );
         Ok(element::outcome(request, revision, warnings, via))
+    }
+
+    fn browser_url(&self, pid: i32) -> Result<Option<String>, ComputerError> {
+        Ok(self
+            .browser_urls
+            .lock()
+            .expect("browser urls")
+            .get(&pid)
+            .cloned())
+    }
+
+    fn peek_element(
+        &self,
+        app: Option<&str>,
+        window: Option<&str>,
+        session: Option<&str>,
+        index: u32,
+    ) -> Result<Option<element::ElementPeek>, ComputerError> {
+        let query = TreeQuery {
+            app: app.map(str::to_string),
+            window: window.map(str::to_string),
+            full: false,
+            session: session.map(str::to_string),
+        };
+        let Ok((info, window_id, _)) = self.resolve_tree_target(&query) else {
+            return Ok(None);
+        };
+        let key = (
+            query.session.clone().unwrap_or_default(),
+            info.pid,
+            window_id,
+        );
+        let fixtures = self.element_fixtures.lock().expect("fixtures");
+        let Some(fixture) = fixtures.get(&key) else {
+            return Ok(None);
+        };
+        let Some(node) = tree::find_ui(&fixture.ui, index) else {
+            return Ok(None);
+        };
+        let title = node
+            .identifier
+            .clone()
+            .or_else(|| node.title.clone())
+            .or_else(|| node.description.clone());
+        Ok(Some(element::ElementPeek {
+            title,
+            secure: node.secure,
+        }))
     }
 
     fn hit_test(&self, _x: i32, _y: i32) -> Result<Option<HitInfo>, ComputerError> {

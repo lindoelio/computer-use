@@ -39,6 +39,7 @@ pub(crate) fn unsupported(operation: &str) -> ComputerError {
     ))
 }
 
+pub(crate) use command::run_with_stdin;
 pub use input::validate_key;
 
 /// Desktop automation surface used by [`crate::dispatch`].
@@ -117,8 +118,8 @@ pub trait DesktopBackend: Send + Sync {
         Err(unsupported("activate"))
     }
 
-    /// Ask an application to quit. This does not force-terminate.
-    fn quit(&self, _app: &str) -> Result<QuitResult, ComputerError> {
+    /// Ask an application to quit. `force` uses a forced terminate where the OS has one.
+    fn quit(&self, _app: &str, _force: bool) -> Result<QuitResult, ComputerError> {
         Err(unsupported("quit"))
     }
 
@@ -159,6 +160,62 @@ pub trait DesktopBackend: Send + Sync {
     /// The macOS backend overrides it.
     fn display_block(&self) -> Option<ComputerError> {
         None
+    }
+
+    /// Page URL for a browser process. `Ok(None)` when the platform has no URL.
+    ///
+    /// A [`ComputerError::PermissionRequired`] fails closed when a block list
+    /// caused the call. Other platforms return `Ok(None)`.
+    fn browser_url(&self, pid: i32) -> Result<Option<String>, ComputerError> {
+        #[cfg(target_os = "macos")]
+        {
+            macos::browser_url(pid)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = pid;
+            Ok(None)
+        }
+    }
+
+    /// Title and secure bit of a cached element. `Ok(None)` when it is not cached.
+    ///
+    /// The default on macOS reads the session cache. The stub reads its fixture.
+    fn peek_element(
+        &self,
+        app: Option<&str>,
+        window: Option<&str>,
+        session: Option<&str>,
+        index: u32,
+    ) -> Result<Option<crate::element::ElementPeek>, ComputerError> {
+        #[cfg(target_os = "macos")]
+        {
+            macos::peek_element(app, window, session, index)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (app, window, session, index);
+            Ok(None)
+        }
+    }
+
+    /// Install the listen-only user-input tap when this process should pause.
+    ///
+    /// `None` when the tap is installed or was not requested. The warning string
+    /// is `user-input pause unavailable`. Tests never create a real event tap.
+    fn user_input_pause_warning(&self) -> Option<&'static str> {
+        #[cfg(test)]
+        {
+            None
+        }
+        #[cfg(all(not(test), target_os = "macos"))]
+        {
+            macos::input::ensure_installed()
+        }
+        #[cfg(all(not(test), not(target_os = "macos")))]
+        {
+            Some("user-input pause unavailable")
+        }
     }
 
     /// Hit-test a screen point. macOS reports the element under the point.
@@ -287,8 +344,8 @@ macro_rules! impl_platform_backend {
                 $activate(app, window)
             }
 
-            fn quit(&self, app: &str) -> Result<QuitResult, ComputerError> {
-                $quit(app)
+            fn quit(&self, app: &str, force: bool) -> Result<QuitResult, ComputerError> {
+                $quit(app, force)
             }
 
             fn doctor(&self, request: bool) -> Result<DoctorReport, ComputerError> {

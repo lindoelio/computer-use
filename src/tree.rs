@@ -116,6 +116,37 @@ impl UiNode {
     }
 }
 
+/// Preorder lookup. Index 0 is `root`, matching [`render`].
+pub fn find_ui(root: &UiNode, index: u32) -> Option<&UiNode> {
+    let mut cursor = 0u32;
+    fn walk<'a>(node: &'a UiNode, index: u32, cursor: &mut u32) -> Option<&'a UiNode> {
+        if *cursor == index {
+            return Some(node);
+        }
+        *cursor = cursor.saturating_add(1);
+        for child in &node.children {
+            if let Some(found) = walk(child, index, cursor) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    walk(root, index, &mut cursor)
+}
+
+/// Lookup by the index stored when the signature was rendered.
+pub fn find_sig(root: &SigNode, index: u32) -> Option<&SigNode> {
+    if root.index == index {
+        return Some(root);
+    }
+    for child in &root.children {
+        if let Some(found) = find_sig(child, index) {
+            return Some(found);
+        }
+    }
+    None
+}
+
 /// Structural signature stored in the session cache. Values are already redacted.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SigNode {

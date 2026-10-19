@@ -89,7 +89,7 @@ pub(crate) fn activate(_app: &str, _window: Option<&str>) -> Result<LaunchResult
     Err(unsupported("activate"))
 }
 
-pub(crate) fn quit(_app: &str) -> Result<QuitResult, ComputerError> {
+pub(crate) fn quit(_app: &str, _force: bool) -> Result<QuitResult, ComputerError> {
     Err(unsupported("quit"))
 }
 

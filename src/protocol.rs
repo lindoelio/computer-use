@@ -19,6 +19,7 @@ use crate::element::{self, ElementError, ElementOp, ElementOutcome, ElementReque
 use crate::error::{ComputerError, ErrorBody};
 use crate::image_util::{self, encode_base64};
 use crate::keys::parse_key_combo;
+use crate::policy;
 use crate::state::collect_state_for;
 use crate::target::{
     filter_windows_for_pid, parse_app_selector, parse_window_selector, resolve_app, resolve_window,
@@ -188,8 +189,19 @@ pub enum Action {
     Launch,
     /// Activate an application named by the shared `app` field.
     Activate,
-    /// Ask an application to quit. Does not force-terminate.
-    Quit,
+    /// Ask an application to quit. `force` requests a forced terminate.
+    Quit {
+        /// Force-quit when the platform supports it. Still requires confirmation.
+        #[serde(default, skip_serializing_if = "is_false")]
+        force: bool,
+    },
+    /// Report whether policy would allow `app`. Does not perform an action.
+    #[serde(rename = "policy_check")]
+    PolicyCheck,
+    /// Pause mutating actions until `resume`.
+    Pause,
+    /// Clear the pause flag.
+    Resume,
     /// Report accessibility and screen-capture permission.
     Doctor {
         /// Prompt for Accessibility and Screen Recording when true.
@@ -263,6 +275,10 @@ pub struct CallContext {
     pub display: Option<String>,
     /// Fail when the element is outside the window and scroll-into-view cannot run.
     pub require_visible: bool,
+    /// User policy file from `--policy`. Absent uses the default path.
+    pub policy: Option<String>,
+    /// Confirm hook from `--confirm-cmd`. Wins over the environment and the policy file.
+    pub confirm_cmd: Option<String>,
 }
 
 /// A JSON request: an optional `id`, shared flags, and an [`Action`].
@@ -312,6 +328,8 @@ fn take_context(object: &mut Map<String, Value>) -> Result<CallContext, Computer
         adapter: take_stringish(object, "adapter")?,
         display: take_stringish(object, "display")?,
         require_visible: take_bool(object, "require_visible")?,
+        policy: None,
+        confirm_cmd: None,
     })
 }
 
@@ -368,11 +386,33 @@ pub fn handle_request_line(line: &str) -> Response {
     handle_request_line_with(line, None)
 }
 
+/// Options from the CLI that JSON requests do not carry.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LineOptions<'a> {
+    /// Process `--adapter` flag. A request field wins.
+    pub adapter: Option<&'a str>,
+    /// Process `--policy` path.
+    pub policy: Option<&'a str>,
+    /// Process `--confirm-cmd` program.
+    pub confirm_cmd: Option<&'a str>,
+}
+
 /// Decode one JSON line. `cli_adapter` is the process `--adapter` flag.
 ///
 /// A request field `adapter` wins. `native` skips translation. There is no
 /// detection when both are absent.
 pub fn handle_request_line_with(line: &str, cli_adapter: Option<&str>) -> Response {
+    handle_request_line_opts(
+        line,
+        LineOptions {
+            adapter: cli_adapter,
+            ..LineOptions::default()
+        },
+    )
+}
+
+/// Decode one JSON line and apply CLI `--policy` and `--confirm-cmd`.
+pub fn handle_request_line_opts(line: &str, options: LineOptions<'_>) -> Response {
     let value = match serde_json::from_str::<Value>(line) {
         Ok(value) => value,
         Err(error) => {
@@ -380,12 +420,20 @@ pub fn handle_request_line_with(line: &str, cli_adapter: Option<&str>) -> Respon
         }
     };
     let id = value.get("id").cloned();
-    let echo = match effective_adapter(&value, cli_adapter) {
+    let echo = match effective_adapter(&value, options.adapter) {
         Ok(name) => name,
         Err(error) => return Response::from_error(error).with_id(id),
     };
     match build_request(value, echo.as_deref()) {
-        Ok(request) => dispatch_context(request.action, &request.context).with_id(request.id),
+        Ok(mut request) => {
+            if let Some(policy) = options.policy {
+                request.context.policy = Some(policy.to_string());
+            }
+            if let Some(confirm) = options.confirm_cmd {
+                request.context.confirm_cmd = Some(confirm.to_string());
+            }
+            dispatch_context(request.action, &request.context).with_id(request.id)
+        }
         Err(error) => {
             let mut response = Response::from_error(error).with_id(id);
             stamp_adapter_name(&mut response, echo.as_deref());
@@ -493,16 +541,43 @@ enum PostKind {
 }
 
 fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallContext) -> Response {
+    let label = action_label(&action);
     let action = match remap_coordinates(context, action) {
         Ok(action) => action,
-        Err(error) => return Response::from_error(error),
+        Err(error) => {
+            return finish_action(
+                context,
+                label,
+                &policy::Subject::default(),
+                None,
+                Response::from_error(error),
+            )
+        }
     };
+    let prepared = prepare_action(backend, &action, context);
+    if let Some(response) = prepared.stop {
+        return finish_action(
+            context,
+            label,
+            &prepared.subject,
+            prepared.warning.as_deref(),
+            response,
+        );
+    }
     let kind = post_state_kind(&action);
     let response = match action {
         Action::Batch {
             actions,
             stop_on_error,
-        } => return run_batch(backend, context, actions, stop_on_error),
+        } => {
+            return finish_action(
+                context,
+                label,
+                &prepared.subject,
+                prepared.warning.as_deref(),
+                run_batch(backend, context, actions, stop_on_error),
+            )
+        }
         Action::Screenshot {
             output,
             region,
@@ -565,14 +640,546 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
             context.app.as_deref(),
             context.window.as_deref(),
         )),
-        Action::Quit => result_response(quit(backend, context.app.as_deref())),
+        Action::Quit { force } => result_response(quit(backend, context.app.as_deref(), force)),
         Action::Doctor { request } => result_response(doctor(backend, request)),
         Action::CursorPosition => result_response(cursor_position(backend)),
         Action::SessionPrune { dry_run, ttl_secs } => {
             result_response(session_prune(dry_run, ttl_secs))
         }
+        Action::PolicyCheck => {
+            let (response, subject) = policy_check(backend, context);
+            let response = attach_post_state(backend, context, kind, response);
+            return finish_action(
+                context,
+                label,
+                &subject,
+                prepared.warning.as_deref(),
+                response,
+            );
+        }
+        Action::Pause => pause_response(true),
+        Action::Resume => pause_response(false),
     };
-    attach_post_state(backend, context, kind, response)
+    let response = attach_post_state(backend, context, kind, response);
+    finish_action(
+        context,
+        label,
+        &prepared.subject,
+        prepared.warning.as_deref(),
+        response,
+    )
+}
+
+fn finish_action(
+    context: &CallContext,
+    label: &str,
+    subject: &policy::Subject,
+    warning: Option<&str>,
+    mut response: Response,
+) -> Response {
+    if let Some(warning) = warning {
+        push_warning(&mut response, warning);
+    }
+    let code = if response.ok {
+        "ok"
+    } else {
+        response
+            .error
+            .as_ref()
+            .map(|error| error.code.as_str())
+            .unwrap_or("execution_failed")
+    };
+    let tier = response
+        .fields
+        .get("tier")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    let session = context
+        .session
+        .clone()
+        .unwrap_or_else(|| std::process::id().to_string());
+    if let Err(error) = crate::audit::record(&crate::audit::AuditRecord {
+        session: &session,
+        action: label,
+        bundle_id: subject.bundle_id.as_deref(),
+        pid: subject.pid,
+        window_id: subject.window_id,
+        element: context.element,
+        code,
+        tier: tier.as_deref(),
+    }) {
+        push_warning(
+            &mut response,
+            &format!("audit log was not written: {error}"),
+        );
+    }
+    response
+}
+
+fn push_warning(response: &mut Response, warning: &str) {
+    let warnings = response
+        .fields
+        .entry("warnings")
+        .or_insert_with(|| json!([]));
+    if let Some(items) = warnings.as_array_mut() {
+        items.push(json!(warning));
+    }
+}
+
+fn action_label(action: &Action) -> &'static str {
+    match action {
+        Action::Screenshot { .. } => "screenshot",
+        Action::Click { .. } => "click",
+        Action::DoubleClick { .. } => "double_click",
+        Action::Press { .. } => "press",
+        Action::Focus => "focus",
+        Action::SetValue { .. } => "set_value",
+        Action::SelectText { .. } => "select_text",
+        Action::PerformAction { .. } => "perform_action",
+        Action::ScrollTo => "scroll_to",
+        Action::Move { .. } => "move",
+        Action::Type { .. } => "type",
+        Action::Key { .. } => "key",
+        Action::Scroll { .. } => "scroll",
+        Action::GetState => "get_state",
+        Action::Wait { .. } => "wait",
+        Action::Displays => "displays",
+        Action::ListApps { .. } => "list_apps",
+        Action::ListWindows => "list_windows",
+        Action::Launch => "launch",
+        Action::Activate => "activate",
+        Action::Quit { .. } => "quit",
+        Action::Doctor { .. } => "doctor",
+        Action::Tree => "tree",
+        Action::SessionEnd => "session_end",
+        Action::CursorPosition => "cursor_position",
+        Action::Batch { .. } => "batch",
+        Action::SessionPrune { .. } => "session_prune",
+        Action::PolicyCheck => "policy_check",
+        Action::Pause => "pause",
+        Action::Resume => "resume",
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PolicyClass {
+    Always,
+    Benign,
+    Observe,
+    Mutate,
+    Quit,
+    Key,
+}
+
+fn policy_class(action: &Action) -> PolicyClass {
+    match action {
+        Action::Wait { .. }
+        | Action::Doctor { .. }
+        | Action::Displays
+        | Action::ListApps { .. }
+        | Action::ListWindows
+        | Action::Pause
+        | Action::Resume => PolicyClass::Always,
+        Action::SessionEnd | Action::SessionPrune { .. } | Action::CursorPosition => {
+            PolicyClass::Benign
+        }
+        Action::Screenshot { .. } | Action::Tree | Action::GetState | Action::PolicyCheck => {
+            PolicyClass::Observe
+        }
+        Action::Quit { .. } => PolicyClass::Quit,
+        Action::Key { .. } => PolicyClass::Key,
+        _ => PolicyClass::Mutate,
+    }
+}
+
+struct Prepared {
+    stop: Option<Response>,
+    warning: Option<String>,
+    subject: policy::Subject,
+}
+
+fn prepare_action(
+    backend: &dyn DesktopBackend,
+    action: &Action,
+    context: &CallContext,
+) -> Prepared {
+    let class = policy_class(action);
+    let loaded = match policy::load_policy(context.policy.as_deref().map(Path::new)) {
+        Ok(policy) => policy,
+        Err(error) => {
+            if matches!(class, PolicyClass::Always) {
+                policy::LoadedPolicy::default()
+            } else {
+                return Prepared {
+                    stop: Some(Response::from_error(error)),
+                    warning: None,
+                    subject: policy::Subject::default(),
+                };
+            }
+        }
+    };
+    let warning = if loaded.pause_on_user_input {
+        backend.user_input_pause_warning().map(str::to_string)
+    } else {
+        None
+    };
+    if matches!(action, Action::Pause | Action::Resume | Action::PolicyCheck) {
+        return Prepared {
+            stop: None,
+            warning,
+            subject: policy::Subject::default(),
+        };
+    }
+    let subject = match resolve_subject(backend, action, context) {
+        Ok(subject) => subject,
+        Err(error) => {
+            return Prepared {
+                stop: Some(Response::from_error(error)),
+                warning,
+                subject: policy::Subject::default(),
+            }
+        }
+    };
+    let policy_action = match action {
+        Action::Quit { .. } => policy::PolicyAction::Quit,
+        Action::Key { keys } => policy::PolicyAction::Key {
+            combo: keys.clone(),
+        },
+        Action::Screenshot { .. } | Action::Tree | Action::GetState => {
+            policy::PolicyAction::Observe
+        }
+        _ => match class {
+            PolicyClass::Always => policy::PolicyAction::Always,
+            PolicyClass::Benign => policy::PolicyAction::Benign,
+            PolicyClass::Mutate => policy::PolicyAction::Mutate,
+            PolicyClass::Observe => policy::PolicyAction::Observe,
+            PolicyClass::Quit => policy::PolicyAction::Quit,
+            PolicyClass::Key => policy::PolicyAction::Key {
+                combo: String::new(),
+            },
+        },
+    };
+    let decision = policy::decide(&loaded, &subject, &policy_action);
+    if let policy::Decision::Deny { message, .. } = decision {
+        return Prepared {
+            stop: Some(Response::from_error(ComputerError::PolicyDenied(message))),
+            warning,
+            subject,
+        };
+    }
+    if let Err(error) = refuse_blocked_url(backend, &loaded, &subject) {
+        return Prepared {
+            stop: Some(Response::from_error(error)),
+            warning,
+            subject,
+        };
+    }
+    let mutating = matches!(
+        class,
+        PolicyClass::Mutate | PolicyClass::Quit | PolicyClass::Key
+    );
+    if mutating && policy::is_paused() {
+        return Prepared {
+            stop: Some(Response::from_error(ComputerError::Paused(
+                "local input paused mutating actions; run computer-use resume".into(),
+            ))),
+            warning,
+            subject,
+        };
+    }
+    if let Action::Key { .. } = action {
+        if let Some(index) = context.element {
+            if let Ok(Some(peek)) = backend.peek_element(
+                context.app.as_deref(),
+                context.window.as_deref(),
+                context.session.as_deref(),
+                index,
+            ) {
+                if peek.secure {
+                    return Prepared {
+                        stop: Some(Response::from_error(ComputerError::PolicyDenied(
+                            "refusing a key event aimed at a secure field".into(),
+                        ))),
+                        warning,
+                        subject,
+                    };
+                }
+            }
+        }
+    }
+    if let policy::Decision::Confirm { reason } = decision {
+        if let Err(error) =
+            confirm_action(context, &loaded, &subject, action_label(action), &reason)
+        {
+            return Prepared {
+                stop: Some(Response::from_error(error)),
+                warning,
+                subject,
+            };
+        }
+    }
+    Prepared {
+        stop: None,
+        warning,
+        subject,
+    }
+}
+
+fn confirm_action(
+    context: &CallContext,
+    loaded: &policy::LoadedPolicy,
+    subject: &policy::Subject,
+    action: &str,
+    reason: &str,
+) -> Result<(), ComputerError> {
+    let command = policy::confirm_program(loaded, context.confirm_cmd.as_deref());
+    policy::run_confirm(
+        command.as_deref(),
+        loaded.timeout_secs(),
+        &policy::ConfirmDocument {
+            action,
+            bundle_id: subject.bundle_id.as_deref(),
+            path: subject.path.as_deref(),
+            pid: subject.pid,
+            window_id: subject.window_id,
+            element: context.element,
+            reason,
+        },
+    )
+}
+
+fn refuse_blocked_url(
+    backend: &dyn DesktopBackend,
+    loaded: &policy::LoadedPolicy,
+    subject: &policy::Subject,
+) -> Result<(), ComputerError> {
+    if loaded.blocked_urls().is_empty() {
+        return Ok(());
+    }
+    if !policy::is_browser(
+        subject.bundle_id.as_deref(),
+        subject.path.as_deref().map(Path::new),
+        subject.name.as_deref(),
+    ) {
+        return Ok(());
+    }
+    let from_title = subject
+        .window_title
+        .as_deref()
+        .and_then(policy::url_in_text)
+        .map(str::to_string);
+    let url = if let Some(url) = from_title {
+        Some(url)
+    } else if let Some(pid) = subject.pid {
+        backend.browser_url(pid)?
+    } else {
+        None
+    };
+    if let Some(url) = url.as_deref() {
+        if let Some(pattern) = policy::url_blocked(url, loaded.blocked_urls()) {
+            return Err(ComputerError::BlockedUrl(format!("matched {pattern}")));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_subject(
+    backend: &dyn DesktopBackend,
+    action: &Action,
+    context: &CallContext,
+) -> Result<policy::Subject, ComputerError> {
+    let class = policy_class(action);
+    if matches!(class, PolicyClass::Always | PolicyClass::Benign) {
+        return Ok(policy::Subject::default());
+    }
+    let screenshot = matches!(action, Action::Screenshot { .. });
+    let frontmost_observe =
+        matches!(action, Action::Tree | Action::GetState) && context.app.is_none();
+    let app_text = context.app.clone().or_else(|| {
+        if frontmost_observe {
+            backend.frontmost().app
+        } else {
+            None
+        }
+    });
+    if app_text.is_none() && context.window.is_none() {
+        return Ok(policy::Subject::default());
+    }
+    if app_text.is_none() && screenshot {
+        return subject_from_window(backend, context);
+    }
+    let Some(app_text) = app_text else {
+        return Ok(policy::Subject::default());
+    };
+    let selector = parse_app_selector(&app_text)?;
+    let fallback = subject_from_selector(&selector);
+    let apps = match backend.list_apps(true) {
+        Ok(apps) => apps,
+        Err(error) => {
+            if policy::selector_denial(&selector).is_some() || matches!(action, Action::Launch) {
+                return Ok(fallback);
+            }
+            return Err(error);
+        }
+    };
+    let info = match resolve_app(&apps, &selector) {
+        Ok(info) => info.clone(),
+        Err(error) => {
+            if policy::selector_denial(&selector).is_some() || matches!(action, Action::Launch) {
+                return Ok(fallback);
+            }
+            // An implicit frontmost name that is not running is not a target.
+            // The backend resolves the key window itself.
+            if context.app.is_none() {
+                return Ok(policy::Subject::default());
+            }
+            return Err(error);
+        }
+    };
+    let mut subject = policy::Subject {
+        name: Some(info.name.clone()),
+        bundle_id: info.bundle_id.clone(),
+        path: info.path.clone(),
+        pid: Some(info.pid),
+        window_id: None,
+        window_title: None,
+        ax_identifier: None,
+    };
+    let want_window = context.window.is_some()
+        || matches!(
+            action,
+            Action::Tree | Action::GetState | Action::Screenshot { .. }
+        );
+    if want_window {
+        if let Ok(listed) = backend.list_windows() {
+            let owned = filter_windows_for_pid(&listed.windows, info.pid);
+            let chosen = match context.window.as_deref() {
+                Some(window) => {
+                    let selector = parse_window_selector(window)?;
+                    Some(resolve_window(&owned, &selector)?.clone())
+                }
+                None => owned.first().cloned(),
+            };
+            if let Some(window) = chosen {
+                subject.window_id = Some(window.id);
+                if context.window.is_some()
+                    || matches!(
+                        action,
+                        Action::Tree | Action::GetState | Action::Screenshot { .. }
+                    )
+                {
+                    subject.window_title = Some(window.title);
+                }
+            }
+        }
+    }
+    Ok(subject)
+}
+
+fn subject_from_window(
+    backend: &dyn DesktopBackend,
+    context: &CallContext,
+) -> Result<policy::Subject, ComputerError> {
+    let Some(window) = context.window.as_deref() else {
+        return Ok(policy::Subject::default());
+    };
+    let listed = backend.list_windows()?;
+    let selector = parse_window_selector(window)?;
+    let window = resolve_window(&listed.windows, &selector)?.clone();
+    let apps = backend.list_apps(true)?;
+    let info = apps.into_iter().find(|app| app.pid == window.pid);
+    Ok(policy::Subject {
+        name: info
+            .as_ref()
+            .map(|app| app.name.clone())
+            .or(Some(window.app.clone())),
+        bundle_id: info.as_ref().and_then(|app| app.bundle_id.clone()),
+        path: info.and_then(|app| app.path),
+        pid: Some(window.pid),
+        window_id: Some(window.id),
+        window_title: Some(window.title),
+        ax_identifier: None,
+    })
+}
+
+fn subject_from_selector(selector: &crate::target::AppSelector) -> policy::Subject {
+    use crate::target::AppSelector;
+    match selector {
+        AppSelector::BundleId(bundle) => policy::Subject {
+            bundle_id: Some(bundle.clone()),
+            ..policy::Subject::default()
+        },
+        AppSelector::Name(name) => policy::Subject {
+            name: Some(name.clone()),
+            ..policy::Subject::default()
+        },
+        AppSelector::Path(path) => policy::Subject {
+            path: Some(path.display().to_string()),
+            ..policy::Subject::default()
+        },
+        AppSelector::Pid(pid) => policy::Subject {
+            pid: Some(*pid),
+            ..policy::Subject::default()
+        },
+    }
+}
+
+fn policy_check(
+    backend: &dyn DesktopBackend,
+    context: &CallContext,
+) -> (Response, policy::Subject) {
+    let Some(app) = context
+        .app
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    else {
+        return (
+            Response::from_error(ComputerError::InvalidArguments("app is required".into())),
+            policy::Subject::default(),
+        );
+    };
+    let loaded = match policy::load_policy(context.policy.as_deref().map(Path::new)) {
+        Ok(policy) => policy,
+        Err(error) => return (Response::from_error(error), policy::Subject::default()),
+    };
+    let selector = match parse_app_selector(app) {
+        Ok(selector) => selector,
+        Err(error) => return (Response::from_error(error), policy::Subject::default()),
+    };
+    let mut subject = subject_from_selector(&selector);
+    if let Ok(apps) = backend.list_apps(true) {
+        if let Ok(info) = resolve_app(&apps, &selector) {
+            subject.name = Some(info.name.clone());
+            subject.bundle_id = info.bundle_id.clone();
+            subject.path = info.path.clone();
+            subject.pid = Some(info.pid);
+        }
+    }
+    let decision = policy::app_verdict(&loaded, &subject);
+    let (name, source) = match decision {
+        policy::Decision::Allow { source } => ("allow", source),
+        policy::Decision::Deny { source, .. } => ("deny", source),
+        policy::Decision::Confirm { .. } => ("allow", "default"),
+    };
+    (
+        Response::success(json!({
+            "decision": name,
+            "source": source,
+            "bundle_id": subject.bundle_id,
+        })),
+        subject,
+    )
+}
+
+fn pause_response(paused: bool) -> Response {
+    match policy::set_paused(paused) {
+        Ok(()) => Response::success(json!({
+            "action": if paused { "pause" } else { "resume" },
+            "paused": paused,
+        })),
+        Err(error) => Response::from_error(error),
+    }
 }
 
 fn result_response(result: Result<Value, ComputerError>) -> Response {
@@ -599,7 +1206,7 @@ fn post_state_kind(action: &Action) -> PostKind {
         | Action::Scroll { .. }
         | Action::Launch
         | Action::Activate
-        | Action::Quit
+        | Action::Quit { .. }
         | Action::Batch { .. } => PostKind::Mutating,
         Action::GetState
         | Action::Wait { .. }
@@ -610,7 +1217,10 @@ fn post_state_kind(action: &Action) -> PostKind {
         | Action::Tree
         | Action::SessionEnd
         | Action::SessionPrune { .. }
-        | Action::CursorPosition => PostKind::ReadOnly,
+        | Action::CursorPosition
+        | Action::PolicyCheck
+        | Action::Pause
+        | Action::Resume => PostKind::ReadOnly,
     }
 }
 
@@ -1220,12 +1830,13 @@ fn click(
             let count: u8 = if double { 2 } else { 1 };
             element_command(backend, context, ElementOp::Press { count })
         }
-        (None, Some(x), Some(y)) => coordinate_click(backend, x, y, button, double),
+        (None, Some(x), Some(y)) => coordinate_click(backend, context, x, y, button, double),
     }
 }
 
 fn coordinate_click(
     backend: &dyn DesktopBackend,
+    context: &CallContext,
     x: i32,
     y: i32,
     button: MouseButton,
@@ -1239,6 +1850,13 @@ fn coordinate_click(
             None
         }
     };
+    if let Some(title) = hit.as_ref().and_then(|hit| hit.title.as_deref()) {
+        if policy::sensitive_title(title) {
+            if let Err(error) = confirm_title(context, "click", "sensitive control title") {
+                return Response::from_error(error);
+            }
+        }
+    }
     if let Err(error) = backend.simulate_click(x, y, button) {
         return Response::from_error(error);
     }
@@ -1283,6 +1901,9 @@ fn element_command(backend: &dyn DesktopBackend, context: &CallContext, op: Elem
     if let Err(error) = precheck(&op) {
         return Response::from_error(error);
     }
+    if let Err(error) = confirm_element_title(backend, context, &op) {
+        return Response::from_error(error);
+    }
     let index = match context.element {
         Some(index) => index,
         None => {
@@ -1303,6 +1924,51 @@ fn element_command(backend: &dyn DesktopBackend, context: &CallContext, op: Elem
         Ok(outcome) => Response::success(outcome_value(&outcome)),
         Err(error) => element_error_response(error),
     }
+}
+
+fn confirm_element_title(
+    backend: &dyn DesktopBackend,
+    context: &CallContext,
+    op: &ElementOp,
+) -> Result<(), ComputerError> {
+    let press = matches!(op, ElementOp::Press { .. })
+        || matches!(op, ElementOp::Perform { name } if name.eq_ignore_ascii_case("AXPress"));
+    if !press {
+        return Ok(());
+    }
+    let Some(index) = context.element else {
+        return Ok(());
+    };
+    let Ok(Some(peek)) = backend.peek_element(
+        context.app.as_deref(),
+        context.window.as_deref(),
+        context.session.as_deref(),
+        index,
+    ) else {
+        return Ok(());
+    };
+    if peek.title.as_deref().is_some_and(policy::sensitive_title) {
+        confirm_title(context, "press", "sensitive control title")?;
+    }
+    Ok(())
+}
+
+fn confirm_title(context: &CallContext, action: &str, reason: &str) -> Result<(), ComputerError> {
+    let loaded = policy::load_policy(context.policy.as_deref().map(Path::new))?;
+    let command = policy::confirm_program(&loaded, context.confirm_cmd.as_deref());
+    policy::run_confirm(
+        command.as_deref(),
+        loaded.timeout_secs(),
+        &policy::ConfirmDocument {
+            action,
+            bundle_id: None,
+            path: None,
+            pid: None,
+            window_id: None,
+            element: context.element,
+            reason,
+        },
+    )
 }
 
 fn precheck(op: &ElementOp) -> Result<(), ComputerError> {
@@ -1588,15 +2254,20 @@ fn activate(
     }))
 }
 
-fn quit(backend: &dyn DesktopBackend, app: Option<&str>) -> Result<Value, ComputerError> {
+fn quit(
+    backend: &dyn DesktopBackend,
+    app: Option<&str>,
+    force: bool,
+) -> Result<Value, ComputerError> {
     let app = require_app(app)?;
-    let result = backend.quit(app)?;
+    let result = backend.quit(app, force)?;
     Ok(json!({
         "action": "quit",
         "name": result.name,
         "bundle_id": result.bundle_id,
         "pid": result.pid,
         "accepted": result.accepted,
+        "force": force,
     }))
 }
 
@@ -2277,14 +2948,14 @@ mod tests {
         assert_eq!(response.to_value()["window_id"], 101);
         assert_eq!(response.to_value()["window_title"], "Welcome");
 
-        let response = dispatch_with_context(&backend, Action::Quit, &ctx("Terminal"));
+        let response =
+            dispatch_with_context(&backend, Action::Quit { force: false }, &ctx("Terminal"));
         assert_eq!(response.to_value()["error"]["code"], "policy_denied");
         assert!(backend.quit.lock().unwrap().is_empty());
 
-        let response = dispatch_with_context(&backend, Action::Quit, &ctx("412"));
-        assert!(response.ok, "{response:?}");
-        assert_eq!(response.to_value()["accepted"], true);
-        assert_eq!(response.to_value()["name"], "Foo \"Bar\"");
+        let response = dispatch_with_context(&backend, Action::Quit { force: false }, &ctx("412"));
+        assert_eq!(response.to_value()["error"]["code"], "confirm_required");
+        assert!(backend.quit.lock().unwrap().is_empty());
 
         let response = dispatch_with(&backend, Action::Launch);
         assert_eq!(response.to_value()["error"]["code"], "invalid_arguments");
@@ -2400,7 +3071,11 @@ mod tests {
             hidden: false,
             activation_policy: crate::target::ActivationPolicy::Regular,
         });
-        let response = dispatch_with_context(&backend, Action::Quit, &ctx(&self_pid.to_string()));
+        let response = dispatch_with_context(
+            &backend,
+            Action::Quit { force: false },
+            &ctx(&self_pid.to_string()),
+        );
         assert_eq!(response.to_value()["error"]["code"], "policy_denied");
     }
 
@@ -2932,5 +3607,144 @@ mod tests {
         });
         assert!(response.ok, "{response:?}");
         assert!(!dir.exists());
+    }
+
+    #[test]
+    fn pause_short_circuits_before_the_stub_clicks() {
+        let backend = StubBackend::default();
+        let _paused = policy::override_paused(true);
+        let response = dispatch_with(
+            &backend,
+            Action::Click {
+                x: Some(1),
+                y: Some(2),
+                button: MouseButton::Left,
+                double: false,
+            },
+        );
+        assert_eq!(response.to_value()["error"]["code"], "paused");
+        assert_eq!(backend.clicks.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.click_attempts.load(Ordering::SeqCst), 0);
+        let waited = dispatch_with(
+            &backend,
+            Action::Wait {
+                ms: Some(0),
+                seconds: None,
+            },
+        );
+        assert!(waited.ok, "{waited:?}");
+    }
+
+    #[test]
+    fn confirm_hook_allows_quit_and_a_failure_does_not() {
+        let backend = StubBackend::default();
+        let dir = std::env::temp_dir().join(format!(
+            "computer-use-hook-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(unix)]
+        let (allow, deny) = {
+            let allow = dir.join("allow.sh");
+            let deny = dir.join("deny.sh");
+            std::fs::write(&allow, "#!/bin/sh\ncat >/dev/null\nexit 0\n").unwrap();
+            std::fs::write(&deny, "#!/bin/sh\ncat >/dev/null\nexit 1\n").unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&allow, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(&deny, std::fs::Permissions::from_mode(0o700)).unwrap();
+            (allow.display().to_string(), deny.display().to_string())
+        };
+        #[cfg(windows)]
+        let (allow, deny) = ("cmd /C exit 0".to_string(), "cmd /C exit 1".to_string());
+        let mut context = ctx("412");
+        context.confirm_cmd = Some(deny);
+        let denied = dispatch_with_context(&backend, Action::Quit { force: false }, &context);
+        assert_eq!(denied.to_value()["error"]["code"], "confirm_denied");
+        assert!(backend.quit.lock().unwrap().is_empty());
+        context.confirm_cmd = Some(allow);
+        let allowed = dispatch_with_context(&backend, Action::Quit { force: false }, &context);
+        assert!(allowed.ok, "{allowed:?}");
+        assert_eq!(backend.quit.lock().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn blocked_url_prevents_the_click() {
+        let mut backend = StubBackend::default();
+        backend.apps.push(crate::target::AppInfo {
+            name: "Safari".into(),
+            bundle_id: Some("com.apple.Safari".into()),
+            pid: 80,
+            path: Some("/Applications/Safari.app/Contents/MacOS/Safari".into()),
+            active: false,
+            hidden: false,
+            activation_policy: crate::target::ActivationPolicy::Regular,
+        });
+        backend
+            .browser_urls
+            .lock()
+            .unwrap()
+            .insert(80, "https://accounts.example.com/login".into());
+        let dir = std::env::temp_dir().join(format!(
+            "computer-use-url-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let policy_path = dir.join("policy.toml");
+        std::fs::write(
+            &policy_path,
+            "version = 1\n[browser]\nblocked_urls = [\"https://accounts.example.com/*\"]\n",
+        )
+        .unwrap();
+        let mut context = ctx("80");
+        context.policy = Some(policy_path.display().to_string());
+        let response = dispatch_with_context(
+            &backend,
+            Action::Click {
+                x: Some(3),
+                y: Some(4),
+                button: MouseButton::Left,
+                double: false,
+            },
+            &context,
+        );
+        assert_eq!(response.to_value()["error"]["code"], "blocked_url");
+        assert!(response.to_value()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("https://accounts.example.com/*"));
+        assert!(!response.to_value()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("login"));
+        assert_eq!(backend.click_attempts.load(Ordering::SeqCst), 0);
+        backend
+            .browser_urls
+            .lock()
+            .unwrap()
+            .insert(80, "https://example.com/".into());
+        let allowed = dispatch_with_context(
+            &backend,
+            Action::Click {
+                x: Some(3),
+                y: Some(4),
+                button: MouseButton::Left,
+                double: false,
+            },
+            &context,
+        );
+        assert!(allowed.ok, "{allowed:?}");
+        assert_eq!(backend.clicks.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

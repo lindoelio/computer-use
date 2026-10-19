@@ -9,8 +9,10 @@ mod apps;
 mod ax;
 mod capture;
 mod doctor;
+pub(crate) mod input;
 
 pub(crate) use apps::{activate, launch, list_apps, list_windows, quit};
+pub(crate) use ax::{browser_url, peek_element};
 pub(crate) use capture::session_display_block;
 pub(crate) use doctor::doctor;
 

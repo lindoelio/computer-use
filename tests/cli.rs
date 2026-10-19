@@ -26,8 +26,47 @@ fn cache_home() -> &'static str {
 
 fn command(args: &[&str]) -> Command {
     let mut command = Command::new(bin());
-    command.args(args).env("XDG_CACHE_HOME", cache_home());
     command
+        .args(args)
+        .env("XDG_CACHE_HOME", cache_home())
+        .env("XDG_CONFIG_HOME", config_home())
+        .env("XDG_STATE_HOME", state_home())
+        .env("COMPUTER_USE_ADMIN_POLICY", missing_admin())
+        .env_remove("COMPUTER_USE_CONFIRM_CMD");
+    command
+}
+
+fn config_home() -> &'static str {
+    static DIR: OnceLock<String> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir =
+            std::env::temp_dir().join(format!("computer-use-cli-config-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp config dir");
+        dir.to_string_lossy().into_owned()
+    })
+    .as_str()
+}
+
+fn state_home() -> &'static str {
+    static DIR: OnceLock<String> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir =
+            std::env::temp_dir().join(format!("computer-use-cli-state-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp state dir");
+        dir.to_string_lossy().into_owned()
+    })
+    .as_str()
+}
+
+fn missing_admin() -> &'static str {
+    static PATH: OnceLock<String> = OnceLock::new();
+    PATH.get_or_init(|| {
+        std::env::temp_dir()
+            .join(format!("computer-use-cli-no-admin-{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned()
+    })
+    .as_str()
 }
 
 fn run(args: &[&str]) -> std::process::Output {
@@ -294,6 +333,52 @@ fn assert_json_wait(args: &[&str]) {
     assert_eq!(value["ok"], true);
     assert_eq!(value["id"], 1);
     assert_eq!(value["waited_ms"], 1);
+}
+
+#[test]
+fn policy_check_reports_builtin_and_user_deny() {
+    let output = run(&["policy", "check", "--app", "com.apple.Terminal"]);
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
+        panic!(
+            "stdout: {} stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    assert_eq!(value["ok"], true, "{value}");
+    assert_eq!(value["decision"], "deny");
+    assert_eq!(value["source"], "builtin");
+    assert_eq!(value["bundle_id"], "com.apple.Terminal");
+
+    let dir = std::env::temp_dir().join(format!("computer-use-cli-policy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let policy = dir.join("policy.toml");
+    std::fs::write(
+        &policy,
+        "version = 1\n[[deny]]\nbundle_id = \"com.example.Blocked\"\n",
+    )
+    .unwrap();
+    let output = command(&[
+        "--policy",
+        policy.to_str().expect("utf-8"),
+        "policy",
+        "check",
+        "--app",
+        "com.example.Blocked",
+    ])
+    .output()
+    .unwrap();
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["decision"], "deny", "{value}");
+    assert_eq!(value["source"], "user");
+
+    let audit = std::path::Path::new(state_home())
+        .join("computer-use")
+        .join("audit.jsonl");
+    let text = std::fs::read_to_string(&audit).unwrap_or_default();
+    assert!(text.contains("\"action\":\"policy_check\""), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

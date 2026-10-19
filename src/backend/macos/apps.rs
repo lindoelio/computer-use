@@ -149,7 +149,7 @@ pub(crate) fn activate(app: &str, window: Option<&str>) -> Result<LaunchResult, 
     })
 }
 
-pub(crate) fn quit(app: &str) -> Result<QuitResult, ComputerError> {
+pub(crate) fn quit(app: &str, force: bool) -> Result<QuitResult, ComputerError> {
     let (info, _) = resolve_running(app, None)?;
     if quit_is_protected(
         info.pid,
@@ -163,7 +163,11 @@ pub(crate) fn quit(app: &str) -> Result<QuitResult, ComputerError> {
         ));
     }
     let running = running_app(info.pid)?;
-    let accepted = running.terminate();
+    let accepted = if force {
+        running.forceTerminate()
+    } else {
+        running.terminate()
+    };
     if !accepted {
         return Err(ComputerError::ExecutionFailed(format!(
             "quit was not accepted for {} (pid {})",

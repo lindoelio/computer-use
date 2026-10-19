@@ -251,6 +251,15 @@ impl From<ComputerError> for ElementError {
     }
 }
 
+/// Cached title and secure bit used by the confirm hook before an element action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElementPeek {
+    /// Title, identifier, or description. Empty when the node has none.
+    pub title: Option<String>,
+    /// `AXSecureTextField` or a secure subrole.
+    pub secure: bool,
+}
+
 /// Role and title of the element under a coordinate, when hit-testing finds one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HitInfo {

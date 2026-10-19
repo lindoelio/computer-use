@@ -209,7 +209,7 @@ pub struct DoctorReport {
     pub accessibility: Option<bool>,
     /// Screen capture trust. Null until the platform probe exists.
     pub screen_capture: Option<bool>,
-    /// Input monitor / event tap. Null until P6.
+    /// Input monitor / event tap. Null when this process has not tried to install one.
     pub input_monitor: Option<bool>,
     /// Parent GUI app that must be toggled in Settings, when it could be found.
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -11,9 +11,9 @@ use std::process::ExitCode;
 
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use computer_use::protocol::{handle_request_line_opts, LineOptions};
 use computer_use::{
-    handle_request_line_with, parse_region, Action, CallContext, ImageFormat, MouseButton,
-    Response, ScrollDirection,
+    parse_region, Action, CallContext, ImageFormat, MouseButton, Response, ScrollDirection,
 };
 
 /// Cross-platform desktop automation for agents.
@@ -81,6 +81,14 @@ struct Cli {
     #[arg(long, global = true, value_name = "native|openai|anthropic")]
     adapter: Option<String>,
 
+    /// User policy file. Absent uses `~/.config/computer-use/policy.toml`.
+    #[arg(long, global = true, value_name = "PATH")]
+    policy: Option<PathBuf>,
+
+    /// Program that confirms a sensitive action. Its stdin receives one JSON object.
+    #[arg(long, global = true, value_name = "COMMAND")]
+    confirm_cmd: Option<String>,
+
     #[command(subcommand)]
     command: Option<CliCommand>,
 }
@@ -103,6 +111,12 @@ enum SessionCommand {
         #[arg(long, default_value_t = 86_400)]
         ttl: u64,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum PolicyCommand {
+    /// Report allow or deny for `--app`.
+    Check,
 }
 
 #[derive(Debug, Subcommand)]
@@ -346,12 +360,32 @@ enum CliCommand {
     /// Example: computer-use activate --app Notes --window 0
     Activate,
 
-    /// Ask an application to quit. This does not force-terminate.
+    /// Ask an application to quit.
     ///
     /// Requires `--app`. loginwindow, WindowServer, and this process are refused.
+    /// Allowed apps need a confirm hook. `--force` asks the OS to force-terminate
+    /// after that hook exits 0.
     ///
     /// Example: computer-use quit --app Notes
-    Quit,
+    Quit {
+        /// Force-quit after the confirm hook allows it.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Show whether policy allows an app. This does not perform an action.
+    ///
+    /// Example: computer-use policy check --app Terminal
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommand,
+    },
+
+    /// Pause mutating actions until `resume`.
+    Pause,
+
+    /// Clear the pause flag.
+    Resume,
 
     /// Report Accessibility and Screen Recording permission.
     ///
@@ -477,12 +511,12 @@ fn run() -> u8 {
 
     match (&cli.command, cli.json) {
         (Some(CliCommand::Exec { json }), _) => {
-            let response = handle_request_line_with(json, cli.adapter.as_deref());
+            let response = handle_request_line_opts(json, line_options(&cli));
             let code = u8::from(!response.ok);
             emit(&response, cli.pretty);
             code
         }
-        (Some(CliCommand::Serve), _) | (None, true) => serve(cli.adapter.as_deref()),
+        (Some(CliCommand::Serve), _) | (None, true) => serve(&cli),
         (Some(_), true) => {
             emit(
                 &Response::failure(
@@ -515,6 +549,8 @@ fn run() -> u8 {
                 return_state: cli.state,
                 include_screenshot: cli.include_screenshot,
                 coord: cli.coord.clone(),
+                policy: cli.policy.as_ref().map(|path| path.display().to_string()),
+                confirm_cmd: cli.confirm_cmd.clone(),
                 ..CallContext::default()
             };
             match command_action(command, context) {
@@ -640,7 +676,7 @@ fn command_action(
             }
             Action::Activate
         }
-        CliCommand::Quit => {
+        CliCommand::Quit { force } => {
             if context
                 .app
                 .as_deref()
@@ -651,8 +687,25 @@ fn command_action(
                     "quit requires --app",
                 ));
             }
-            Action::Quit
+            Action::Quit { force: *force }
         }
+        CliCommand::Policy { command } => match command {
+            PolicyCommand::Check => {
+                if context
+                    .app
+                    .as_deref()
+                    .is_none_or(|app| app.trim().is_empty())
+                {
+                    return Err(Response::failure(
+                        "invalid_arguments",
+                        "policy check requires --app",
+                    ));
+                }
+                Action::PolicyCheck
+            }
+        },
+        CliCommand::Pause => Action::Pause,
+        CliCommand::Resume => Action::Resume,
         CliCommand::Doctor { request } => Action::Doctor { request: *request },
         CliCommand::Tree => Action::Tree,
         CliCommand::Session { command } => match command {
@@ -693,7 +746,15 @@ fn reject_non_native_adapter(adapter: Option<&str>) -> Option<Response> {
     }
 }
 
-fn serve(cli_adapter: Option<&str>) -> u8 {
+fn line_options(cli: &Cli) -> LineOptions<'_> {
+    LineOptions {
+        adapter: cli.adapter.as_deref(),
+        policy: cli.policy.as_ref().and_then(|path| path.to_str()),
+        confirm_cmd: cli.confirm_cmd.as_deref(),
+    }
+}
+
+fn serve(cli: &Cli) -> u8 {
     let stdin = io::stdin();
     let mut lines = stdin.lock().lines();
     let stdout = io::stdout();
@@ -712,7 +773,7 @@ fn serve(cli_adapter: Option<&str>) -> u8 {
         if line.trim().is_empty() {
             continue;
         }
-        let response = handle_request_line_with(&line, cli_adapter);
+        let response = handle_request_line_opts(&line, line_options(cli));
         if write!(out, "{}", response.to_json_line(false)).is_err() || out.flush().is_err() {
             return 1;
         }

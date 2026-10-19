@@ -19,6 +19,7 @@
 #![deny(unsafe_code)]
 
 pub mod adapters;
+pub mod audit;
 pub mod backend;
 pub mod cache;
 pub mod element;

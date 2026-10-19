@@ -40,7 +40,14 @@ pub(crate) fn doctor(request: bool) -> Result<DoctorReport, ComputerError> {
             "System Settings → Privacy & Security → Screen Recording → enable {subject}"
         ));
     }
+    let input_monitor = super::input::status();
     let mut notes = Vec::new();
+    if input_monitor == Some(false) {
+        notes.push("user-input pause unavailable".to_string());
+        fixes.push(format!(
+            "System Settings → Privacy & Security → Input Monitoring → enable {subject}"
+        ));
+    }
     if request {
         notes.push(
             "the Accessibility prompt is asynchronous and does not change this result".to_string(),
@@ -55,7 +62,7 @@ pub(crate) fn doctor(request: bool) -> Result<DoctorReport, ComputerError> {
     Ok(DoctorReport {
         accessibility: Some(accessibility),
         screen_capture: Some(screen_capture),
-        input_monitor: None,
+        input_monitor,
         responsible_app: responsible,
         fixes,
         note: if notes.is_empty() {

@@ -1220,6 +1220,85 @@ fn trusted() -> bool {
     unsafe { AXIsProcessTrusted() }
 }
 
+/// `AXURL` of the main browser window, or a URL in that window's title.
+pub(crate) fn browser_url(pid: i32) -> Result<Option<String>, ComputerError> {
+    if !trusted() {
+        return Err(ComputerError::PermissionRequired(permission_subject()));
+    }
+    let app = application(pid).map_err(|error| error.into_computer())?;
+    ignore_timeout(&app);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let windows = match copy_windows(&app, deadline) {
+        Ok(windows) => windows,
+        Err(_) => return Ok(None),
+    };
+    let Some(window) = windows
+        .iter()
+        .find(|window| window.main)
+        .or_else(|| windows.first())
+    else {
+        return Ok(None);
+    };
+    if let Ok(Some(url)) = copy_string(&window.element, "AXURL") {
+        if policy::url_in_text(&url).is_some() || url.contains("://") {
+            return Ok(Some(url));
+        }
+    }
+    Ok(policy::url_in_text(&window.title).map(str::to_string))
+}
+
+/// Title and secure bit from the session cache. Does not walk a live tree.
+pub(crate) fn peek_element(
+    app: Option<&str>,
+    window: Option<&str>,
+    session: Option<&str>,
+    index: u32,
+) -> Result<Option<element::ElementPeek>, ComputerError> {
+    let query = TreeQuery {
+        app: app.map(str::to_string),
+        window: window.map(str::to_string),
+        full: false,
+        session: session.map(str::to_string),
+    };
+    let Ok(resolved) = resolve_target(&query) else {
+        return Ok(None);
+    };
+    let Ok(windows) = apps::on_screen_windows() else {
+        return Ok(None);
+    };
+    let owned = filter_windows_for_pid(&windows, resolved.pid);
+    let window_id = if let Some(selector) = window {
+        let Ok(parsed) = parse_window_selector(selector) else {
+            return Ok(None);
+        };
+        let Ok(chosen) = resolve_window(&owned, &parsed) else {
+            return Ok(None);
+        };
+        chosen.id
+    } else if let Some(front) = owned.first() {
+        front.id
+    } else {
+        return Ok(None);
+    };
+    let Ok(Some(snapshot)) = cache::load(
+        session,
+        resolved.bundle_id.as_deref(),
+        resolved.pid,
+        window_id,
+    ) else {
+        return Ok(None);
+    };
+    let root = snapshot.observed.as_ref().unwrap_or(&snapshot.root);
+    let Some(node) = tree::find_sig(root, index) else {
+        return Ok(None);
+    };
+    let title = (!node.identity.is_empty()).then(|| node.identity.clone());
+    Ok(Some(element::ElementPeek {
+        title,
+        secure: node.secure,
+    }))
+}
+
 /// Frames of sheets or modals attached to the window that matches `bounds`.
 ///
 /// An empty list means Accessibility is off, the window was not joined, or no
