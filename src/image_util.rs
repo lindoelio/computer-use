@@ -22,6 +22,9 @@ const IMAGE_TO_SCREEN: &str = "screen = origin + (image - pad) * logical_size / 
 const SCREEN_TO_IMAGE: &str = "image = pad + (screen - origin) * image_content_size / logical_size";
 
 /// How a ScreenCaptureKit failure should be treated. Pure; no system call.
+///
+/// Compiled on macOS and in tests. Other platforms do not call it.
+#[cfg(any(test, target_os = "macos"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CaptureFault {
     /// Screen Recording permission or a TCC denial.
@@ -33,6 +36,7 @@ pub(crate) enum CaptureFault {
 }
 
 /// Classify a fake or real ScreenCaptureKit error without calling the framework.
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) fn classify_sck_error(domain: &str, code: i64, message: &str) -> CaptureFault {
     let domain = domain.to_ascii_lowercase();
     let message = message.to_ascii_lowercase();
@@ -53,6 +57,7 @@ pub(crate) fn classify_sck_error(domain: &str, code: i64, message: &str) -> Capt
 }
 
 /// True when neither shareable-content query contained the CG window id.
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) fn window_absent(on_screen_found: bool, off_screen_found: bool) -> bool {
     !on_screen_found && !off_screen_found
 }
@@ -127,6 +132,7 @@ pub struct PreparedShot {
 }
 
 /// One window or sheet placed into a union image.
+#[cfg(any(test, target_os = "macos"))]
 #[derive(Debug, Clone)]
 pub(crate) struct Layer {
     /// Captured pixels.
@@ -142,6 +148,7 @@ pub(crate) struct Layer {
 }
 
 /// Union of composited layers.
+#[cfg(any(test, target_os = "macos"))]
 #[derive(Debug, Clone)]
 pub(crate) struct Composite {
     /// Sheet drawn above the parent.
@@ -327,6 +334,7 @@ pub fn screen_to_image(map: &ScreenshotMap, screen_x: f64, screen_y: f64) -> (f6
 /// Draw `layers` into one image. Later layers paint over earlier ones.
 ///
 /// The pixel grid is the union of the logical rectangles times `scale`.
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) fn composite_layers(layers: &[Layer], scale: f64) -> Result<Composite, ComputerError> {
     if layers.is_empty() {
         return Err(ComputerError::ExecutionFailed(
@@ -413,6 +421,7 @@ fn resize_to(image: &RgbaImage, width: u32, height: u32) -> RgbaImage {
     }
 }
 
+#[cfg(any(test, target_os = "macos"))]
 fn points_to_px(points: u32, scale: f64) -> u32 {
     let value = (f64::from(points) * scale).round();
     if value < 1.0 {
