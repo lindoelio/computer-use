@@ -189,7 +189,10 @@ fn unlock_file(file: &File) -> io::Result<()> {
 #[cfg(windows)]
 fn try_lock_file(file: &File) -> io::Result<bool> {
     use std::os::windows::io::AsRawHandle;
+    // The pid is written at offset 0. Windows locks are mandatory, so the
+    // locked byte sits past that text and a contender can still read the holder.
     let mut overlapped = Overlapped::zero();
+    overlapped.offset = LOCK_BYTE_OFFSET;
     // SAFETY: `file` is open and `overlapped` is a zeroed synchronous OVERLAPPED.
     // LockFileEx with FAIL_IMMEDIATELY returns when the lock is busy.
     let ok = unsafe {
@@ -217,6 +220,7 @@ fn try_lock_file(file: &File) -> io::Result<bool> {
 fn unlock_file(file: &File) -> io::Result<()> {
     use std::os::windows::io::AsRawHandle;
     let mut overlapped = Overlapped::zero();
+    overlapped.offset = LOCK_BYTE_OFFSET;
     // SAFETY: `file` is the handle [`try_lock_file`] locked. The range matches that call.
     let ok = unsafe { UnlockFileEx(file.as_raw_handle(), 0, 1, 0, &mut overlapped) };
     if ok != 0 {
@@ -230,6 +234,8 @@ fn unlock_file(file: &File) -> io::Result<()> {
 const LOCKFILE_EXCLUSIVE_LOCK: u32 = 2;
 #[cfg(windows)]
 const LOCKFILE_FAIL_IMMEDIATELY: u32 = 1;
+#[cfg(windows)]
+const LOCK_BYTE_OFFSET: u32 = 4096;
 
 #[cfg(windows)]
 #[repr(C)]
