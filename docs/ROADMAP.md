@@ -1,5 +1,5 @@
 # computer-use 0.2.0 roadmap
-Status: planning. No application code changes belong to this document.
+Status: P1 is done. Resume from the Progress table.
 Target release: `0.2.0`. The crate stays on `0.1.0` until phase P15.
 Public repo: <https://github.com/lindoelio/computer-use>.
 
@@ -1114,23 +1114,23 @@ The full CI matrix, plus `bash -n scripts/package-macos-app.sh`, plus a dry-run 
 | Agent cursor overlay | Yes | Click-through `NSWindow`, helper process | TODO | P7. |
 | Parallel agents | Yes | Per-session cache, no shared cursor on ax/event tiers | TODO | P7 lock. 0.1.0 has no session and always moves the one cursor. |
 | Does not steal the cursor or the focus | Yes on the background path | Tiers `ax` and `event` | TODO | 0.1.0 steals both, via enigo. |
-| `list_apps` | Yes | `list-apps` with bundle id, pid, path | TODO | P1. `get-state` only reports the frontmost name. |
-| Window inventory | Yes | `list-windows` joined to CG z-order | TODO | P1. |
-| Launch apps | Yes | `launch` via `NSWorkspace` | TODO | P1. |
-| z-order | Yes | CGWindow list order, index 0 in front | TODO | P1. |
-| Per-app approval / allowlist | Yes | `policy.toml` allow and deny | TODO | P6. Built-in deny starts in P1. |
+| `list_apps` | Yes | `list-apps` with bundle id, pid, path | DONE | P1 on macOS via NSWorkspace. Linux and Windows return `unsupported` until P13 and P12. |
+| Window inventory | Yes | `list-windows` joined to CG z-order | PARTIAL | P1 lists on-screen CG windows with z-order, bounds, layer, and window number. `ax_matched` stays false until P2 joins them to AX windows. |
+| Launch apps | Yes | `launch` via `NSWorkspace` | DONE | P1 on macOS, with `activate` and `quit`. `quit` calls `terminate()` only. Off macOS those three commands return `unsupported`. |
+| z-order | Yes | CGWindow list order, index 0 in front | DONE | P1. An `--app` filter renumbers so 0 is that app's front window. A window id uses the `id:` prefix. |
+| Per-app approval / allowlist | Yes | `policy.toml` allow and deny | TODO | P6. The built-in deny list landed in P1. |
 | Admin policy | Yes | `/etc/computer-use/policy.toml`, deny wins | TODO | P6. |
 | Sensitive-action confirmation | Yes | Confirm hook, secure fields always refused | TODO | P6. |
-| Refuses terminals | Yes | Built-in deny list | TODO | P1 list, P6 file. |
+| Refuses terminals | Yes | Built-in deny list | PARTIAL | P1 matches bundle id, executable file name, and an `.app` path component. `policy.toml` is P6. |
 | Blocked-URL error | Yes | `blocked_url` for browsers and for CDP | TODO | P6, used again by P10. |
-| Path-resolved app identity | Yes | Canonical executable path | TODO | P1 identity, P6 enforcement. |
+| Path-resolved app identity | Yes | Canonical executable path | PARTIAL | P1 deny checks the canonical executable path. `allow.path` enforcement is P6. |
 | Relock / pause on local input | Yes | Listen-only `CGEventTap`, ignore our marker | TODO | P6. |
 | Windows foreground-only plus allowlist | Yes, foreground-only | UIA patterns without foreground, policy still applies | TODO | P12. Target is past Codex. Status stays TODO until it ships. |
 | Linux | Unverified | AT-SPI, ScreenCast, RemoteDesktop or libei, XTest fallback | TODO | P13. Codex does not ship a verified Linux backend. |
 | Batched `actions[]` | Yes | `action: "batch"` | TODO | P5. |
 | Screenshot coordinate remap, about 1440×900 | Yes | Default max-width 1440, map in every image, optional canvas | PARTIAL | `--max-width` exists with no default and no inverse map. P4. |
 | MCP server | No | No | DONE | Out of scope on purpose. `serve` stays stdin/stdout. |
-| Permission doctor with fix text | Limited | `doctor` JSON, `--request` optional | TODO | P1, extended in P8 and P12. |
+| Permission doctor with fix text | Limited | `doctor` JSON, `--request` optional | DONE | P1 on macOS reports AX trust, Screen Recording preflight, and the TCC responsible app. `input_monitor` stays null until P8. Linux notes P13 and Windows notes P12. |
 | Clipboard get/set | Unknown | `arboard` 3.7.0, set requires confirm | TODO | P8. |
 | Drag, mouse down/up, triple-click, hold key, xdotool names | Partial | Those actions on the same tiers | PARTIAL | Right, middle, and double click exist as foreground coordinates. The rest is P8. |
 | Menu bar traversal | Yes for AX menus | `menu list` / `menu click` | TODO | P9. |
@@ -1147,7 +1147,7 @@ Update this table at the end of a phase. `commit` is the full hash on `main` of 
 | Phase | Status | Commit | Notes |
 | --- | --- | --- | --- |
 | P0 Planning | DONE | this commit | No code changes. Hash is `git rev-parse HEAD` after this commit lands. |
-| P1 Targeting, inventory, doctor | TODO | | `rust-version` 1.91. Built-in deny. Trait methods. |
+| P1 Targeting, inventory, doctor | DONE | `921e942947a1ce841b3026c0d33fdd2caecc701e` | `rust-version` 1.91. Built-in deny. macOS list-apps, list-windows, launch, activate, quit, and doctor. Feature commit `4266448035c78352c79b9025db01c445d8d0ff39`; this hash is the Windows clippy fix CI accepted. `ax_matched` stays false until P2. `activate` does not raise one AX window. `quit` is `terminate()` only. Linux and Windows inventory returns `unsupported`. Their doctor probes stay null (P13 / P12) and `--request` does not prompt there. `dirs` is deferred to P2. Live doctor on this machine saw Accessibility denied for Grok Bot and Screen Recording granted. |
 | P2 macOS AX tree, diff, cache | TODO | | osascript becomes the fallback. |
 | P3 Element actions | TODO | | Revalidate, scroll-to-visible, secure refuse. |
 | P4 Window capture and remap | TODO | | Default max-width 1440. |
