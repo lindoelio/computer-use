@@ -1007,6 +1007,9 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
             result_response(apple_event_action(backend, &app, &script, language))
         }
         Action::ShortcutsRun { name } => {
+            if !cfg!(target_os = "macos") {
+                return Response::from_error(unsupported_error("shortcuts_run"));
+            }
             if name.trim().is_empty() {
                 return Response::from_error(invalid_arguments(
                     "shortcuts run requires a workflow name",
@@ -2192,6 +2195,13 @@ fn cursor_position(backend: &dyn DesktopBackend) -> Result<Value, ComputerError>
 
 fn invalid_arguments(message: &str) -> ComputerError {
     ComputerError::InvalidArguments(message.to_string())
+}
+
+fn unsupported_error(operation: &str) -> ComputerError {
+    ComputerError::Unsupported(format!(
+        "{operation} is not available on {}",
+        std::env::consts::OS
+    ))
 }
 
 fn menu_list(backend: &dyn DesktopBackend, app: &str, depth: u32) -> Result<Value, ComputerError> {
