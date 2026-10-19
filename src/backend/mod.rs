@@ -118,7 +118,7 @@ pub trait DesktopBackend: Send + Sync {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            Err(ElementError::new(unsupported(&request.op.action_name())))
+            Err(ElementError::new(unsupported(request.op.action_name())))
         }
     }
 
