@@ -421,19 +421,14 @@ fn session_prune_dry_run_stays_in_the_temp_cache() {
 }
 
 #[test]
-fn launch_terminal_is_denied_or_unsupported() {
+fn launch_terminal_is_denied_on_every_os() {
     let output = run(&["launch", "com.apple.Terminal"]);
     assert!(!output.status.success());
     let value: Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
     assert_eq!(value["ok"], false);
-    let code = value["error"]["code"].as_str().unwrap();
-    if cfg!(target_os = "macos") {
-        assert_eq!(code, "policy_denied", "{value}");
-    } else {
-        assert_eq!(code, "unsupported", "{value}");
-        let message = value["error"]["message"].as_str().unwrap();
-        assert!(message.contains(std::env::consts::OS), "{message}");
-    }
+    assert_eq!(value["error"]["code"], "policy_denied", "{value}");
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(message.contains("com.apple.Terminal"), "{message}");
 }
 
 #[test]

@@ -820,19 +820,17 @@ fn ambient_admin_policy_file() -> Option<std::path::PathBuf> {
     path.is_file().then_some(path)
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), windows))]
 fn default_admin_path() -> std::path::PathBuf {
-    #[cfg(windows)]
-    {
-        let base = std::env::var_os("ProgramData")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\ProgramData"));
-        return base.join("computer-use").join("policy.toml");
-    }
-    #[cfg(not(windows))]
-    {
-        std::path::PathBuf::from("/etc/computer-use/policy.toml")
-    }
+    let base = std::env::var_os("ProgramData")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\ProgramData"));
+    base.join("computer-use").join("policy.toml")
+}
+
+#[cfg(all(not(test), not(windows)))]
+fn default_admin_path() -> std::path::PathBuf {
+    std::path::PathBuf::from("/etc/computer-use/policy.toml")
 }
 
 fn merge_file(
