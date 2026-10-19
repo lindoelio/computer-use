@@ -258,15 +258,18 @@ pub trait DesktopBackend: Send + Sync {
         }
         #[cfg(not(target_os = "macos"))]
         {
+            // `Self` is unsized when this default runs through `dyn DesktopBackend`.
             off_platform_input(self, job)
         }
     }
 }
 
 /// Foreground enigo path used when event posting is not available.
+///
+/// `B: ?Sized` so the default method can pass `self` from a trait object.
 #[cfg(not(target_os = "macos"))]
-fn off_platform_input(
-    backend: &dyn DesktopBackend,
+fn off_platform_input<B: DesktopBackend + ?Sized>(
+    backend: &B,
     job: &crate::tier::InputJob,
 ) -> Result<crate::tier::InputReport, ComputerError> {
     use crate::tier::{InputKind, InputReport, TierName};

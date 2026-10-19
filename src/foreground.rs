@@ -233,6 +233,7 @@ const LOCKFILE_FAIL_IMMEDIATELY: u32 = 1;
 
 #[cfg(windows)]
 #[repr(C)]
+#[allow(dead_code)] // C reads these fields; Rust only writes them.
 struct Overlapped {
     internal: usize,
     internal_high: usize,

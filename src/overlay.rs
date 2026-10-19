@@ -8,8 +8,10 @@
 
 #![allow(unsafe_code)]
 
+#[cfg(unix)]
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
