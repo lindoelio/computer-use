@@ -30,14 +30,17 @@ mod foreground;
 mod image_util;
 mod input_session;
 pub mod keys;
+pub mod menu_path;
 pub mod overlay;
 pub mod policy;
 pub mod protocol;
+pub mod shortcuts;
 pub mod state;
 pub mod target;
 mod tier;
 pub mod tree;
 pub mod types;
+pub mod window_groups;
 
 #[cfg(test)]
 pub(crate) mod test_backend;

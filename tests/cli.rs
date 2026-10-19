@@ -263,6 +263,89 @@ fn tree_command_is_unsupported_off_macos() {
 }
 
 #[test]
+fn p9_commands_are_unsupported_off_macos() {
+    if cfg!(target_os = "macos") {
+        return;
+    }
+    let cases: &[&[&str]] = &[
+        &["menu", "list", "--app", "Finder"],
+        &["menu", "click", "--app", "Finder", "--path", "File > Save"],
+        &["apple-event", "--app", "Finder", "--script", "get name"],
+        &["shortcuts", "run", "Open URL"],
+        &["dock", "list"],
+        &["dock", "click", "--title", "Finder"],
+        &["spaces"],
+    ];
+    for args in cases {
+        let output = run(args);
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
+            panic!(
+                "{:?} stdout was not JSON: {} stderr: {}",
+                args,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+        assert_eq!(
+            value["ok"], false,
+            "{:?} expected ok=false: {}",
+            args, value
+        );
+        assert_eq!(
+            value["error"]["code"], "unsupported",
+            "{:?} expected unsupported: {}",
+            args, value
+        );
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains(std::env::consts::OS),
+            "{:?} message missing os: {message}",
+            args
+        );
+    }
+}
+
+#[test]
+fn p9_help_lists_new_commands() {
+    let output = run(&["--help"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for needle in ["menu", "apple-event", "shortcuts", "dock", "spaces"] {
+        assert!(stdout.contains(needle), "help missing {needle}:\n{stdout}");
+    }
+}
+
+#[test]
+fn p9_exec_round_trip_for_each_action() {
+    let actions: &[&str] = &[
+        r#"{"action":"menu_list","app":"Notes","depth":4}"#,
+        r#"{"action":"menu_click","app":"Notes","path":"File > Save"}"#,
+        r#"{"action":"apple_event","app":"Notes","script":"get name"}"#,
+        r#"{"action":"apple_event","app":"Notes","script":"get name","language":"javascript"}"#,
+        r#"{"action":"shortcuts_run","name":"Open URL"}"#,
+        r#"{"action":"dock_list"}"#,
+        r#"{"action":"dock_click","title":"Finder"}"#,
+        r#"{"action":"spaces"}"#,
+    ];
+    for action in actions {
+        let output = run(&["exec", action]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // The action is either ok=true (binary present / stub happy) or
+        // ok=false with a documented error code. Anything else, especially
+        // an empty body, is a regression.
+        assert!(
+            !stdout.trim().is_empty(),
+            "exec {action} produced no JSON: stderr: {stderr}"
+        );
+        let value: Value = serde_json::from_str(&stdout).unwrap_or_else(|_| {
+            panic!("exec {action} stdout was not JSON: {stdout} stderr: {stderr}")
+        });
+        assert!(value["ok"].is_boolean(), "{value}");
+    }
+}
+
+#[test]
 fn version_prints_package_version() {
     let output = run(&["--version"]);
     assert!(output.status.success());

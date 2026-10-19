@@ -4,6 +4,17 @@
 
 These calls are private, version-skewed, and unsigned. They may break on any macOS update. A missing symbol returns `unsupported` and names the symbol. The process does not abort. A non-zero status is `execution_failed`.
 
+## Spaces (P9)
+
+`spaces` reads the visible desktop. It walks `NSScreen` and the existing
+window list and groups on-screen windows by the screen that contains their
+center. Mission Control moves are **not** attempted; the report only
+describes the current layout. When the `skylight` feature is active, a
+best-effort path may opt into SkyLight symbols to relocate a window. That
+path is not exposed by `spaces` itself; the action's `note` field carries
+a one-line caveat when the feature is on. Never claim Mission Control
+control.
+
 The crate opens `/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight` with `RTLD_LAZY` and uses the first symbol that `dlsym` resolves:
 
 1. `SLPSSetFrontProcessWithOptions`

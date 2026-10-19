@@ -5,7 +5,7 @@
 
 mod capture;
 pub(crate) mod clipboard;
-mod command;
+pub(crate) mod command;
 pub(crate) mod held;
 mod input;
 
@@ -18,9 +18,12 @@ mod windows;
 
 use crate::element::{ElementError, ElementOutcome, ElementRequest, HitInfo};
 use crate::error::ComputerError;
+use crate::protocol::AppleEventLanguage;
 use crate::target::{AppInfo, DoctorReport, LaunchResult, QuitResult, WindowBounds, WindowList};
 use crate::tree::{TreeQuery, TreeReport};
 use crate::types::{DisplayInfo, Frame, FrontmostInfo, Modifier, MouseButton, RawCapture, Region};
+use crate::window_groups::SpacesReport;
+use serde::Serialize;
 
 /// One window selected for capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +46,76 @@ pub(crate) fn unsupported(operation: &str) -> ComputerError {
 
 pub(crate) use command::run_with_stdin;
 pub use input::validate_key;
+
+/// One entry under a menu bar item or submenu. The macOS backend fills `title`
+/// from `AXTitle`, `enabled` from `AXEnabled`, and recurses into `AXMenu`
+/// children up to `depth` levels.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MenuNode {
+    /// Item title from `AXTitle`. Empty string when the menu hides it.
+    pub title: String,
+    /// `AXEnabled`. Items are still listed when `false`; the macOS backend
+    /// refuses to press them.
+    pub enabled: bool,
+    /// Submenu children. Empty for leaf items.
+    pub children: Vec<MenuNode>,
+}
+
+/// Full menu report for one running app.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MenuListReport {
+    /// App name as resolved by the platform.
+    pub app: String,
+    /// Sections under the menu bar. Each one is a top-level menu (File, Edit,
+    /// ...) with the items inside it.
+    pub sections: Vec<MenuNode>,
+}
+
+/// What `menu_click` did.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MenuClickReport {
+    /// `true` when the click was pressed. `false` is reserved for a deliberate
+    /// no-op (the path resolved but the trailing segment was a separator).
+    pub pressed: bool,
+}
+
+/// Outcome of an Apple event script.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AppleEventReport {
+    /// Number of bytes in the original script. The body is never logged.
+    pub script_bytes: usize,
+    /// Lowercase hex hash of the script body. Audit lines include this so a
+    /// script can be identified without leaking its content.
+    pub script_hash: String,
+    /// Standard output, trimmed to one line. Empty when the script did not
+    /// write anything.
+    pub stdout: String,
+    /// Standard error, trimmed. Empty when `osascript` was silent.
+    pub stderr: String,
+    /// Exit status of `osascript`.
+    pub exit_status: i32,
+}
+
+/// One Dock item.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DockItem {
+    /// Item title as the Dock exposes it.
+    pub title: String,
+}
+
+/// Full Dock listing.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DockListReport {
+    /// Items in Dock order.
+    pub items: Vec<DockItem>,
+}
+
+/// What `dock_click` did.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DockClickReport {
+    /// `true` when the click was pressed.
+    pub pressed: bool,
+}
 
 /// Desktop automation surface used by [`crate::dispatch`].
 ///
@@ -123,6 +196,53 @@ pub trait DesktopBackend: Send + Sync {
     /// Ask an application to quit. `force` uses a forced terminate where the OS has one.
     fn quit(&self, _app: &str, _force: bool) -> Result<QuitResult, ComputerError> {
         Err(unsupported("quit"))
+    }
+
+    /// Walk `app`'s menu bar. The macOS backend uses
+    /// `AXMenuBar -> AXMenuBarItem -> AXMenu`. Other platforms return
+    /// `unsupported`. `depth` caps recursion; out-of-depth submenus are
+    /// reported as a single placeholder child.
+    fn menu_list(&self, _app: &str, _depth: u32) -> Result<MenuListReport, ComputerError> {
+        Err(unsupported("menu_list"))
+    }
+
+    /// Press one menu item by `">"`-separated titles. A miss is
+    /// `element_not_found`. A disabled item is `execution_failed`.
+    fn menu_click(
+        &self,
+        _app: &str,
+        _path: &crate::menu_path::MenuPath,
+    ) -> Result<MenuClickReport, ComputerError> {
+        Err(unsupported("menu_click"))
+    }
+
+    /// Run an Apple event via `osascript`. macOS only. `script` is the body
+    /// passed with `-e`; it never goes through a shell. The script body is
+    /// never logged verbatim; only its byte count and SHA-256 are recorded.
+    fn apple_event(
+        &self,
+        _app: &str,
+        _script: &str,
+        _language: AppleEventLanguage,
+    ) -> Result<AppleEventReport, ComputerError> {
+        Err(unsupported("apple_event"))
+    }
+
+    /// List Dock items. macOS only.
+    fn dock_list(&self) -> Result<DockListReport, ComputerError> {
+        Err(unsupported("dock_list"))
+    }
+
+    /// Click a Dock item by title. macOS only. A miss is `element_not_found`.
+    fn dock_click(&self, _title: &str) -> Result<DockClickReport, ComputerError> {
+        Err(unsupported("dock_click"))
+    }
+
+    /// Group on-screen windows by the screen that contains each window's
+    /// center. Mission Control moves are not attempted; the skylight feature,
+    /// when active, may opt into best-effort space moves.
+    fn spaces(&self) -> Result<SpacesReport, ComputerError> {
+        Err(unsupported("spaces"))
     }
 
     /// Permission probe. `options.prompt` may show a system prompt on macOS.
@@ -513,6 +633,55 @@ macro_rules! impl_platform_backend {
 
             fn end_session(&self, session: Option<&str>) -> Result<Vec<i32>, ComputerError> {
                 $end_session(session)
+            }
+
+            // P9: menu bar, Apple events, Dock, and Spaces are macOS-only.
+            // Linux and Windows keep the `unsupported` default from the trait.
+            #[cfg(target_os = "macos")]
+            fn menu_list(&self, app: &str, depth: u32) -> Result<MenuListReport, ComputerError> {
+                macos::menu::list(app, depth)
+            }
+
+            #[cfg(target_os = "macos")]
+            fn menu_click(
+                &self,
+                app: &str,
+                path: &crate::menu_path::MenuPath,
+            ) -> Result<MenuClickReport, ComputerError> {
+                macos::menu::click(app, path)
+            }
+
+            #[cfg(target_os = "macos")]
+            fn apple_event(
+                &self,
+                app: &str,
+                script: &str,
+                language: AppleEventLanguage,
+            ) -> Result<AppleEventReport, ComputerError> {
+                let _ = app;
+                let outcome = macos::apple::run(script, language)?;
+                Ok(AppleEventReport {
+                    script_bytes: outcome.script_bytes,
+                    script_hash: outcome.script_hash,
+                    stdout: outcome.stdout,
+                    stderr: outcome.stderr,
+                    exit_status: outcome.exit_status,
+                })
+            }
+
+            #[cfg(target_os = "macos")]
+            fn dock_list(&self) -> Result<DockListReport, ComputerError> {
+                macos::dock::list()
+            }
+
+            #[cfg(target_os = "macos")]
+            fn dock_click(&self, title: &str) -> Result<DockClickReport, ComputerError> {
+                macos::dock::click(title)
+            }
+
+            #[cfg(target_os = "macos")]
+            fn spaces(&self) -> Result<crate::window_groups::SpacesReport, ComputerError> {
+                Ok(macos::spaces::report())
             }
         }
     };

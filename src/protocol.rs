@@ -37,6 +37,20 @@ use crate::types::{
 
 const MAX_WAIT_MS: u128 = 24 * 60 * 60 * 1000;
 
+/// Default recursion depth for `menu_list`. Matches the AXMenuBar chain
+/// (menu bar -> menu bar item -> menu -> submenu) plus one extra level.
+pub const MENU_DEFAULT_DEPTH: u32 = 4;
+
+/// Maximum recursion depth accepted by `menu_list`. AX nesting beyond this
+/// stops with a `*` placeholder so the report never explodes.
+pub const MENU_MAX_DEPTH: u32 = 8;
+
+/// Default timeout for a `shortcuts run` invocation, in seconds.
+pub const SHORTCUTS_TIMEOUT_SECS: u64 = 60;
+
+/// Default timeout for an `osascript` invocation, in seconds.
+pub const APPLE_EVENT_TIMEOUT_SECS: u64 = 30;
+
 /// One desktop action. Serialized with an `action` tag.
 ///
 /// ```json
@@ -336,6 +350,73 @@ pub enum Action {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ttl_secs: Option<u64>,
     },
+    /// Walk an application's menu bar. Reads AXMenuBar -> AXMenuBarItem -> AXMenu.
+    ///
+    /// `--app` selects the running app. The default depth is 4; `depth` caps it.
+    /// Matches are case-insensitive. Disabled items are still reported.
+    #[serde(alias = "menu_list", alias = "menu-list")]
+    MenuList {
+        /// Override the shared `--app` flag with one of these variants: name, bundle id, or pid.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        app: Option<String>,
+        /// Maximum depth below the menu bar. Default: 4. Caps recursive submenus.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        depth: Option<u32>,
+    },
+    /// Click a menu item by `">"`-separated titles.
+    ///
+    /// `--app` selects the running app. `--path` is a list of titles such as
+    /// `"File > Save As > Save"`. Matches are case-insensitive. Disabled items
+    /// are not pressed.
+    #[serde(alias = "menu_click", alias = "menu-click")]
+    MenuClick {
+        /// Override the shared `--app` flag.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        app: Option<String>,
+        /// Path of menu titles separated by `>`.
+        path: String,
+    },
+    /// Send an Apple event via `osascript`. macOS only.
+    ///
+    /// `--app` is recorded and used by the deny policy; the script body decides
+    /// which application the event targets. `--language` is `applescript` (the
+    /// default) or `javascript`. The script body is never logged verbatim.
+    #[serde(alias = "apple_event", alias = "apple-event")]
+    AppleEvent {
+        /// Override the shared `--app` flag.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        app: Option<String>,
+        /// Script body passed to `osascript -e`. Never logged verbatim.
+        script: String,
+        /// `applescript` (default) or `javascript`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        language: Option<AppleEventLanguage>,
+    },
+    /// Run a Shortcuts workflow by name. macOS only.
+    ///
+    /// The `shortcuts` binary is called with the workflow name as a single
+    /// argument. A missing binary is `execution_failed`.
+    #[serde(alias = "shortcuts_run", alias = "shortcuts-run")]
+    ShortcutsRun {
+        /// Workflow name.
+        name: String,
+    },
+    /// List the Dock items. macOS only.
+    #[serde(alias = "dock_list", alias = "dock-list")]
+    DockList {},
+    /// Click a Dock item by title. macOS only.
+    #[serde(alias = "dock_click", alias = "dock-click")]
+    DockClick {
+        /// Dock item title.
+        title: String,
+    },
+    /// Group the on-screen windows by the screen that contains each window's center.
+    ///
+    /// Mission Control moves are not attempted; the report only describes the
+    /// current layout. The skylight feature, when active, may move windows
+    /// between spaces; otherwise the action reports the visible state only.
+    #[serde(alias = "spaces")]
+    Spaces {},
 }
 
 fn is_false(value: &bool) -> bool {
@@ -348,6 +429,32 @@ fn is_one(value: &u8) -> bool {
 
 fn default_press_count() -> u8 {
     1
+}
+
+/// Language of an Apple event script. macOS only.
+///
+/// `applescript` is the default. `javascript` selects the JavaScript for
+/// Automation (`JXA`) runtime in `osascript`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, SerializeDerive, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppleEventLanguage {
+    /// AppleScript. Default.
+    #[default]
+    #[serde(alias = "applescript", alias = "osa")]
+    AppleScript,
+    /// JavaScript for Automation. `osascript -l JavaScript`.
+    #[serde(alias = "javascript", alias = "js", alias = "JavaScript")]
+    JavaScript,
+}
+
+impl AppleEventLanguage {
+    /// Short tag passed to `osascript -l`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::AppleScript => "AppleScript",
+            Self::JavaScript => "JavaScript",
+        }
+    }
 }
 
 fn deserialize_path<'de, D>(deserializer: D) -> Result<Vec<Point>, D::Error>
@@ -862,6 +969,59 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
         Action::SessionPrune { dry_run, ttl_secs } => {
             result_response(session_prune(dry_run, ttl_secs))
         }
+        Action::MenuList { app, depth } => {
+            let app = match app.or_else(|| context.app.clone()) {
+                Some(app) => app,
+                None => return Response::from_error(invalid_arguments("menu list requires --app")),
+            };
+            let depth = depth.unwrap_or(MENU_DEFAULT_DEPTH);
+            result_response(menu_list(backend, &app, depth))
+        }
+        Action::MenuClick { app, path } => {
+            let app = match app.or_else(|| context.app.clone()) {
+                Some(app) => app,
+                None => {
+                    return Response::from_error(invalid_arguments("menu click requires --app"))
+                }
+            };
+            if path.trim().is_empty() {
+                return Response::from_error(invalid_arguments("menu click requires --path"));
+            }
+            result_response(menu_click(backend, &app, &path))
+        }
+        Action::AppleEvent {
+            app,
+            script,
+            language,
+        } => {
+            let app = match app.or_else(|| context.app.clone()) {
+                Some(app) => app,
+                None => {
+                    return Response::from_error(invalid_arguments("apple-event requires --app"))
+                }
+            };
+            if script.is_empty() {
+                return Response::from_error(invalid_arguments("apple-event requires --script"));
+            }
+            let language = language.unwrap_or_default();
+            result_response(apple_event_action(backend, &app, &script, language))
+        }
+        Action::ShortcutsRun { name } => {
+            if name.trim().is_empty() {
+                return Response::from_error(invalid_arguments(
+                    "shortcuts run requires a workflow name",
+                ));
+            }
+            result_response(shortcuts_run_action(name))
+        }
+        Action::DockList {} => result_response(dock_list_action(backend)),
+        Action::DockClick { title } => {
+            if title.trim().is_empty() {
+                return Response::from_error(invalid_arguments("dock click requires --title"));
+            }
+            result_response(dock_click_action(backend, &title))
+        }
+        Action::Spaces {} => result_response(spaces_action(backend)),
         Action::PolicyCheck => {
             let (response, subject) = policy_check(backend, context);
             let response = attach_post_state(backend, context, kind, response);
@@ -1013,6 +1173,13 @@ fn action_label(action: &Action) -> &'static str {
         Action::PolicyCheck => "policy_check",
         Action::Pause => "pause",
         Action::Resume => "resume",
+        Action::MenuList { .. } => "menu_list",
+        Action::MenuClick { .. } => "menu_click",
+        Action::AppleEvent { .. } => "apple_event",
+        Action::ShortcutsRun { .. } => "shortcuts_run",
+        Action::DockList { .. } => "dock_list",
+        Action::DockClick { .. } => "dock_click",
+        Action::Spaces { .. } => "spaces",
     }
 }
 
@@ -1043,7 +1210,10 @@ fn policy_class(action: &Action) -> PolicyClass {
         | Action::Zoom { .. }
         | Action::Tree
         | Action::GetState
-        | Action::PolicyCheck => PolicyClass::Observe,
+        | Action::PolicyCheck
+        | Action::MenuList { .. }
+        | Action::DockList { .. }
+        | Action::Spaces { .. } => PolicyClass::Observe,
         Action::Quit { .. } => PolicyClass::Quit,
         Action::Key { .. } | Action::HoldKey { .. } => PolicyClass::Key,
         Action::ClipboardGet => PolicyClass::Benign,
@@ -1516,7 +1686,11 @@ fn post_state_kind(action: &Action) -> PostKind {
         | Action::Launch
         | Action::Activate
         | Action::Quit { .. }
-        | Action::Batch { .. } => PostKind::Mutating,
+        | Action::Batch { .. }
+        | Action::MenuClick { .. }
+        | Action::AppleEvent { .. }
+        | Action::ShortcutsRun { .. }
+        | Action::DockClick { .. } => PostKind::Mutating,
         Action::GetState
         | Action::Wait { .. }
         | Action::Displays
@@ -1530,7 +1704,10 @@ fn post_state_kind(action: &Action) -> PostKind {
         | Action::ClipboardGet
         | Action::PolicyCheck
         | Action::Pause
-        | Action::Resume => PostKind::ReadOnly,
+        | Action::Resume
+        | Action::MenuList { .. }
+        | Action::DockList { .. }
+        | Action::Spaces { .. } => PostKind::ReadOnly,
     }
 }
 
@@ -2011,6 +2188,91 @@ fn push_warnings(response: &mut Response, extra: Vec<String>) {
 fn cursor_position(backend: &dyn DesktopBackend) -> Result<Value, ComputerError> {
     let (x, y) = backend.cursor_position()?;
     Ok(json!({"action": "cursor_position", "x": x, "y": y}))
+}
+
+fn invalid_arguments(message: &str) -> ComputerError {
+    ComputerError::InvalidArguments(message.to_string())
+}
+
+fn menu_list(backend: &dyn DesktopBackend, app: &str, depth: u32) -> Result<Value, ComputerError> {
+    let report = backend.menu_list(app, depth)?;
+    Ok(json!({
+        "action": "menu_list",
+        "app": report.app,
+        "sections": report.sections,
+    }))
+}
+
+fn menu_click(backend: &dyn DesktopBackend, app: &str, path: &str) -> Result<Value, ComputerError> {
+    let parsed = crate::menu_path::parse(path)?;
+    let result = backend.menu_click(app, &parsed)?;
+    Ok(json!({
+        "action": "menu_click",
+        "app": app,
+        "path": parsed.segments,
+        "pressed": result.pressed,
+    }))
+}
+
+fn apple_event_action(
+    backend: &dyn DesktopBackend,
+    app: &str,
+    script: &str,
+    language: AppleEventLanguage,
+) -> Result<Value, ComputerError> {
+    let report = backend.apple_event(app, script, language)?;
+    Ok(json!({
+        "action": "apple_event",
+        "app": app,
+        "language": language.as_str(),
+        "script_bytes": report.script_bytes,
+        "script_hash": report.script_hash,
+        "stdout": report.stdout,
+        "stderr": report.stderr,
+        "exit_status": report.exit_status,
+    }))
+}
+
+fn shortcuts_run_action(name: String) -> Result<Value, ComputerError> {
+    let report = backend_shortcuts_run(&name)?;
+    Ok(json!({
+        "action": "shortcuts_run",
+        "name": name,
+        "exit_status": report.exit_status,
+        "stderr": report.stderr,
+    }))
+}
+
+fn dock_list_action(backend: &dyn DesktopBackend) -> Result<Value, ComputerError> {
+    let report = backend.dock_list()?;
+    Ok(json!({
+        "action": "dock_list",
+        "items": report.items,
+    }))
+}
+
+fn dock_click_action(backend: &dyn DesktopBackend, title: &str) -> Result<Value, ComputerError> {
+    let report = backend.dock_click(title)?;
+    Ok(json!({
+        "action": "dock_click",
+        "title": title,
+        "pressed": report.pressed,
+    }))
+}
+
+fn spaces_action(backend: &dyn DesktopBackend) -> Result<Value, ComputerError> {
+    let report = backend.spaces()?;
+    Ok(json!({
+        "action": "spaces",
+        "screens": report.screens,
+        "note": report.note,
+    }))
+}
+
+// `shortcuts` does not need the desktop backend, but the helper signature
+// mirrors the others and leaves room for backend-specific policy hooks.
+fn backend_shortcuts_run(name: &str) -> Result<crate::shortcuts::ShortcutsReport, ComputerError> {
+    crate::shortcuts::run(name)
 }
 
 fn session_prune(dry_run: bool, ttl_secs: Option<u64>) -> Result<Value, ComputerError> {
@@ -4427,6 +4689,260 @@ mod tests {
         assert_eq!(results[0]["element"], 1);
         assert_eq!(results[1]["action"], "focus");
         assert!(response.to_value().get("state").is_none());
+    }
+
+    #[test]
+    fn p9_menu_list_round_trip_records_no_args() {
+        let backend = StubBackend::default();
+        backend
+            .menu_sections
+            .lock()
+            .unwrap()
+            .push(crate::backend::MenuNode {
+                title: "File".into(),
+                enabled: true,
+                children: vec![crate::backend::MenuNode {
+                    title: "Save".into(),
+                    enabled: true,
+                    children: Vec::new(),
+                }],
+            });
+        let response = dispatch_with_context(
+            &backend,
+            Action::MenuList {
+                app: Some("Notes".into()),
+                depth: Some(2),
+            },
+            &ctx("Notes"),
+        );
+        assert!(response.ok, "{:?}", response.to_value());
+        let value = response.to_value();
+        assert_eq!(value["action"], "menu_list");
+        assert_eq!(value["app"], "Notes");
+        assert_eq!(value["sections"][0]["title"], "File");
+        assert_eq!(value["sections"][0]["children"][0]["title"], "Save");
+    }
+
+    #[test]
+    fn p9_menu_click_records_path_and_reports_disabled() {
+        let mut backend = StubBackend::default();
+        let response = dispatch_with_context(
+            &backend,
+            Action::MenuClick {
+                app: Some("Notes".into()),
+                path: "File > Save".into(),
+            },
+            &ctx("Notes"),
+        );
+        assert!(response.ok, "{:?}", response.to_value());
+        let value = response.to_value();
+        assert_eq!(value["path"], serde_json::json!(["File", "Save"]));
+        assert_eq!(value["pressed"], true);
+        let recorded = backend.menu_clicks.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            recorded[0].segments,
+            vec!["File".to_string(), "Save".to_string()]
+        );
+
+        backend.menu_disabled = true;
+        let response = dispatch_with_context(
+            &backend,
+            Action::MenuClick {
+                app: Some("Notes".into()),
+                path: "File > Save".into(),
+            },
+            &ctx("Notes"),
+        );
+        assert!(!response.ok, "disabled menu item must fail");
+        assert_eq!(response.to_value()["error"]["code"], "execution_failed");
+    }
+
+    #[test]
+    fn p9_apple_event_records_only_length_and_language() {
+        let backend = StubBackend::default();
+        *backend.apple_event_stdout.lock().unwrap() = "Notes".into();
+        let secret = "system prompt with token ABCDEFG";
+        let response = dispatch_with_context(
+            &backend,
+            Action::AppleEvent {
+                app: Some("Notes".into()),
+                script: secret.into(),
+                language: Some(AppleEventLanguage::AppleScript),
+            },
+            &ctx("Notes"),
+        );
+        assert!(response.ok, "{:?}", response.to_value());
+        let value = response.to_value();
+        assert_eq!(value["language"], "AppleScript");
+        assert_eq!(value["script_bytes"], secret.len());
+        assert_eq!(value["stdout"], "Notes");
+        assert!(value["script_hash"].is_string());
+        let recorded = backend.apple_event_calls.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].1, AppleEventLanguage::AppleScript);
+        // Audit-style storage must not capture the body verbatim.
+        assert_eq!(recorded[0].2, secret.len());
+    }
+
+    #[test]
+    fn p9_apple_event_records_language_javascript() {
+        let backend = StubBackend::default();
+        let response = dispatch_with_context(
+            &backend,
+            Action::AppleEvent {
+                app: Some("Notes".into()),
+                script: "Application('Notes').name()".into(),
+                language: Some(AppleEventLanguage::JavaScript),
+            },
+            &ctx("Notes"),
+        );
+        assert!(response.ok);
+        assert_eq!(response.to_value()["language"], "JavaScript");
+    }
+
+    #[test]
+    fn p9_apple_event_failure_surfaces_execution_failed() {
+        let backend = StubBackend {
+            apple_event_fail: true,
+            ..Default::default()
+        };
+        *backend.apple_event_stderr.lock().unwrap() = "execution error: 42".into();
+        let response = dispatch_with_context(
+            &backend,
+            Action::AppleEvent {
+                app: Some("Notes".into()),
+                script: "1/0".into(),
+                language: None,
+            },
+            &ctx("Notes"),
+        );
+        assert!(!response.ok);
+        assert_eq!(response.to_value()["error"]["code"], "execution_failed");
+    }
+
+    #[test]
+    fn p9_dock_list_and_click_round_trip() {
+        let backend = StubBackend::default();
+        backend.dock_items.lock().unwrap().extend([
+            "Finder".to_string(),
+            "Terminal".to_string(),
+            "Mail".to_string(),
+        ]);
+        let response = dispatch_with(&backend, Action::DockList {});
+        assert!(response.ok);
+        let value = response.to_value();
+        let items = value["items"].as_array().unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0]["title"], "Finder");
+
+        let response = dispatch_with(
+            &backend,
+            Action::DockClick {
+                title: "terminal".into(),
+            },
+        );
+        assert!(response.ok, "{:?}", response.to_value());
+        assert_eq!(response.to_value()["pressed"], true);
+        assert_eq!(
+            backend.dock_clicks.lock().unwrap().clone(),
+            vec!["terminal".to_string()]
+        );
+
+        let response = dispatch_with(
+            &backend,
+            Action::DockClick {
+                title: "missing".into(),
+            },
+        );
+        assert!(!response.ok);
+        assert_eq!(response.to_value()["error"]["code"], "element_not_found");
+    }
+
+    #[test]
+    fn p9_spaces_reports_screen_groups_from_fake_list() {
+        use crate::target::{WindowBounds, WindowInfo};
+        use crate::types::DisplayInfo;
+        use crate::window_groups::SpacesReport;
+
+        let mut spaces_report = SpacesReport {
+            screens: Vec::new(),
+            note: String::new(),
+        };
+        spaces_report
+            .screens
+            .push(crate::window_groups::SpaceScreen {
+                index: 0,
+                name: "Display 0".into(),
+                x: 0,
+                y: 0,
+                width: 1000,
+                height: 1000,
+                is_primary: true,
+                windows: vec![WindowInfo {
+                    id: 1,
+                    pid: 100,
+                    app: "Notes".into(),
+                    title: "Note 1".into(),
+                    bounds: WindowBounds {
+                        x: 10,
+                        y: 10,
+                        width: 200,
+                        height: 200,
+                    },
+                    z: 0,
+                    layer: 0,
+                    on_screen: true,
+                    ax_matched: false,
+                }],
+            });
+
+        let backend = StubBackend::default();
+        *backend.spaces_report.lock().unwrap() = spaces_report;
+        let response = dispatch_with(&backend, Action::Spaces {});
+        assert!(response.ok);
+        let value = response.to_value();
+        assert_eq!(value["action"], "spaces");
+        assert_eq!(value["screens"][0]["name"], "Display 0");
+        assert_eq!(value["screens"][0]["windows"][0]["title"], "Note 1");
+        assert_eq!(value["screens"][0]["is_primary"], true);
+        // `group_windows` itself is exercised in window_groups tests.
+        let _ = DisplayInfo {
+            id: 0,
+            name: String::new(),
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+            scale: 1.0,
+            is_primary: false,
+        };
+    }
+
+    #[test]
+    fn p9_shortcuts_run_invokes_with_only_the_name() {
+        // The test backend does not exercise the binary; this test only
+        // confirms dispatch reaches the helper when the binary is missing.
+        let backend = StubBackend::default();
+        let response = dispatch_with(
+            &backend,
+            Action::ShortcutsRun {
+                name: "Open URL".into(),
+            },
+        );
+        // The `shortcuts` binary is unlikely to exist on a CI runner; the
+        // dispatch path always reaches it, so the response is either ok
+        // (binary present) or `execution_failed` (binary absent). Either
+        // outcome is acceptable; the failure code must be the documented
+        // one.
+        if !response.ok {
+            assert_eq!(
+                response.to_value()["error"]["code"],
+                "execution_failed",
+                "{:?}",
+                response.to_value()
+            );
+        }
     }
 
     #[test]

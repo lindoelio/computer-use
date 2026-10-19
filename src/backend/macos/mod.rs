@@ -5,15 +5,19 @@
 //! for a reason other than permission or a messaging timeout. App inventory
 //! and `doctor` use AppKit and CoreGraphics.
 
+pub(crate) mod apple;
 mod apps;
 mod ax;
 mod capture;
+pub(crate) mod dock;
 mod doctor;
 #[cfg(all(feature = "skylight", not(test)))]
 mod focus;
 pub(crate) mod input;
+pub(crate) mod menu;
 #[cfg(not(test))]
 pub(crate) mod overlay;
+pub(crate) mod spaces;
 
 pub(crate) use apps::{activate, launch, list_apps, list_windows, quit};
 pub(crate) use ax::{browser_url, peek_element};

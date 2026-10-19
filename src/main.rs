@@ -11,7 +11,7 @@ use std::process::ExitCode;
 
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
-use computer_use::protocol::{handle_request_line_opts, LineOptions};
+use computer_use::protocol::{handle_request_line_opts, AppleEventLanguage, LineOptions};
 use computer_use::{
     parse_path, parse_region, Action, CallContext, ImageFormat, MouseButton, Response,
     ScrollDirection,
@@ -581,6 +581,73 @@ enum CliCommand {
     /// Example: computer-use tree --app Notes --window 0
     Tree,
 
+    /// Walk a running app's menu bar. macOS only.
+    ///
+    /// Without `--depth` the walk goes four levels deep. The walk uses the
+    /// Accessibility API (`AXMenuBar` -> `AXMenuBarItem` -> `AXMenu`).
+    /// `--app` selects the running app; bundle id or pid are accepted too.
+    /// Title matches are case-insensitive.
+    ///
+    /// Example: computer-use menu list --app Finder
+    #[command(name = "menu")]
+    Menu {
+        #[command(subcommand)]
+        command: MenuCommand,
+    },
+
+    /// Send an Apple event script via `osascript`. macOS only.
+    ///
+    /// The script body is never logged verbatim. `--language javascript`
+    /// selects JavaScript for Automation. The script body may contain
+    /// `tell application "X" to ...`; the `--app` value is recorded in the
+    /// audit line and used by the policy deny list.
+    ///
+    /// Example: computer-use apple-event --app Finder --script 'get name'
+    #[command(name = "apple-event", alias = "apple_event")]
+    AppleEvent {
+        /// Optional override. Falls back to `--app`.
+        #[arg(long, value_name = "APP")]
+        app: Option<String>,
+        /// Script body passed to `osascript -e`.
+        #[arg(long, value_name = "SCRIPT")]
+        script: String,
+        /// `applescript` (default) or `javascript`.
+        #[arg(long, value_enum)]
+        language: Option<CliAppleEventLanguage>,
+    },
+
+    /// Run a Shortcuts workflow by name. macOS only.
+    ///
+    /// The `shortcuts` binary is invoked with the workflow name as a single
+    /// positional argument. A missing binary is `execution_failed`.
+    ///
+    /// Example: computer-use shortcuts run "Open URL"
+    #[command(name = "shortcuts")]
+    Shortcuts {
+        #[command(subcommand)]
+        command: ShortcutsCommand,
+    },
+
+    /// List or click Dock items. macOS only.
+    ///
+    /// Example: computer-use dock list
+    /// Example: computer-use dock click --title Finder
+    #[command(name = "dock")]
+    Dock {
+        #[command(subcommand)]
+        command: DockCommand,
+    },
+
+    /// Group on-screen windows by the screen that contains each window's
+    /// center.
+    ///
+    /// Mission Control moves are not attempted; the report only describes
+    /// the current layout. The skylight feature, when active, may opt into
+    /// best-effort space moves; otherwise the report is read-only.
+    ///
+    /// Example: computer-use spaces
+    Spaces,
+
     /// Session cache and accessibility teardown.
     Session {
         #[command(subcommand)]
@@ -611,6 +678,72 @@ enum CliCommand {
 enum OverlayCommand {
     /// Draw a click-through ring at points read from the overlay socket.
     Serve,
+}
+
+#[derive(Debug, Subcommand)]
+enum MenuCommand {
+    /// List the menu bar for one running app.
+    ///
+    /// `--app` is required. `--depth` caps the recursion; default is 4.
+    List {
+        /// Optional override. Falls back to `--app`.
+        #[arg(long, value_name = "APP")]
+        app: Option<String>,
+        /// Maximum depth below the menu bar. Default: 4.
+        #[arg(long, value_name = "N")]
+        depth: Option<u32>,
+    },
+    /// Click one menu item by `">"`-separated titles.
+    ///
+    /// `--app` is required. Matches are case-insensitive.
+    Click {
+        /// Optional override. Falls back to `--app`.
+        #[arg(long, value_name = "APP")]
+        app: Option<String>,
+        /// Path of menu titles separated by `>`.
+        #[arg(long, value_name = "PATH")]
+        path: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliAppleEventLanguage {
+    /// AppleScript. Default.
+    #[value(name = "applescript", alias = "osa")]
+    AppleScript,
+    /// JavaScript for Automation. `osascript -l JavaScript`.
+    #[value(name = "javascript", alias = "js")]
+    JavaScript,
+}
+
+impl From<CliAppleEventLanguage> for AppleEventLanguage {
+    fn from(value: CliAppleEventLanguage) -> Self {
+        match value {
+            CliAppleEventLanguage::AppleScript => Self::AppleScript,
+            CliAppleEventLanguage::JavaScript => Self::JavaScript,
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum ShortcutsCommand {
+    /// Run a Shortcuts workflow by name. The binary is `shortcuts run <name>`.
+    Run {
+        /// Workflow name. Passed as a single positional argument.
+        name: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DockCommand {
+    /// List the Dock items in Dock order.
+    List,
+    /// Click a Dock item by title.
+    Click {
+        /// Dock item title.
+        #[arg(long, value_name = "TITLE")]
+        title: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -1011,6 +1144,52 @@ fn command_action(
             open_settings: *open_settings,
         },
         CliCommand::Tree => Action::Tree,
+        CliCommand::Menu { command } => match command {
+            MenuCommand::List { app, depth } => {
+                if let Some(positional) = app {
+                    context.app = Some(positional.clone());
+                }
+                Action::MenuList {
+                    app: None,
+                    depth: *depth,
+                }
+            }
+            MenuCommand::Click { app, path } => {
+                if let Some(positional) = app {
+                    context.app = Some(positional.clone());
+                }
+                Action::MenuClick {
+                    app: None,
+                    path: path.to_string(),
+                }
+            }
+        },
+        CliCommand::AppleEvent {
+            app,
+            script,
+            language,
+        } => {
+            if let Some(positional) = app {
+                context.app = Some(positional.clone());
+            }
+            Action::AppleEvent {
+                app: None,
+                script: script.to_string(),
+                language: language.map(AppleEventLanguage::from),
+            }
+        }
+        CliCommand::Shortcuts { command } => match command {
+            ShortcutsCommand::Run { name } => Action::ShortcutsRun {
+                name: name.to_string(),
+            },
+        },
+        CliCommand::Dock { command } => match command {
+            DockCommand::List => Action::DockList {},
+            DockCommand::Click { title } => Action::DockClick {
+                title: title.to_string(),
+            },
+        },
+        CliCommand::Spaces => Action::Spaces {},
         CliCommand::Session { command } => match command {
             SessionCommand::End => Action::SessionEnd,
             SessionCommand::Prune { dry_run, ttl } => Action::SessionPrune {

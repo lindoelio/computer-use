@@ -87,7 +87,7 @@ pub(crate) fn permission_message_for(subject: &str) -> String {
 }
 
 #[derive(Debug)]
-enum WalkError {
+pub(crate) enum WalkError {
     Permission(String),
     Timeout,
     WindowNotFound(String),
@@ -106,7 +106,7 @@ impl WalkError {
     }
 }
 
-enum AttrError {
+pub(crate) enum AttrError {
     Timeout,
     Permission,
     Failed,
@@ -1439,6 +1439,18 @@ fn ensure_trusted() -> Result<(), WalkError> {
     }
 }
 
+/// P9 menu/dock helpers reuse this. The desktop view of the menu bar and the
+/// Dock items is gated behind Accessibility like the tree.
+pub(crate) fn ensure_trusted_for_menu() -> Result<(), crate::error::ComputerError> {
+    if trusted() {
+        Ok(())
+    } else {
+        Err(crate::error::ComputerError::PermissionRequired(
+            permission_subject(),
+        ))
+    }
+}
+
 fn permission_subject() -> String {
     let subject = apps::responsible_app()
         .map(|app| app.name)
@@ -1446,7 +1458,7 @@ fn permission_subject() -> String {
     permission_message_for(&subject)
 }
 
-fn application(pid: i32) -> Result<CFRetained<AXUIElement>, WalkError> {
+pub(crate) fn application(pid: i32) -> Result<CFRetained<AXUIElement>, WalkError> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // SAFETY: pid is a process id. The wrapper returns a +1 element or panics if the
         // system returns null. The panic is caught and becomes execution_failed.
@@ -1462,7 +1474,10 @@ fn ignore_timeout(element: &AXUIElement) {
     let _ = unsafe { element.set_messaging_timeout(ELEMENT_TIMEOUT_SECS) };
 }
 
-fn copy_cf(element: &AXUIElement, name: &str) -> Result<Option<CFRetained<CFType>>, AttrError> {
+pub(crate) fn copy_cf(
+    element: &AXUIElement,
+    name: &str,
+) -> Result<Option<CFRetained<CFType>>, AttrError> {
     let attribute = CFString::from_str(name);
     let mut slot: *const CFType = std::ptr::null();
     // SAFETY: slot is a stack out-parameter. On success it holds a +1 CFType, which from_raw owns.
@@ -1480,11 +1495,11 @@ fn copy_cf(element: &AXUIElement, name: &str) -> Result<Option<CFRetained<CFType
     }
 }
 
-fn copy_string(element: &AXUIElement, name: &str) -> Result<Option<String>, AttrError> {
+pub(crate) fn copy_string(element: &AXUIElement, name: &str) -> Result<Option<String>, AttrError> {
     Ok(copy_cf(element, name)?.as_deref().and_then(cf_text))
 }
 
-fn copy_bool(element: &AXUIElement, name: &str) -> Result<Option<bool>, AttrError> {
+pub(crate) fn copy_bool(element: &AXUIElement, name: &str) -> Result<Option<bool>, AttrError> {
     let Some(value) = copy_cf(element, name)? else {
         return Ok(None);
     };
@@ -1727,7 +1742,7 @@ fn copy_range(
     Ok(array_elements(&array))
 }
 
-fn array_elements(array: &CFArray) -> Vec<CFRetained<AXUIElement>> {
+pub(crate) fn array_elements(array: &CFArray) -> Vec<CFRetained<AXUIElement>> {
     let mut out = Vec::new();
     for index in 0..array.count() {
         // SAFETY: index is in range. value_at_index is +0. Null entries are skipped.

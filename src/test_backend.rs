@@ -5,10 +5,15 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
-use crate::backend::{DesktopBackend, WindowTarget};
+use crate::backend::{
+    AppleEventReport, DesktopBackend, DockClickReport, DockListReport, MenuClickReport,
+    MenuListReport, MenuNode, WindowTarget,
+};
 use crate::element::{self, ElementError, ElementOutcome, ElementRequest, HitInfo};
 use crate::error::ComputerError;
+use crate::menu_path::MenuPath;
 use crate::policy::{self, quit_is_protected};
+use crate::protocol::AppleEventLanguage;
 use crate::target::{
     filter_windows_for_pid, parse_app_selector, parse_window_selector, resolve_app, resolve_window,
     ActivationPolicy, AppInfo, AppSelector, DoctorReport, LaunchResult, QuitResult, ResponsibleApp,
@@ -16,6 +21,7 @@ use crate::target::{
 };
 use crate::tree::{self, NodeFrame, SigNode, TreeQuery, TreeReport, UiNode};
 use crate::types::{DisplayInfo, Frame, FrontmostInfo, Modifier, MouseButton, RawCapture, Region};
+use crate::window_groups::SpacesReport;
 
 /// Fault injected by [`StubBackend::capture_window`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -97,6 +103,29 @@ pub struct StubBackend {
     pub clipboard_text: Mutex<Option<String>>,
     /// In-memory clipboard RGBA. Used when text is absent.
     pub clipboard_image: Mutex<Option<Vec<u8>>>,
+    /// Menu bar entries the stub returns from `menu_list`.
+    pub menu_sections: Mutex<Vec<MenuNode>>,
+    /// Menu click requests, recorded by `menu_click`.
+    pub menu_clicks: Mutex<Vec<MenuPath>>,
+    /// Apple event script calls. The body is **not** stored verbatim; only
+    /// the script length and the language survive the test boundary.
+    pub apple_event_calls: Mutex<Vec<(String, AppleEventLanguage, usize)>>,
+    /// Stubbed `osascript` output for `apple_event`.
+    pub apple_event_stdout: Mutex<String>,
+    /// Stubbed `osascript` stderr for `apple_event`.
+    pub apple_event_stderr: Mutex<String>,
+    /// When true, `apple_event` returns `execution_failed` with `apple_event_stderr`.
+    pub apple_event_fail: bool,
+    /// Dock items the stub returns from `dock_list`.
+    pub dock_items: Mutex<Vec<String>>,
+    /// Dock click requests, recorded by `dock_click`.
+    pub dock_clicks: Mutex<Vec<String>>,
+    /// Stubbed `spaces` report.
+    pub spaces_report: Mutex<SpacesReport>,
+    /// When true, the stubbed menu click returns an `element_not_found`.
+    pub fail_menu_click: bool,
+    /// When true, the stubbed menu click finds the item but reports it disabled.
+    pub menu_disabled: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -154,6 +183,20 @@ impl Default for StubBackend {
             holds_ms: Mutex::new(Vec::new()),
             clipboard_text: Mutex::new(None),
             clipboard_image: Mutex::new(None),
+            menu_sections: Mutex::new(Vec::new()),
+            menu_clicks: Mutex::new(Vec::new()),
+            apple_event_calls: Mutex::new(Vec::new()),
+            apple_event_stdout: Mutex::new(String::new()),
+            apple_event_stderr: Mutex::new(String::new()),
+            apple_event_fail: false,
+            dock_items: Mutex::new(Vec::new()),
+            dock_clicks: Mutex::new(Vec::new()),
+            spaces_report: Mutex::new(SpacesReport {
+                screens: Vec::new(),
+                note: String::new(),
+            }),
+            fail_menu_click: false,
+            menu_disabled: false,
         }
     }
 }
@@ -646,6 +689,110 @@ impl DesktopBackend for StubBackend {
             .cloned())
     }
 
+    fn menu_list(&self, app: &str, _depth: u32) -> Result<MenuListReport, ComputerError> {
+        let selector = parse_app_selector(app)?;
+        policy::deny_or_allow(policy::selector_denial(&selector))?;
+        let sections = self.menu_sections.lock().expect("menu sections").clone();
+        Ok(MenuListReport {
+            app: app.to_string(),
+            sections,
+        })
+    }
+
+    fn menu_click(&self, app: &str, path: &MenuPath) -> Result<MenuClickReport, ComputerError> {
+        let selector = parse_app_selector(app)?;
+        policy::deny_or_allow(policy::selector_denial(&selector))?;
+        self.menu_clicks
+            .lock()
+            .expect("menu clicks")
+            .push(path.clone());
+        if self.fail_menu_click {
+            return Err(ComputerError::ElementNotFound(format!(
+                "menu segment {:?} not found",
+                path.segments.last()
+            )));
+        }
+        if self.menu_disabled {
+            return Err(ComputerError::ExecutionFailed(format!(
+                "menu segment {:?} is disabled",
+                path.segments.last()
+            )));
+        }
+        Ok(MenuClickReport { pressed: true })
+    }
+
+    fn apple_event(
+        &self,
+        app: &str,
+        script: &str,
+        language: AppleEventLanguage,
+    ) -> Result<AppleEventReport, ComputerError> {
+        let selector = parse_app_selector(app)?;
+        policy::deny_or_allow(policy::selector_denial(&selector))?;
+        // The script body is never logged verbatim. Record only the language
+        // and length so the audit line can identify a script run.
+        self.apple_event_calls
+            .lock()
+            .expect("apple event calls")
+            .push((app.to_string(), language, script.len()));
+        let stdout = self
+            .apple_event_stdout
+            .lock()
+            .expect("apple event stdout")
+            .clone();
+        let stderr = self
+            .apple_event_stderr
+            .lock()
+            .expect("apple event stderr")
+            .clone();
+        if self.apple_event_fail {
+            return Err(ComputerError::ExecutionFailed(format!(
+                "osascript stub failed: {stderr}"
+            )));
+        }
+        let hash = fnv1a64_hex(script.as_bytes());
+        Ok(AppleEventReport {
+            script_bytes: script.len(),
+            script_hash: hash,
+            stdout,
+            stderr,
+            exit_status: 0,
+        })
+    }
+
+    fn dock_list(&self) -> Result<DockListReport, ComputerError> {
+        let items = self
+            .dock_items
+            .lock()
+            .expect("dock items")
+            .iter()
+            .map(|title| crate::backend::DockItem {
+                title: title.clone(),
+            })
+            .collect();
+        Ok(DockListReport { items })
+    }
+
+    fn dock_click(&self, title: &str) -> Result<DockClickReport, ComputerError> {
+        let items = self.dock_items.lock().expect("dock items").clone();
+        let needle = title.to_lowercase();
+        let match_position = items.iter().position(|item| item.to_lowercase() == needle);
+        let Some(_) = match_position else {
+            return Err(ComputerError::ElementNotFound(format!(
+                "dock item {title:?} not found"
+            )));
+        };
+        self.dock_clicks
+            .lock()
+            .expect("dock clicks")
+            .push(title.to_string());
+        Ok(DockClickReport { pressed: true })
+    }
+
+    fn spaces(&self) -> Result<SpacesReport, ComputerError> {
+        Ok(self.spaces_report.lock().expect("spaces report").clone())
+    }
+
     fn peek_element(
         &self,
         app: Option<&str>,
@@ -1057,6 +1204,17 @@ fn fixture_doctor() -> DoctorReport {
         required: crate::doctor::MACOS_REQUIRED,
         ..crate::doctor::DoctorInput::default()
     })
+}
+
+fn fnv1a64_hex(bytes: &[u8]) -> String {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut hash = OFFSET;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    format!("{hash:016x}")
 }
 
 #[cfg(test)]

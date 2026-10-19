@@ -226,7 +226,7 @@ struct LaunchTarget {
     bundle_path: PathBuf,
 }
 
-fn resolve_running(
+pub(crate) fn resolve_running(
     app: &str,
     window: Option<&str>,
 ) -> Result<(AppInfo, Option<crate::target::WindowInfo>), ComputerError> {
