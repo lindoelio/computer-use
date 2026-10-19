@@ -1,15 +1,33 @@
 //! macOS accessibility and frontmost-window lookup.
 //!
-//! Screenshots and input are shared. The accessibility tree comes from
-//! System Events through `osascript` (JavaScript for Automation), adapted
-//! from the Bezalel macOS backend and bounded so a deep tree cannot hang
-//! the process. App inventory and `doctor` use AppKit and CoreGraphics.
+//! Screenshots and input are shared. The accessibility tree is read in-process
+//! from `AXUIElement`. `osascript` remains the fallback when that path fails
+//! for a reason other than permission or a messaging timeout. App inventory
+//! and `doctor` use AppKit and CoreGraphics.
 
 mod apps;
+mod ax;
 mod doctor;
 
 pub(crate) use apps::{activate, launch, list_apps, list_windows, quit};
 pub(crate) use doctor::doctor;
+
+use crate::tree::{TreeQuery, TreeReport};
+
+/// Key-window accessibility tree.
+pub(crate) fn tree(query: &TreeQuery) -> Result<TreeReport, ComputerError> {
+    ax::tree(query)
+}
+
+/// Restore Electron flags for `session` and stop its observers.
+pub(crate) fn end_session(session: Option<&str>) -> Result<Vec<i32>, ComputerError> {
+    ax::end_session(session)
+}
+
+/// Process-exit restore. See [`ax::shutdown_sessions`].
+pub(crate) fn shutdown_sessions() {
+    ax::shutdown_sessions();
+}
 
 use std::time::Duration;
 

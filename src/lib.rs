@@ -19,6 +19,7 @@
 #![deny(unsafe_code)]
 
 pub mod backend;
+pub mod cache;
 pub mod error;
 mod image_util;
 pub mod keys;
@@ -26,6 +27,7 @@ pub mod policy;
 pub mod protocol;
 pub mod state;
 pub mod target;
+pub mod tree;
 pub mod types;
 
 #[cfg(test)]
@@ -42,6 +44,15 @@ pub use types::{
     parse_region, DisplayInfo, Frame, FrontmostInfo, ImageFormat, Modifier, MouseButton, Region,
     ScrollDirection,
 };
+
+/// Restore Electron accessibility flags and stop AX observers.
+///
+/// The CLI calls this before it exits. A crash skips it, so a flag this process
+/// turned on can stay set until the target app quits. `session end` restores
+/// from the session cache in a later process.
+pub fn shutdown_sessions() {
+    backend::shutdown_sessions();
+}
 
 #[cfg(target_os = "linux")]
 pub use backend::LinuxDesktopBackend;

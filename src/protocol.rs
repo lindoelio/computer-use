@@ -17,8 +17,9 @@ use crate::backend::{validate_key, DesktopBackend};
 use crate::error::{ComputerError, ErrorBody};
 use crate::image_util::{encode_base64, encode_image};
 use crate::keys::parse_key_combo;
-use crate::state::collect_state_targeting;
-use crate::target::{filter_windows_for_pid, parse_app_selector, resolve_app, AppSelector};
+use crate::state::collect_state_for;
+use crate::target::{filter_windows_for_pid, parse_app_selector, resolve_app};
+use crate::tree::TreeQuery;
 use crate::types::{ImageFormat, Modifier, MouseButton, Region, ScrollDirection};
 
 const MAX_WAIT_MS: u128 = 24 * 60 * 60 * 1000;
@@ -146,6 +147,10 @@ pub enum Action {
         #[serde(default)]
         request: bool,
     },
+    /// Numbered accessibility tree for the key window.
+    Tree,
+    /// Restore Electron accessibility flags and stop observers.
+    SessionEnd,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -349,10 +354,9 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
             direction,
             amount,
         } => scroll(backend, x, y, dx, dy, direction, amount),
-        Action::GetState => Ok(collect_state_targeting(
-            backend,
-            app_name_for_state(backend, context.app.as_deref()).as_deref(),
-        )),
+        Action::GetState => Ok(collect_state_for(backend, &tree_query(context))),
+        Action::Tree => tree_action(backend, context),
+        Action::SessionEnd => session_end(backend, context),
         Action::Wait { ms, seconds } => wait(ms, seconds),
         Action::Displays => displays(backend),
         Action::ListApps { all } => list_apps(backend, all),
@@ -585,25 +589,46 @@ fn displays(backend: &dyn DesktopBackend) -> Result<Value, ComputerError> {
     Ok(json!({"displays": displays}))
 }
 
-/// Name passed to the current accessibility inspector.
-///
-/// A pid or bundle id is resolved to the localized name when the inventory
-/// is available. A failure keeps the raw selector so the inspector can try it.
-fn app_name_for_state(backend: &dyn DesktopBackend, app: Option<&str>) -> Option<String> {
-    let app = app?;
-    let Ok(selector) = parse_app_selector(app) else {
-        return Some(app.to_string());
-    };
-    match selector {
-        AppSelector::Name(name) => Some(name),
-        other => match backend.list_apps(true) {
-            Ok(apps) => resolve_app(&apps, &other)
-                .ok()
-                .map(|item| item.name.clone())
-                .or_else(|| Some(app.to_string())),
-            Err(_) => Some(app.to_string()),
-        },
+fn tree_query(context: &CallContext) -> TreeQuery {
+    TreeQuery {
+        app: context.app.clone(),
+        window: context.window.clone(),
+        full: context.full,
+        session: context.session.clone(),
     }
+}
+
+fn tree_action(
+    backend: &dyn DesktopBackend,
+    context: &CallContext,
+) -> Result<Value, ComputerError> {
+    let report = backend.tree(&tree_query(context))?;
+    let mut body = json!({
+        "pid": report.pid,
+        "window_id": report.window_id,
+        "revision": report.revision,
+        "source": report.source,
+        "truncated": report.truncated,
+        "tree": report.tree,
+    });
+    if let Some(note) = report.note {
+        body["note"] = json!(note);
+    }
+    if let Some(legacy) = report.legacy.as_deref() {
+        body["accessibility_legacy"] = serde_json::from_str(legacy).unwrap_or(Value::Null);
+    }
+    Ok(body)
+}
+
+fn session_end(
+    backend: &dyn DesktopBackend,
+    context: &CallContext,
+) -> Result<Value, ComputerError> {
+    let restored = backend.end_session(context.session.as_deref())?;
+    Ok(json!({
+        "action": "session_end",
+        "restored": restored,
+    }))
 }
 
 fn list_apps(backend: &dyn DesktopBackend, all: bool) -> Result<Value, ComputerError> {
@@ -1137,8 +1162,8 @@ mod tests {
         assert_eq!(windows[0]["id"], 100);
         assert_eq!(windows[1]["z"], 1);
         assert_eq!(windows[1]["title"], "Welcome");
-        assert_eq!(windows[0]["ax_matched"], false);
-        assert!(value["note"].as_str().unwrap().contains("P2"));
+        assert_eq!(windows[0]["ax_matched"], true);
+        assert!(value.get("note").is_none());
 
         let response = dispatch_with_context(&backend, Action::Launch, &ctx("Notes"));
         assert!(response.ok, "{response:?}");
@@ -1188,16 +1213,50 @@ mod tests {
 
         let response = dispatch_with(&backend, Action::GetState);
         assert!(response.ok);
-        let seen = backend.accessibility_apps.lock().unwrap().clone();
-        assert_eq!(seen.last(), Some(&None));
+        let value = response.to_value();
+        assert_eq!(value["pid"], 10);
+        assert_eq!(value["source"], "stub");
+        assert!(value["tree"].as_str().unwrap().contains("AXWindow"));
+        assert!(value["accessibility_legacy"].is_null());
 
         let response = dispatch_with_context(&backend, Action::GetState, &ctx("412"));
-        assert_eq!(response.to_value()["accessibility"]["role"], "window");
+        assert_eq!(response.to_value()["pid"], 412);
+        assert_eq!(response.to_value()["source"], "stub");
+        assert!(response.to_value()["tree"]
+            .as_str()
+            .unwrap()
+            .contains("AXWindow"));
         let seen = backend.accessibility_apps.lock().unwrap().clone();
-        assert_eq!(
-            seen.last().and_then(|name| name.as_deref()),
-            Some("Foo \"Bar\"")
+        assert_eq!(seen.last().and_then(|name| name.as_deref()), Some("412"));
+
+        // Get-state already stored a baseline. Clear it so this sequence
+        // still covers "no baseline prints the full tree".
+        backend.baselines.lock().unwrap().clear();
+        let first = dispatch_with_context(&backend, Action::Tree, &ctx("Notes"));
+        assert!(first.ok, "{first:?}");
+        let full = first.to_value()["tree"].as_str().unwrap().to_string();
+        assert!(full.contains("value=\"a\""), "{full}");
+        assert_eq!(first.to_value()["source"], "stub");
+        *backend.stub_value.lock().unwrap() = "ab".into();
+        let diff = dispatch_with_context(&backend, Action::Tree, &ctx("Notes"));
+        let diff_text = diff.to_value()["tree"].as_str().unwrap().to_string();
+        assert!(
+            diff_text.contains("~ [1] AXTextArea value: \"a\" -> \"ab\""),
+            "{diff_text}"
         );
+        let mut full_context = ctx("Notes");
+        full_context.full = true;
+        let replaced = dispatch_with_context(&backend, Action::Tree, &full_context);
+        let replaced_text = replaced.to_value()["tree"].as_str().unwrap().to_string();
+        assert!(replaced_text.contains("value=\"ab\""), "{replaced_text}");
+        assert!(!replaced_text.contains("~ [1]"));
+        let after = dispatch_with_context(&backend, Action::Tree, &ctx("Notes"));
+        assert_eq!(after.to_value()["tree"].as_str().unwrap(), "");
+
+        let ended = dispatch_with(&backend, Action::SessionEnd);
+        assert!(ended.ok, "{ended:?}");
+        assert_eq!(ended.to_value()["action"], "session_end");
+        assert!(ended.to_value()["restored"].as_array().unwrap().is_empty());
     }
 
     #[test]
@@ -1212,6 +1271,7 @@ mod tests {
             ),
             active: false,
             hidden: false,
+            activation_policy: crate::target::ActivationPolicy::Regular,
         });
         backend.windows.push(crate::target::WindowInfo {
             id: 9,
@@ -1247,6 +1307,7 @@ mod tests {
             path: None,
             active: false,
             hidden: false,
+            activation_policy: crate::target::ActivationPolicy::Regular,
         });
         let response = dispatch_with_context(&backend, Action::Quit, &ctx(&self_pid.to_string()));
         assert_eq!(response.to_value()["error"]["code"], "policy_denied");

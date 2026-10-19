@@ -42,15 +42,38 @@ fn help_lists_commands() {
         "activate",
         "quit",
         "doctor",
+        "tree",
+        "session",
         "serve",
         "exec",
         "--pretty",
         "--json",
         "--app",
         "--window",
+        "--full",
+        "--session",
     ] {
         assert!(stdout.contains(needle), "help missing {needle}:\n{stdout}");
     }
+}
+
+#[test]
+fn tree_command_is_unsupported_off_macos() {
+    if cfg!(target_os = "macos") {
+        return;
+    }
+    let output = run(&["tree"]);
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
+        panic!(
+            "stdout was not JSON: {} stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["code"], "unsupported");
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(message.contains(std::env::consts::OS), "{message}");
 }
 
 #[test]

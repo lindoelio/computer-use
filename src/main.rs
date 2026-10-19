@@ -45,8 +45,26 @@ struct Cli {
     #[arg(long, global = true, value_name = "TITLE|INDEX|ID")]
     window: Option<String>,
 
+    /// Print a diff against the cached tree. This is the default once a baseline exists.
+    #[arg(long, global = true, conflicts_with = "full")]
+    diff: bool,
+
+    /// Print the full tree and replace the cached baseline.
+    #[arg(long, global = true)]
+    full: bool,
+
+    /// Session cache namespace. Defaults to this process id.
+    #[arg(long, global = true, value_name = "ID")]
+    session: Option<String>,
+
     #[command(subcommand)]
     command: Option<CliCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+enum SessionCommand {
+    /// Restore Electron accessibility flags this process changed and stop observers.
+    End,
 }
 
 #[derive(Debug, Subcommand)]
@@ -197,7 +215,7 @@ enum CliCommand {
     /// List on-screen windows in z-order. Index 0 is front.
     ///
     /// `--app` keeps that application's windows and renumbers z-order.
-    /// `ax_matched` stays false until the accessibility join in a later phase.
+    /// `ax_matched` is true when an accessibility window shares that row's bounds.
     ///
     /// Example: computer-use list-windows --app Finder
     #[command(name = "list-windows", visible_alias = "list_windows")]
@@ -238,6 +256,20 @@ enum CliCommand {
         /// Prompt for Accessibility and request Screen Recording.
         #[arg(long)]
         request: bool,
+    },
+
+    /// Print the key window's accessibility tree.
+    ///
+    /// This does not click. `--diff` is the default once a baseline exists.
+    /// `--full` prints the whole tree and replaces that baseline.
+    ///
+    /// Example: computer-use tree --app Notes --window 0
+    Tree,
+
+    /// Session cache and accessibility teardown.
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
     },
 
     /// Read newline-delimited JSON actions from stdin and write one JSON response per line.
@@ -317,6 +349,12 @@ impl From<CliDirection> for ScrollDirection {
 }
 
 fn main() -> ExitCode {
+    let code = run();
+    computer_use::shutdown_sessions();
+    ExitCode::from(code)
+}
+
+fn run() -> u8 {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => match error.kind() {
@@ -326,12 +364,12 @@ fn main() -> ExitCode {
                     &Response::failure("invalid_arguments", clap_message(&error)),
                     false,
                 );
-                return ExitCode::from(2);
+                return 2;
             }
         },
     };
 
-    let code = match (&cli.command, cli.json) {
+    match (&cli.command, cli.json) {
         (Some(CliCommand::Exec { json }), _) => {
             let response = handle_request_line(json);
             let code = u8::from(!response.ok);
@@ -359,6 +397,9 @@ fn main() -> ExitCode {
             let context = CallContext {
                 app: cli.app.clone(),
                 window: cli.window.clone(),
+                diff: cli.diff,
+                full: cli.full,
+                session: cli.session.clone(),
                 ..CallContext::default()
             };
             match command_action(command, context) {
@@ -369,8 +410,7 @@ fn main() -> ExitCode {
                 }
             }
         }
-    };
-    ExitCode::from(code)
+    }
 }
 
 fn command_action(
@@ -486,6 +526,10 @@ fn command_action(
             Action::Quit
         }
         CliCommand::Doctor { request } => Action::Doctor { request: *request },
+        CliCommand::Tree => Action::Tree,
+        CliCommand::Session { command } => match command {
+            SessionCommand::End => Action::SessionEnd,
+        },
         CliCommand::Serve | CliCommand::Exec { .. } => {
             return Err(Response::failure(
                 "invalid_arguments",

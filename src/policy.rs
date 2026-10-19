@@ -28,6 +28,7 @@ const DENIED_BUNDLE_IDS: &[&str] = &[
     "in.sinew.Enpass-Desktop",
     "com.apple.keychainaccess",
     "Microsoft.WindowsTerminal",
+    "app.crynta.terax",
 ];
 
 /// Executable file names, matched case-insensitively after canonicalization.
@@ -53,6 +54,7 @@ const DENIED_EXE_NAMES: &[&str] = &[
     "Dashlane",
     "Enpass",
     "Keychain Access",
+    "Terax",
 ];
 
 /// `.app` bundle directory names, matched as a single path component.
@@ -72,6 +74,7 @@ const DENIED_APP_BUNDLES: &[&str] = &[
     "Dashlane.app",
     "Enpass.app",
     "Keychain Access.app",
+    "Terax.app",
 ];
 
 /// Display names refused before a bundle is resolved. `Terminal` is enough
@@ -93,6 +96,7 @@ const DENIED_DISPLAY_NAMES: &[&str] = &[
     "Enpass",
     "Keychain Access",
     "Windows Terminal",
+    "Terax",
 ];
 
 /// Why a built-in rule refused an app.
@@ -273,6 +277,11 @@ mod tests {
         assert!(selector_denial(&selector).is_some());
         let named = AppSelector::Name(r#"Foo "Bar""#.into());
         assert!(selector_denial(&named).is_none());
+
+        assert!(identity_denial(Some("app.crynta.terax"), None, None, None).is_some());
+        assert!(selector_denial(&AppSelector::Name("Terax".into())).is_some());
+        let terax = Path::new("/Applications/Terax.app/Contents/MacOS/Terax");
+        assert!(identity_denial(None, Some(terax), None, None).is_some());
     }
 
     #[test]

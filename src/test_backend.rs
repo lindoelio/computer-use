@@ -1,5 +1,6 @@
 //! In-memory backend for unit tests. It never touches the real desktop.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
@@ -9,9 +10,10 @@ use crate::error::ComputerError;
 use crate::policy::{self, quit_is_protected};
 use crate::target::{
     filter_windows_for_pid, parse_app_selector, parse_window_selector, resolve_app, resolve_window,
-    AppInfo, AppSelector, DoctorReport, LaunchResult, QuitResult, ResponsibleApp, WindowBounds,
-    WindowInfo, WindowList,
+    ActivationPolicy, AppInfo, AppSelector, DoctorReport, LaunchResult, QuitResult, ResponsibleApp,
+    WindowBounds, WindowInfo, WindowList,
 };
+use crate::tree::{self, NodeFrame, SigNode, TreeQuery, TreeReport, UiNode};
 use crate::types::{DisplayInfo, Frame, FrontmostInfo, Modifier, MouseButton, Region};
 
 #[derive(Debug)]
@@ -34,6 +36,10 @@ pub struct StubBackend {
     pub quit: Mutex<Vec<String>>,
     pub accessibility_apps: Mutex<Vec<Option<String>>>,
     pub doctor_report: DoctorReport,
+    /// Value shown on the stub text node. Tests change it to force a diff.
+    pub stub_value: Mutex<String>,
+    /// In-memory tree baselines keyed by session, pid, and window id.
+    pub baselines: Mutex<HashMap<(String, i32, u32), SigNode>>,
 }
 
 impl Default for StubBackend {
@@ -54,6 +60,8 @@ impl Default for StubBackend {
             quit: Mutex::new(Vec::new()),
             accessibility_apps: Mutex::new(Vec::new()),
             doctor_report: fixture_doctor(),
+            stub_value: Mutex::new("a".into()),
+            baselines: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -149,7 +157,7 @@ impl DesktopBackend for StubBackend {
     fn list_windows(&self) -> Result<WindowList, ComputerError> {
         Ok(WindowList {
             windows: self.windows.clone(),
-            note: Some("ax_matched is false; joining CG windows to AX windows lands in P2".into()),
+            note: None,
         })
     }
 
@@ -234,6 +242,52 @@ impl DesktopBackend for StubBackend {
         })
     }
 
+    fn tree(&self, query: &TreeQuery) -> Result<TreeReport, ComputerError> {
+        self.accessibility_apps
+            .lock()
+            .expect("accessibility apps")
+            .push(query.app.clone());
+        if self.fail_accessibility {
+            return Err(ComputerError::Unsupported(
+                "accessibility is unavailable".into(),
+            ));
+        }
+        let (pid, window_id, title, _bundle_id) = self.resolve_tree_target(query)?;
+        let value = self.stub_value.lock().expect("stub value").clone();
+        let mut window = UiNode::bare("AXWindow");
+        window.title = Some(title);
+        window.frame = Some(NodeFrame {
+            x: 0.0,
+            y: 0.0,
+            width: 800.0,
+            height: 600.0,
+        });
+        let mut text = UiNode::bare("AXTextArea");
+        text.value = Some(value);
+        window.children = vec![text];
+        let rendered = tree::render(&window);
+        let key = (query.session.clone().unwrap_or_default(), pid, window_id);
+        let mut baselines = self.baselines.lock().expect("baselines");
+        let previous = baselines.get(&key).cloned();
+        let printed = tree::choose_text(previous.as_ref(), &rendered, query.full);
+        baselines.insert(key, rendered.root.clone());
+        Ok(TreeReport {
+            pid,
+            window_id,
+            revision: tree::revision_of(&rendered.root),
+            source: "stub".into(),
+            truncated: rendered.truncated,
+            tree: printed,
+            note: None,
+            legacy: None,
+        })
+    }
+
+    fn end_session(&self, _session: Option<&str>) -> Result<Vec<i32>, ComputerError> {
+        self.baselines.lock().expect("baselines").clear();
+        Ok(Vec::new())
+    }
+
     fn doctor(&self, request: bool) -> Result<DoctorReport, ComputerError> {
         let mut report = self.doctor_report.clone();
         if request {
@@ -279,6 +333,35 @@ impl StubBackend {
         ))?;
         Ok((info, chosen))
     }
+
+    fn resolve_tree_target(
+        &self,
+        query: &TreeQuery,
+    ) -> Result<(i32, u32, String, Option<String>), ComputerError> {
+        let apps = self.all_apps();
+        let info = if let Some(app) = query.app.as_deref() {
+            let selector = parse_app_selector(app)?;
+            resolve_app(&apps, &selector)?.clone()
+        } else {
+            apps.into_iter()
+                .find(|app| app.active && app.activation_policy == ActivationPolicy::Regular)
+                .ok_or_else(|| ComputerError::AppNotFound("frontmost app".into()))?
+        };
+        let owned = filter_windows_for_pid(&self.windows, info.pid);
+        let chosen = match query.window.as_deref() {
+            Some(window) => {
+                let selector = parse_window_selector(window)?;
+                Some(resolve_window(&owned, &selector)?.clone())
+            }
+            None => owned.first().cloned(),
+        };
+        let title = chosen
+            .as_ref()
+            .map(|window| window.title.clone())
+            .unwrap_or_else(|| info.name.clone());
+        let window_id = chosen.as_ref().map(|window| window.id).unwrap_or(0);
+        Ok((info.pid, window_id, title, info.bundle_id))
+    }
 }
 
 fn fixture_apps() -> Vec<AppInfo> {
@@ -290,6 +373,7 @@ fn fixture_apps() -> Vec<AppInfo> {
             path: Some("/Applications/Notes.app/Contents/MacOS/Notes".into()),
             active: true,
             hidden: false,
+            activation_policy: ActivationPolicy::Regular,
         },
         AppInfo {
             name: "Terminal".into(),
@@ -298,6 +382,7 @@ fn fixture_apps() -> Vec<AppInfo> {
             path: Some("/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal".into()),
             active: false,
             hidden: false,
+            activation_policy: ActivationPolicy::Regular,
         },
         AppInfo {
             name: "Foo \"Bar\"".into(),
@@ -306,6 +391,7 @@ fn fixture_apps() -> Vec<AppInfo> {
             path: Some("/Applications/Foo.app/Contents/MacOS/Foo".into()),
             active: false,
             hidden: false,
+            activation_policy: ActivationPolicy::Regular,
         },
     ]
 }
@@ -318,12 +404,17 @@ fn accessory_app() -> AppInfo {
         path: None,
         active: false,
         hidden: true,
+        activation_policy: ActivationPolicy::Accessory,
     }
 }
 
 fn fixture_windows() -> Vec<WindowInfo> {
     vec![
-        window(100, 10, "Notes", "Shopping", 0),
+        {
+            let mut front = window(100, 10, "Notes", "Shopping", 0);
+            front.ax_matched = true;
+            front
+        },
         window(200, 20, "Terminal", "bash", 1),
         window(101, 10, "Notes", "Welcome", 2),
     ]

@@ -49,6 +49,7 @@ clap = { version = "4", features = ["derive"] }
 enigo = "0.3.0"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 serde = { version = "1", features = ["derive"] }
+dirs = "6"
 serde_json = "1"
 thiserror = "2"
 xcap = "0.3.3"
@@ -62,8 +63,11 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "block2",
 ] }
 objc2-application-services = { version = "0.3.2", default-features = false, features = [
+    "AXError",
     "AXUIElement",
+    "AXValue",
     "HIServices",
+    "libc",
 ] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
     "CFArray",
@@ -74,6 +78,7 @@ objc2-core-foundation = { version = "0.3.2", default-features = false, features 
     "CFNumber",
     "CFRunLoop",
     "CFString",
+    "CFURL",
 ] }
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = [
     "CGGeometry",

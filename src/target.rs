@@ -36,6 +36,23 @@ pub enum WindowSelector {
     Title(String),
 }
 
+/// How macOS classifies a process. Helpers are accessory or prohibited.
+///
+/// `list-apps` omits this field. Missing values deserialize as [`ActivationPolicy::Regular`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivationPolicy {
+    /// Foreground app (`NSApplicationActivationPolicyRegular`).
+    #[default]
+    Regular,
+    /// Menu-bar or agent app.
+    Accessory,
+    /// Process that does not normally activate. Helper processes use this.
+    Prohibited,
+    /// The platform did not report a policy.
+    Unknown,
+}
+
 /// One running application, as returned by `list_apps`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppInfo {
@@ -51,6 +68,9 @@ pub struct AppInfo {
     pub active: bool,
     /// Whether the app is hidden.
     pub hidden: bool,
+    /// Activation policy. Omitted from `list-apps` JSON.
+    #[serde(default, skip_serializing)]
+    pub activation_policy: ActivationPolicy,
 }
 
 /// Rectangle in logical screen points.
@@ -85,9 +105,7 @@ pub struct WindowInfo {
     pub layer: i32,
     /// Whether the window was listed as on screen.
     pub on_screen: bool,
-    /// Whether an accessibility window was joined to this row.
-    ///
-    /// P1 leaves this false. P2 fills it in.
+    /// Whether an accessibility window was joined to this row by bounds.
     pub ax_matched: bool,
 }
 
@@ -268,6 +286,14 @@ pub fn parse_window_selector(text: &str) -> Result<WindowSelector, ComputerError
     Ok(WindowSelector::Title(text.to_string()))
 }
 
+/// True when `frame` is within 2 points of `bounds` on each edge and size.
+pub fn bounds_match_frame(bounds: WindowBounds, frame: crate::tree::NodeFrame) -> bool {
+    (f64::from(bounds.x) - frame.x).abs() <= 2.0
+        && (f64::from(bounds.y) - frame.y).abs() <= 2.0
+        && (f64::from(bounds.width) - frame.width).abs() <= 2.0
+        && (f64::from(bounds.height) - frame.height).abs() <= 2.0
+}
+
 /// Assign z-order from the CG array order. Index 0 is the front window.
 pub fn assign_z_order(entries: Vec<ListedWindow>) -> Vec<WindowInfo> {
     entries
@@ -380,17 +406,27 @@ pub fn canonical_exe_path(path: &Path) -> PathBuf {
 }
 
 fn pick_one<'a>(matches: &[&'a AppInfo], label: &str) -> Result<&'a AppInfo, ComputerError> {
-    if matches.len() == 1 {
-        return Ok(matches[0]);
+    let regular: Vec<&AppInfo> = matches
+        .iter()
+        .copied()
+        .filter(|app| app.activation_policy == ActivationPolicy::Regular)
+        .collect();
+    let pool: &[&AppInfo] = if regular.is_empty() {
+        matches
+    } else {
+        &regular
+    };
+    if pool.len() == 1 {
+        return Ok(pool[0]);
     }
-    let active: Vec<&&AppInfo> = matches.iter().filter(|app| app.active).collect();
+    let active: Vec<&AppInfo> = pool.iter().copied().filter(|app| app.active).collect();
     if active.len() == 1 {
         return Ok(active[0]);
     }
-    let pids: Vec<String> = matches.iter().map(|app| app.pid.to_string()).collect();
+    let pids: Vec<String> = pool.iter().map(|app| app.pid.to_string()).collect();
     Err(ComputerError::InvalidArguments(format!(
         "app selector {label:?} matched {} processes ({})",
-        matches.len(),
+        pool.len(),
         pids.join(", ")
     )))
 }
@@ -510,6 +546,7 @@ mod tests {
                 path: Some("/System/Applications/Notes.app/Contents/MacOS/Notes".into()),
                 active: true,
                 hidden: false,
+                activation_policy: ActivationPolicy::Regular,
             },
             AppInfo {
                 name: "Notes".into(),
@@ -518,6 +555,7 @@ mod tests {
                 path: Some("/Applications/Notes.app/Contents/MacOS/Notes".into()),
                 active: false,
                 hidden: false,
+                activation_policy: ActivationPolicy::Regular,
             },
             AppInfo {
                 name: r#"Foo "Bar""#.into(),
@@ -526,6 +564,7 @@ mod tests {
                 path: Some(r#"/Applications/Foo "Bar".app/Contents/MacOS/Foo"#.into()),
                 active: false,
                 hidden: false,
+                activation_policy: ActivationPolicy::Regular,
             },
             AppInfo {
                 name: "Terminal".into(),
@@ -534,6 +573,7 @@ mod tests {
                 path: Some("/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal".into()),
                 active: false,
                 hidden: false,
+                activation_policy: ActivationPolicy::Regular,
             },
         ]
     }
@@ -636,6 +676,59 @@ mod tests {
         let error = resolve_app(&both_inactive, &notes).unwrap_err();
         assert_eq!(error.code(), "invalid_arguments");
         assert!(error.to_string().contains("10"));
+    }
+
+    #[test]
+    fn ambiguous_name_prefers_a_regular_app_over_a_helper() {
+        let mut table = apps();
+        table.push(AppInfo {
+            name: "Google Chrome".into(),
+            bundle_id: Some("com.google.Chrome".into()),
+            pid: 1,
+            path: None,
+            active: false,
+            hidden: false,
+            activation_policy: ActivationPolicy::Regular,
+        });
+        table.push(AppInfo {
+            name: "Google Chrome".into(),
+            bundle_id: Some("com.google.Chrome.helper".into()),
+            pid: 3,
+            path: None,
+            active: true,
+            hidden: false,
+            activation_policy: ActivationPolicy::Prohibited,
+        });
+        let resolved = resolve_app(&table, &AppSelector::Name("Google Chrome".into())).unwrap();
+        assert_eq!(resolved.pid, 1);
+    }
+
+    #[test]
+    fn bounds_match_allows_two_points() {
+        let bounds = WindowBounds {
+            x: 10,
+            y: 20,
+            width: 100,
+            height: 80,
+        };
+        assert!(bounds_match_frame(
+            bounds,
+            crate::tree::NodeFrame {
+                x: 12.0,
+                y: 18.0,
+                width: 101.0,
+                height: 80.0,
+            }
+        ));
+        assert!(!bounds_match_frame(
+            bounds,
+            crate::tree::NodeFrame {
+                x: 14.0,
+                y: 20.0,
+                width: 100.0,
+                height: 80.0,
+            }
+        ));
     }
 
     #[test]

@@ -30,12 +30,11 @@ use crate::error::ComputerError;
 use crate::policy::{self, quit_is_protected};
 use crate::target::{
     assign_z_order, canonical_exe_path, filter_windows_for_pid, parse_app_selector,
-    parse_window_selector, resolve_app, resolve_window, AppInfo, AppSelector, LaunchResult,
-    ListedWindow, QuitResult, ResponsibleApp, WindowBounds, WindowList,
+    parse_window_selector, resolve_app, resolve_window, ActivationPolicy, AppInfo, AppSelector,
+    LaunchResult, ListedWindow, QuitResult, ResponsibleApp, WindowBounds, WindowList,
 };
 
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
-const AX_MATCH_NOTE: &str = "ax_matched is false; joining CG windows to AX windows lands in P2";
 /// `kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements`.
 const ON_SCREEN_WINDOWS: u32 = 1 | (1 << 4);
 const PROC_PIDT_SHORTBSDINFO: c_int = 13;
@@ -86,12 +85,20 @@ pub(crate) fn list_apps(all: bool) -> Result<Vec<AppInfo>, ComputerError> {
     Ok(apps)
 }
 
+/// On-screen windows in CG z-order, without the accessibility join.
+pub(crate) fn on_screen_windows() -> Result<Vec<crate::target::WindowInfo>, ComputerError> {
+    Ok(assign_z_order(copy_window_list()?))
+}
+
 pub(crate) fn list_windows() -> Result<WindowList, ComputerError> {
-    let entries = copy_window_list()?;
-    Ok(WindowList {
-        windows: assign_z_order(entries),
-        note: Some(AX_MATCH_NOTE.into()),
-    })
+    let mut windows = on_screen_windows()?;
+    let note = super::ax::annotate_matches(&mut windows);
+    Ok(WindowList { windows, note })
+}
+
+/// Parent pid from `PROC_PIDT_SHORTBSDINFO.pbsi_ppid`.
+pub(crate) fn parent_process_id(pid: i32) -> Option<i32> {
+    parent_pid(pid)
 }
 
 pub(crate) fn launch(selector: &str) -> Result<LaunchResult, ComputerError> {
@@ -524,6 +531,19 @@ fn app_info(app: &NSRunningApplication) -> AppInfo {
         path,
         active: app.isActive(),
         hidden: app.isHidden(),
+        activation_policy: activation_policy(app.activationPolicy()),
+    }
+}
+
+fn activation_policy(policy: NSApplicationActivationPolicy) -> ActivationPolicy {
+    if policy == NSApplicationActivationPolicy::Regular {
+        ActivationPolicy::Regular
+    } else if policy == NSApplicationActivationPolicy::Accessory {
+        ActivationPolicy::Accessory
+    } else if policy == NSApplicationActivationPolicy::Prohibited {
+        ActivationPolicy::Prohibited
+    } else {
+        ActivationPolicy::Unknown
     }
 }
 

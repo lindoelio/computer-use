@@ -16,6 +16,7 @@ mod windows;
 
 use crate::error::ComputerError;
 use crate::target::{AppInfo, DoctorReport, LaunchResult, QuitResult, WindowList};
+use crate::tree::{TreeQuery, TreeReport};
 use crate::types::{DisplayInfo, Frame, FrontmostInfo, Modifier, MouseButton, Region};
 
 /// Error for an operation this operating system does not implement.
@@ -93,6 +94,25 @@ pub trait DesktopBackend: Send + Sync {
     fn doctor(&self, _request: bool) -> Result<DoctorReport, ComputerError> {
         Err(unsupported("doctor"))
     }
+
+    /// Numbered accessibility tree for the key window.
+    fn tree(&self, _query: &TreeQuery) -> Result<TreeReport, ComputerError> {
+        Err(unsupported("tree"))
+    }
+
+    /// Restore accessibility flags recorded for `session`.
+    ///
+    /// The returned pids are the processes whose flags were written back.
+    /// An empty list means there was nothing to restore.
+    fn end_session(&self, _session: Option<&str>) -> Result<Vec<i32>, ComputerError> {
+        Ok(Vec::new())
+    }
+}
+
+/// Restore Electron flags and stop observers. No-op off macOS.
+pub fn shutdown_sessions() {
+    #[cfg(target_os = "macos")]
+    macos::shutdown_sessions();
 }
 
 /// Alias for [`DesktopBackend`].
@@ -119,7 +139,7 @@ pub fn create_desktop_backend() -> Box<dyn DesktopBackend> {
 }
 
 macro_rules! impl_platform_backend {
-    ($ty:ty, $inspect:path, $front:path, $doctor:path, $list_apps:path, $list_windows:path, $launch:path, $activate:path, $quit:path) => {
+    ($ty:ty, $inspect:path, $front:path, $doctor:path, $list_apps:path, $list_windows:path, $launch:path, $activate:path, $quit:path, $tree:path, $end_session:path) => {
         impl DesktopBackend for $ty {
             fn screenshot(&self, region: Option<Region>) -> Result<Frame, ComputerError> {
                 capture::capture(region)
@@ -196,6 +216,14 @@ macro_rules! impl_platform_backend {
             fn doctor(&self, request: bool) -> Result<DoctorReport, ComputerError> {
                 $doctor(request)
             }
+
+            fn tree(&self, query: &TreeQuery) -> Result<TreeReport, ComputerError> {
+                $tree(query)
+            }
+
+            fn end_session(&self, session: Option<&str>) -> Result<Vec<i32>, ComputerError> {
+                $end_session(session)
+            }
         }
     };
 }
@@ -210,7 +238,9 @@ impl_platform_backend!(
     macos::list_windows,
     macos::launch,
     macos::activate,
-    macos::quit
+    macos::quit,
+    macos::tree,
+    macos::end_session
 );
 #[cfg(target_os = "linux")]
 impl_platform_backend!(
@@ -222,7 +252,9 @@ impl_platform_backend!(
     linux::list_windows,
     linux::launch,
     linux::activate,
-    linux::quit
+    linux::quit,
+    linux::tree,
+    linux::end_session
 );
 #[cfg(target_os = "windows")]
 impl_platform_backend!(
@@ -234,7 +266,9 @@ impl_platform_backend!(
     windows::list_windows,
     windows::launch,
     windows::activate,
-    windows::quit
+    windows::quit,
+    windows::tree,
+    windows::end_session
 );
 
 #[cfg(target_os = "linux")]

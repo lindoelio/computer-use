@@ -516,7 +516,9 @@ Electron and Chromium, on first attach to a pid, before the walk:
 - Remember the previous values in the session cache.
 - Restore them from a `Drop` guard on the session and from `computer-use session end`. A crash can leak the flag until the target app quits. Document that. Do not restore a value we did not change.
 
-Hosted content: if the key window's children are empty, or a child's pid differs from the app pid, call `AXUIElementCreateApplication` on the child pid and walk that tree under the same window node. Discover helper pids from the child element first. If that yields nothing, scan `runningApplications` for processes whose bundle id contains the parent name and whose parent pid equals the target (`proc_pidinfo` / `PROC_PIDT_SHORTBSDINFO.pbi_ppid`). Cap helper walks at 3 pids.
+Hosted content: if the key window's children are empty, or a child's pid differs from the app pid, call `AXUIElementCreateApplication` on the child pid and walk that tree under the same window node. Discover helper pids from the child element first. If that yields nothing, scan `runningApplications` for processes whose bundle id contains the parent name and whose parent pid equals the target (`proc_pidinfo` / `PROC_PIDT_SHORTBSDINFO.pbsi_ppid`). Cap helper walks at 3 pids. The parent field is `pbsi_ppid`; `pbi_ppid` belongs to the longer `proc_bsdinfo` struct, which this walk does not use.
+
+A crash, or a library caller that never calls `shutdown_sessions`, skips the restore. A flag this process turned on can stay set until the target app quits. `computer-use session end` in a later process reads the session cache and restores it. The restore never writes an attribute this process did not change.
 
 Key window: the AX window whose `AXMain` is true, else the first AX window. `--window` overrides this. Join to the CG window from P1 by bounds.
 

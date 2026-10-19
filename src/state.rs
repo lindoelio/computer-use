@@ -6,33 +6,44 @@ use serde_json::{json, Value};
 
 use crate::backend::DesktopBackend;
 use crate::error::ComputerError;
+use crate::tree::{TreeQuery, TreeReport};
 use crate::types::{DisplayInfo, FrontmostInfo};
 
 /// Collect screen, cursor, frontmost window, and accessibility information.
 ///
 /// This function does not panic. A backend panic is caught and reported in `note`.
 pub fn collect_state(backend: &dyn DesktopBackend) -> Value {
-    collect_state_targeting(backend, None)
+    collect_state_for(backend, &TreeQuery::default())
 }
 
-/// Same snapshot as [`collect_state`], with `app_name` passed to accessibility.
-pub fn collect_state_targeting(backend: &dyn DesktopBackend, app_name: Option<&str>) -> Value {
-    match catch_unwind(AssertUnwindSafe(|| collect_state_inner(backend, app_name))) {
+/// Same snapshot as [`collect_state`], with the tree query from the request.
+pub fn collect_state_for(backend: &dyn DesktopBackend, query: &TreeQuery) -> Value {
+    match catch_unwind(AssertUnwindSafe(|| collect_state_inner(backend, query))) {
         Ok(value) => value,
-        Err(_) => json!({
-            "platform": platform_name(),
-            "displays": [],
-            "screen": null,
-            "cursor": null,
-            "frontmost_app": null,
-            "frontmost_window": null,
-            "accessibility": null,
-            "note": "get-state panicked internally and was recovered"
-        }),
+        Err(_) => recovered_state(),
     }
 }
 
-fn collect_state_inner(backend: &dyn DesktopBackend, app_name: Option<&str>) -> Value {
+fn recovered_state() -> Value {
+    json!({
+        "platform": platform_name(),
+        "displays": [],
+        "screen": null,
+        "cursor": null,
+        "frontmost_app": null,
+        "frontmost_window": null,
+        "tree": null,
+        "revision": null,
+        "window_id": null,
+        "pid": null,
+        "source": null,
+        "truncated": null,
+        "accessibility_legacy": null,
+        "note": "get-state panicked internally and was recovered"
+    })
+}
+
+fn collect_state_inner(backend: &dyn DesktopBackend, query: &TreeQuery) -> Value {
     let mut notes = Vec::new();
 
     let displays = match guard("displays", || backend.list_displays()) {
@@ -63,20 +74,63 @@ fn collect_state_inner(backend: &dyn DesktopBackend, app_name: Option<&str>) -> 
         notes.push(note);
     }
 
-    let (accessibility, access_note) = accessibility_value(backend, app_name);
-    if let Some(note) = access_note {
-        notes.push(note);
-    }
+    let tree = match catch_unwind(AssertUnwindSafe(|| backend.tree(query))) {
+        Ok(Ok(report)) => tree_value(&report, &mut notes),
+        Ok(Err(error)) => {
+            notes.push(error.to_string());
+            empty_tree()
+        }
+        Err(_) => {
+            notes.push("accessibility inspection panicked and was recovered".into());
+            empty_tree()
+        }
+    };
 
-    json!({
+    let mut body = json!({
         "platform": platform_name(),
         "displays": displays,
         "screen": screen,
         "cursor": cursor,
         "frontmost_app": front.app,
         "frontmost_window": front.window,
-        "accessibility": accessibility,
         "note": if notes.is_empty() { Value::Null } else { Value::String(notes.join("; ")) }
+    });
+    if let (Some(body), Value::Object(fields)) = (body.as_object_mut(), tree) {
+        for (key, value) in fields {
+            body.insert(key, value);
+        }
+    }
+    body
+}
+
+fn empty_tree() -> Value {
+    json!({
+        "tree": null,
+        "revision": null,
+        "window_id": null,
+        "pid": null,
+        "source": null,
+        "truncated": null,
+        "accessibility_legacy": null,
+    })
+}
+
+fn tree_value(report: &TreeReport, notes: &mut Vec<String>) -> Value {
+    if let Some(note) = report.note.as_deref() {
+        notes.push(note.to_string());
+    }
+    let legacy = match report.legacy.as_deref() {
+        Some(text) => serde_json::from_str::<Value>(text.trim()).unwrap_or(Value::Null),
+        None => Value::Null,
+    };
+    json!({
+        "tree": report.tree,
+        "revision": report.revision,
+        "window_id": report.window_id,
+        "pid": report.pid,
+        "source": report.source,
+        "truncated": report.truncated,
+        "accessibility_legacy": legacy,
     })
 }
 
@@ -99,27 +153,6 @@ fn screen_value(display: Option<&DisplayInfo>) -> Value {
             "scale": display.scale,
         }),
         None => Value::Null,
-    }
-}
-
-fn accessibility_value(
-    backend: &dyn DesktopBackend,
-    app_name: Option<&str>,
-) -> (Value, Option<String>) {
-    let result = catch_unwind(AssertUnwindSafe(|| backend.inspect_accessibility(app_name)));
-    match result {
-        Ok(Ok(text)) => match serde_json::from_str::<Value>(text.trim()) {
-            Ok(value) => (value, None),
-            Err(_) => (
-                Value::Null,
-                Some("accessibility output was not JSON".into()),
-            ),
-        },
-        Ok(Err(error)) => (Value::Null, Some(error.to_string())),
-        Err(_) => (
-            Value::Null,
-            Some("accessibility inspection panicked and was recovered".into()),
-        ),
     }
 }
 
@@ -162,7 +195,9 @@ mod tests {
         assert_eq!(value["cursor"]["y"], 5);
         assert_eq!(value["frontmost_app"], "Finder");
         assert_eq!(value["frontmost_window"], "Desktop");
-        assert_eq!(value["accessibility"]["role"], "window");
+        assert_eq!(value["source"], "stub");
+        assert!(value["tree"].as_str().unwrap().contains("AXWindow"));
+        assert!(value["accessibility_legacy"].is_null());
         assert!(value["note"].is_null());
         assert!(value["platform"].is_string());
     }
@@ -174,7 +209,8 @@ mod tests {
             ..StubBackend::default()
         };
         let value = collect_state(&backend);
-        assert!(value["accessibility"].is_null());
+        assert!(value["tree"].is_null());
+        assert!(value["accessibility_legacy"].is_null());
         assert!(value["note"].as_str().unwrap().contains("accessibility"));
         assert_eq!(value["frontmost_app"], "Finder");
     }

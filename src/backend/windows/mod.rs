@@ -107,6 +107,22 @@ pub(crate) fn quit(_app: &str) -> Result<QuitResult, ComputerError> {
     Err(unsupported("quit"))
 }
 
+pub(crate) fn tree(
+    _query: &crate::tree::TreeQuery,
+) -> Result<crate::tree::TreeReport, ComputerError> {
+    Err(unsupported("tree"))
+}
+
+pub(crate) fn end_session(session: Option<&str>) -> Result<Vec<i32>, ComputerError> {
+    if let Ok(pending) = crate::cache::pending_restores(session) {
+        let pids: Vec<i32> = pending.into_iter().map(|(pid, _)| pid).collect();
+        if !pids.is_empty() {
+            let _ = crate::cache::clear_restores(session, &pids);
+        }
+    }
+    Ok(Vec::new())
+}
+
 pub(crate) fn doctor(request: bool) -> Result<DoctorReport, ComputerError> {
     let mut report = DoctorReport::pending("P12");
     if request {
@@ -121,6 +137,13 @@ pub(crate) fn doctor(request: bool) -> Result<DoctorReport, ComputerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tree_is_unsupported() {
+        let error = tree(&crate::tree::TreeQuery::default()).unwrap_err();
+        assert_eq!(error.code(), "unsupported");
+        assert!(error.to_string().contains("windows"));
+    }
 
     #[test]
     fn frontmost_parser_reads_two_lines() {
