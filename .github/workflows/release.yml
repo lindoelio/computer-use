@@ -1,0 +1,103 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.asset }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: computer-use-linux-x64.tar.gz
+            binary: computer-use
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: computer-use-macos-arm64.tar.gz
+            binary: computer-use
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: computer-use-windows-x64.zip
+            binary: computer-use.exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux build dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libxdo-dev libx11-dev libxcb1-dev libxrandr-dev libdbus-1-dev libxkbcommon-dev
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package Unix
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          tar -czf "${{ matrix.asset }}" -C "$(dirname "$bin")" "${{ matrix.binary }}"
+          shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+      - name: Package Windows
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $bin = Resolve-Path "target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          $dest = Join-Path (Get-Location) "${{ matrix.asset }}"
+          $name = Split-Path $bin -Leaf
+          Push-Location (Split-Path $bin)
+          try {
+            Compress-Archive -Path $name -DestinationPath $dest -Force
+          } finally {
+            Pop-Location
+          }
+          $hash = (Get-FileHash -Algorithm SHA256 $dest).Hash.ToLower()
+          Set-Content -Path "${{ matrix.asset }}.sha256" -Encoding ascii -Value "$hash  ${{ matrix.asset }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sha256
+
+  release:
+    name: GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Write SHA256SUMS
+        shell: bash
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum \
+            computer-use-linux-x64.tar.gz \
+            computer-use-macos-arm64.tar.gz \
+            computer-use-windows-x64.zip \
+            > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/computer-use-linux-x64.tar.gz
+            dist/computer-use-linux-x64.tar.gz.sha256
+            dist/computer-use-macos-arm64.tar.gz
+            dist/computer-use-macos-arm64.tar.gz.sha256
+            dist/computer-use-windows-x64.zip
+            dist/computer-use-windows-x64.zip.sha256
+            dist/SHA256SUMS
+          generate_release_notes: true
