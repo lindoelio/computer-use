@@ -26,6 +26,9 @@ pub const LISTEN_EVENT_SETTINGS_URL: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent";
 
 /// macOS permissions that must be granted for `permissions_ok`.
+///
+/// The macOS doctor is the only non-test caller. Other OS builds keep it for tests.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const MACOS_REQUIRED: &[&str] = &[
     "accessibility",
     "screen_recording",
@@ -90,6 +93,9 @@ pub struct DoctorInput {
 }
 
 /// Reads trust. `prompt` true means the platform may show a dialog.
+///
+/// The macOS doctor is the only non-test caller.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub trait PermissionProbe {
     /// Accessibility. `AXIsProcessTrusted` unless `prompt`.
     fn accessibility(&mut self, prompt: bool) -> Option<bool>;
@@ -102,6 +108,9 @@ pub trait PermissionProbe {
 }
 
 /// Four probe results.
+///
+/// The macOS doctor is the only non-test caller.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProbeSample {
     /// Accessibility.
@@ -115,6 +124,9 @@ pub struct ProbeSample {
 }
 
 /// Call each probe once. `prompt` false must not ask the probe to show a dialog.
+///
+/// The macOS doctor is the only non-test caller.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn sample_permissions(probe: &mut impl PermissionProbe, prompt: bool) -> ProbeSample {
     ProbeSample {
         accessibility: probe.accessibility(prompt),
@@ -186,6 +198,9 @@ pub fn assemble(input: DoctorInput) -> DoctorReport {
 }
 
 /// Settings URL of the first missing permission, when the caller asked to open it.
+///
+/// The macOS doctor is the only non-test caller.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn settings_url_to_open(report: &DoctorReport, open: bool) -> Option<&str> {
     if !open {
         return None;
@@ -194,6 +209,9 @@ pub fn settings_url_to_open(report: &DoctorReport, open: bool) -> Option<&str> {
 }
 
 /// Append `text` to the note and to the readable summary.
+///
+/// The macOS doctor is the only caller.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn push_note(report: &mut DoctorReport, text: &str) {
     let text = text.trim();
     if text.is_empty() {
@@ -212,6 +230,9 @@ pub fn push_note(report: &mut DoctorReport, text: &str) {
 }
 
 /// True when `executable` or `bundle_path` is `Computer Use.app`, or the bundle id matches.
+///
+/// The macOS doctor is the only non-test caller.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn is_helper_bundle(
     executable: Option<&str>,
     bundle_id: Option<&str>,
@@ -267,6 +288,9 @@ pub fn atspi_bus_present(at_spi_bus: Option<&str>, runtime_dir: Option<&std::pat
 }
 
 /// `codesign -dv` text. Does not run `codesign`.
+///
+/// The macOS doctor is the only non-test caller.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn parse_codesign(text: &str) -> (&'static str, Option<String>) {
     let lower = text.to_ascii_lowercase();
     if lower.contains("not signed at all") || lower.contains("code object is not signed") {
@@ -444,6 +468,7 @@ fn join_notes(notes: &[String]) -> Option<String> {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn team_id_from(text: &str) -> Option<String> {
     for line in text.lines() {
         let line = line.trim();
