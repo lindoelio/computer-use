@@ -70,6 +70,78 @@ jobs:
           path: |
             ${{ matrix.asset }}
             ${{ matrix.asset }}.sha256
+      - name: Decide macOS signing
+        if: success() && matrix.os == 'macos-latest'
+        id: sign
+        env:
+          P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          PASS: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          TEAM: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          if [ -n "${P12}" ] && [ -n "${PASS}" ] && [ -n "${TEAM}" ]; then
+            echo "enabled=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "enabled=false" >> "${GITHUB_OUTPUT}"
+          fi
+      - name: Import Developer ID certificate
+        if: success() && matrix.os == 'macos-latest' && steps.sign.outputs.enabled == 'true'
+        id: identity
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          keychain="${RUNNER_TEMP}/computer-use-signing.keychain-db"
+          keychain_password=$(openssl rand -base64 24)
+          printf '%s' "${MACOS_CERTIFICATE_P12}" | base64 -D > "${RUNNER_TEMP}/cert.p12"
+          security create-keychain -p "${keychain_password}" "${keychain}"
+          security set-keychain-settings -lut 21600 "${keychain}"
+          security unlock-keychain -p "${keychain_password}" "${keychain}"
+          security import "${RUNNER_TEMP}/cert.p12" -k "${keychain}" -P "${MACOS_CERTIFICATE_PASSWORD}" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${keychain_password}" "${keychain}"
+          security list-keychains -d user -s "${keychain}"
+          identities=$(security find-identity -v -p codesigning "${keychain}" | sed -n 's/.*"\(Developer ID Application:.*\)"/\1/p')
+          identity=$(printf '%s\n' "${identities}" | sed -n "/(${APPLE_TEAM_ID})/p")
+          identity=${identity%%$'\n'*}
+          if [ -z "${identity}" ]; then
+            identity=$(printf '%s\n' "${identities}" | sed -n '1p')
+          fi
+          if [ -z "${identity}" ]; then
+            echo "no Developer ID Application identity in the temporary keychain" >&2
+            exit 1
+          fi
+          echo "identity=${identity}" >> "${GITHUB_OUTPUT}"
+      - name: Package Computer Use.app
+        if: success() && matrix.os == 'macos-latest'
+        env:
+          MACOS_SIGN_IDENTITY: ${{ steps.identity.outputs.identity }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          scripts/package-macos-app.sh "target/${{ matrix.target }}/release/computer-use" "${RUNNER_TEMP}/computer-use-app"
+          archive=$(find "${RUNNER_TEMP}/computer-use-app" -name 'computer-use-macos-arm64-app*.zip' -print -quit)
+          test -n "${archive}"
+          cp "${archive}" .
+          cp "${RUNNER_TEMP}/computer-use-app/computer-use-macos-app-status.txt" .
+          name=$(basename "${archive}")
+          shasum -a 256 "${name}" > "${name}.sha256"
+      - name: Remove signing keychain
+        if: always() && matrix.os == 'macos-latest'
+        run: |
+          security delete-keychain "${RUNNER_TEMP}/computer-use-signing.keychain-db" || true
+          rm -f "${RUNNER_TEMP}/cert.p12" || true
+      - uses: actions/upload-artifact@v4
+        if: success() && matrix.os == 'macos-latest'
+        with:
+          name: computer-use-macos-app
+          path: |
+            computer-use-macos-arm64-app*.zip
+            computer-use-macos-arm64-app*.zip.sha256
+            computer-use-macos-app-status.txt
 
   release:
     name: GitHub Release
@@ -85,19 +157,37 @@ jobs:
         working-directory: dist
         run: |
           set -euo pipefail
-          sha256sum \
-            computer-use-linux-x64.tar.gz \
-            computer-use-macos-arm64.tar.gz \
-            computer-use-windows-x64.zip \
-            > SHA256SUMS
+          files=(
+            computer-use-linux-x64.tar.gz
+            computer-use-macos-arm64.tar.gz
+            computer-use-windows-x64.zip
+          )
+          if [ -f computer-use-macos-arm64-app.zip ]; then
+            files+=(computer-use-macos-arm64-app.zip)
+          elif [ -f computer-use-macos-arm64-app-unsigned.zip ]; then
+            files+=(computer-use-macos-arm64-app-unsigned.zip)
+          fi
+          sha256sum "${files[@]}" > SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/computer-use-linux-x64.tar.gz
-            dist/computer-use-linux-x64.tar.gz.sha256
-            dist/computer-use-macos-arm64.tar.gz
-            dist/computer-use-macos-arm64.tar.gz.sha256
-            dist/computer-use-windows-x64.zip
-            dist/computer-use-windows-x64.zip.sha256
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/*.zip
+            dist/*.zip.sha256
             dist/SHA256SUMS
           generate_release_notes: true
+      - name: Note an unsigned helper app
+        if: hashFiles('dist/computer-use-macos-arm64-app-unsigned.zip') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          existing=$(gh release view "${tag}" --json body --jq .body)
+          note='`computer-use-macos-arm64-app-unsigned.zip` is ad-hoc signed and not notarized. Developer ID signing secrets were not configured. See docs/PACKAGING.md.'
+          {
+            printf '%s\n\n' "${note}"
+            printf '%s\n' "${existing}"
+          } > "${RUNNER_TEMP}/release-notes.md"
+          gh release edit "${tag}" --notes-file "${RUNNER_TEMP}/release-notes.md"

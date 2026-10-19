@@ -6,6 +6,7 @@
 
 use std::time::Duration;
 
+use crate::doctor::{self, DoctorInput, DoctorOptions};
 use crate::error::ComputerError;
 use crate::target::{AppInfo, DoctorReport, LaunchResult, QuitResult, WindowList};
 use crate::types::FrontmostInfo;
@@ -113,15 +114,59 @@ fn clear_cached_restores(session: Option<&str>) {
     }
 }
 
-pub(crate) fn doctor(request: bool) -> Result<DoctorReport, ComputerError> {
-    let mut report = DoctorReport::pending("P13");
-    if request {
-        report.note = Some(
-            "accessibility and screen-capture probes land in P13. --request has no effect on this platform"
-                .into(),
+pub(crate) fn doctor(options: DoctorOptions) -> Result<DoctorReport, ComputerError> {
+    let mut notes = vec!["accessibility and screen-capture probes land in P13".to_string()];
+    let display = env_nonempty("DISPLAY");
+    let wayland = env_nonempty("WAYLAND_DISPLAY");
+    let session = doctor::session_kind(display.as_deref(), wayland.as_deref());
+    if session.is_none() {
+        notes.push("no DISPLAY or WAYLAND_DISPLAY".to_string());
+    }
+    let (atspi_bus, atspi_note) = atspi_presence();
+    if let Some(note) = atspi_note {
+        notes.push(note);
+    }
+    let report = doctor::assemble(DoctorInput {
+        path: doctor::current_executable(),
+        session: session.map(str::to_string),
+        atspi_bus,
+        notes,
+        prompt_ignored: options.prompt,
+        open_settings_ignored: options.open_settings,
+        ..DoctorInput::default()
+    });
+    Ok(report)
+}
+
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn atspi_presence() -> (Option<bool>, Option<String>) {
+    let bus = env_nonempty("AT_SPI_BUS");
+    let runtime = env_nonempty("XDG_RUNTIME_DIR");
+    if bus.is_none() && runtime.is_none() {
+        return (
+            None,
+            Some(
+                "AT-SPI bus was not checked because AT_SPI_BUS and XDG_RUNTIME_DIR are unset. Connection lands in P13."
+                    .to_string(),
+            ),
         );
     }
-    Ok(report)
+    let present =
+        doctor::atspi_bus_present(bus.as_deref(), runtime.as_deref().map(std::path::Path::new));
+    let note = if present {
+        None
+    } else {
+        Some(
+            "AT-SPI bus address was not found. This is presence only; the connection lands in P13."
+                .to_string(),
+        )
+    };
+    (Some(present), note)
 }
 
 #[cfg(test)]
@@ -155,5 +200,31 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.error.code(), "unsupported");
         assert!(error.error.to_string().contains("linux"));
+    }
+
+    #[test]
+    fn doctor_uses_the_shared_shape() {
+        let report = doctor(DoctorOptions::default()).unwrap();
+        let value = serde_json::to_value(&report).unwrap();
+        assert!(value["permissions_ok"].is_boolean());
+        assert!(value["missing"].is_array());
+        assert!(value["accessibility"].is_null());
+        assert!(value["screen_capture"].is_null());
+        assert!(value["screen_recording"].is_null());
+        assert!(value["post_events"].is_null());
+        assert!(value["input_monitoring"].is_null());
+        assert!(value["input_monitor"].is_null());
+        assert!(value["fix"].is_array());
+        assert!(value["fixes"].is_array());
+        assert!(value["text"].is_string());
+        assert!(value["identity"].is_object());
+        assert!(value["session"].is_string() || value["session"].is_null());
+        assert!(value["atspi_bus"].is_boolean() || value["atspi_bus"].is_null());
+        assert!(value["uiaccess"].is_null());
+        assert!(value["integrity"].is_null());
+        let note = value["note"].as_str().unwrap();
+        assert!(note.contains("P13"), "{note}");
+        assert!(report.permissions_ok);
+        assert!(report.missing.is_empty());
     }
 }

@@ -35,8 +35,40 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libxdo-dev libx11-dev libxcb1-dev libxrandr-dev libdbus-1-dev libxkbcommon-dev
+          sudo apt-get install -y pkg-config libxdo-dev libx11-dev libxcb1-dev libxrandr-dev libdbus-1-dev libxkbcommon-dev shellcheck
+      - name: Check packaging script
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n scripts/package-macos-app.sh
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck scripts/package-macos-app.sh
+          fi
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Test
         run: cargo test --all-targets --all-features
+      - name: Package ad-hoc Computer Use.app
+        if: success() && matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x target/debug/computer-use
+          tmp=$(mktemp -d)
+          scripts/package-macos-app.sh target/debug/computer-use "${tmp}"
+          app="${tmp}/Computer Use.app"
+          test -x "${app}/Contents/MacOS/computer-use"
+          test -f "${app}/Contents/Info.plist"
+          test -d "${app}/Contents/Resources"
+          codesign --verify --verbose=2 "${app}"
+          plutil -lint "${app}/Contents/Info.plist"
+          plutil -lint packaging/macos/Info.plist
+          plutil -lint packaging/macos/entitlements.plist
+          ident=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "${app}/Contents/Info.plist")
+          test "${ident}" = "ai.lindoelio.computer-use"
+          version=$(sed -n '1,/^\[dependencies\]/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)
+          version=${version%%$'\n'*}
+          short=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "${app}/Contents/Info.plist")
+          test "${short}" = "${version}"
+          "${app}/Contents/MacOS/computer-use" doctor > "${tmp}/doctor.json"
+          python3 -c 'import json,sys; report=json.load(open(sys.argv[1])); assert report["ok"] is True; assert report["bundle_id"]=="ai.lindoelio.computer-use"; assert report["identity"]["bundled"] is True; assert report["identity"]["bundle_id"]=="ai.lindoelio.computer-use"' "${tmp}/doctor.json"

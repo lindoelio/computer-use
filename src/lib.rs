@@ -23,6 +23,7 @@ mod attempt;
 pub mod audit;
 pub mod backend;
 pub mod cache;
+mod doctor;
 pub mod element;
 pub mod error;
 mod foreground;

@@ -550,15 +550,27 @@ enum CliCommand {
     /// Clear the pause flag.
     Resume,
 
-    /// Report Accessibility and Screen Recording permission.
+    /// Report permissions, the TCC identity, and how to fix what is missing.
     ///
-    /// A normal call does not prompt. `--request` asks for both permissions.
+    /// The process exits 0 when the report is produced, including when a
+    /// permission is missing. `permissions_ok` is false in that case. The
+    /// response `ok` field means the report was produced.
+    ///
+    /// A normal call does not prompt and does not open Settings. `--prompt`
+    /// asks macOS to show the permission dialogs. `--request` is an alias.
+    /// `--open-settings` opens the first missing pane.
+    ///
+    /// Stdout is one JSON object. The same summary is in `text` and, for this
+    /// one-shot command, on stderr. `exec` and `serve` leave stderr alone.
     ///
     /// Example: computer-use doctor
     Doctor {
-        /// Prompt for Accessibility and request Screen Recording.
+        /// Prompt for Accessibility, Screen Recording, Post Event, and Input Monitoring.
+        #[arg(long, visible_alias = "request")]
+        prompt: bool,
+        /// Open System Settings to the first missing permission pane.
         #[arg(long)]
-        request: bool,
+        open_settings: bool,
     },
 
     /// Print the key window's accessibility tree.
@@ -991,7 +1003,13 @@ fn command_action(
         },
         CliCommand::Pause => Action::Pause,
         CliCommand::Resume => Action::Resume,
-        CliCommand::Doctor { request } => Action::Doctor { request: *request },
+        CliCommand::Doctor {
+            prompt,
+            open_settings,
+        } => Action::Doctor {
+            prompt: *prompt,
+            open_settings: *open_settings,
+        },
         CliCommand::Tree => Action::Tree,
         CliCommand::Session { command } => match command {
             SessionCommand::End => Action::SessionEnd,
@@ -1011,7 +1029,18 @@ fn command_action(
 }
 
 fn emit_action(action: Action, context: &CallContext, pretty: bool) -> u8 {
+    let doctor = matches!(action, Action::Doctor { .. });
     let response = computer_use::dispatch_context(action, context);
+    if doctor {
+        if let Some(text) = response
+            .to_value()
+            .get("text")
+            .and_then(|value| value.as_str())
+        {
+            let mut stderr = io::stderr().lock();
+            let _ = writeln!(stderr, "{text}");
+        }
+    }
     let code = u8::from(!response.ok);
     emit(&response, pretty);
     code

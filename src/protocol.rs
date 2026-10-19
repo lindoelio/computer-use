@@ -299,11 +299,18 @@ pub enum Action {
     Pause,
     /// Clear the pause flag.
     Resume,
-    /// Report accessibility and screen-capture permission.
+    /// Report permissions and the TCC identity.
+    ///
+    /// The process exits 0 when the report is produced. `permissions_ok` in the
+    /// body is the permission aggregate. `prompt` asks macOS to show dialogs.
+    /// `request` is an alias of `prompt`.
     Doctor {
-        /// Prompt for Accessibility and Screen Recording when true.
+        /// Prompt for Accessibility, Screen Recording, Post Event, and Input Monitoring.
+        #[serde(default, alias = "request")]
+        prompt: bool,
+        /// Open the first missing System Settings pane. macOS only.
         #[serde(default)]
-        request: bool,
+        open_settings: bool,
     },
     /// Numbered accessibility tree for the key window.
     Tree,
@@ -841,7 +848,16 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
             context.window.as_deref(),
         )),
         Action::Quit { force } => result_response(quit(backend, context.app.as_deref(), force)),
-        Action::Doctor { request } => result_response(doctor(backend, request)),
+        Action::Doctor {
+            prompt,
+            open_settings,
+        } => result_response(doctor(
+            backend,
+            crate::doctor::DoctorOptions {
+                prompt,
+                open_settings,
+            },
+        )),
         Action::CursorPosition => result_response(cursor_position(backend)),
         Action::SessionPrune { dry_run, ttl_secs } => {
             result_response(session_prune(dry_run, ttl_secs))
@@ -3054,8 +3070,11 @@ fn quit(
     }))
 }
 
-fn doctor(backend: &dyn DesktopBackend, request: bool) -> Result<Value, ComputerError> {
-    let report = backend.doctor(request)?;
+fn doctor(
+    backend: &dyn DesktopBackend,
+    options: crate::doctor::DoctorOptions,
+) -> Result<Value, ComputerError> {
+    let report = backend.doctor(options)?;
     serde_json::to_value(report).map_err(|error| {
         ComputerError::ExecutionFailed(format!("failed to encode doctor report: {error}"))
     })
@@ -3754,17 +3773,45 @@ mod tests {
         let response = dispatch_with(&backend, Action::Launch);
         assert_eq!(response.to_value()["error"]["code"], "invalid_arguments");
 
-        let response = dispatch_with(&backend, Action::Doctor { request: false });
+        let response = dispatch_with(
+            &backend,
+            Action::Doctor {
+                prompt: false,
+                open_settings: false,
+            },
+        );
         let value = response.to_value();
         assert_eq!(value["ok"], true);
+        assert_eq!(value["permissions_ok"], false);
         assert_eq!(value["accessibility"], true);
         assert_eq!(value["screen_capture"], false);
+        assert_eq!(value["screen_recording"], false);
         assert!(value["input_monitor"].is_null());
+        assert_eq!(value["missing"][0], "screen_recording");
         assert_eq!(value["responsible_app"]["name"], "Terminal");
         assert!(value["fixes"][0]
             .as_str()
             .unwrap()
             .contains("Screen Recording"));
+        assert_eq!(value["fix"][0]["target"], "Terminal");
+
+        let prompted: Action =
+            serde_json::from_str(r#"{"action":"doctor","request":true}"#).unwrap();
+        assert!(matches!(
+            prompted,
+            Action::Doctor {
+                prompt: true,
+                open_settings: false
+            }
+        ));
+        let plain: Action = serde_json::from_str(r#"{"action":"doctor"}"#).unwrap();
+        assert!(matches!(
+            plain,
+            Action::Doctor {
+                prompt: false,
+                open_settings: false
+            }
+        ));
 
         let response = dispatch_with(&backend, Action::GetState);
         assert!(response.ok);

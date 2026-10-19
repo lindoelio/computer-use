@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  Hardened runtime is enabled with codesign --options runtime.
+  This dict is empty on purpose. docs/PACKAGING.md records each
+  entitlement that was considered and why it is not set.
+  TCC, not an entitlement, gates Accessibility, Screen Recording,
+  Input Monitoring, and Post Event.
+-->
+<dict>
+</dict>
+</plist>

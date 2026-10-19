@@ -125,8 +125,13 @@ pub trait DesktopBackend: Send + Sync {
         Err(unsupported("quit"))
     }
 
-    /// Permission probe. `request` may show a system prompt on macOS.
-    fn doctor(&self, _request: bool) -> Result<DoctorReport, ComputerError> {
+    /// Permission probe. `options.prompt` may show a system prompt on macOS.
+    ///
+    /// The default does not prompt and does not open Settings.
+    fn doctor(
+        &self,
+        _options: crate::doctor::DoctorOptions,
+    ) -> Result<DoctorReport, ComputerError> {
         Err(unsupported("doctor"))
     }
 
@@ -495,8 +500,11 @@ macro_rules! impl_platform_backend {
                 $quit(app, force)
             }
 
-            fn doctor(&self, request: bool) -> Result<DoctorReport, ComputerError> {
-                $doctor(request)
+            fn doctor(
+                &self,
+                options: crate::doctor::DoctorOptions,
+            ) -> Result<DoctorReport, ComputerError> {
+                $doctor(options)
             }
 
             fn tree(&self, query: &TreeQuery) -> Result<TreeReport, ComputerError> {

@@ -693,14 +693,13 @@ impl DesktopBackend for StubBackend {
         Ok(self.hit.lock().expect("hit").clone())
     }
 
-    fn doctor(&self, request: bool) -> Result<DoctorReport, ComputerError> {
+    fn doctor(&self, options: crate::doctor::DoctorOptions) -> Result<DoctorReport, ComputerError> {
         let mut report = self.doctor_report.clone();
-        if request {
-            let extra = "stub ignores --request";
-            report.note = Some(match report.note.take() {
-                Some(note) => format!("{note}; {extra}"),
-                None => extra.into(),
-            });
+        if options.prompt {
+            crate::doctor::push_note(&mut report, "stub ignores --prompt");
+        }
+        if options.open_settings {
+            crate::doctor::push_note(&mut report, "stub ignores --open-settings");
         }
         Ok(report)
     }
@@ -1039,21 +1038,25 @@ fn window(id: u32, pid: i32, app: &str, title: &str, z: u32) -> WindowInfo {
 }
 
 fn fixture_doctor() -> DoctorReport {
-    DoctorReport {
+    crate::doctor::assemble(crate::doctor::DoctorInput {
         accessibility: Some(true),
-        screen_capture: Some(false),
+        screen_recording: Some(false),
+        post_events: Some(true),
+        input_monitoring: Some(true),
         input_monitor: None,
-        responsible_app: Some(ResponsibleApp {
+        path: Some("/usr/local/bin/computer-use".into()),
+        bundle_id: None,
+        bundled: false,
+        signature: Some("adhoc".into()),
+        responsible: Some(ResponsibleApp {
             name: "Terminal".into(),
             bundle_id: Some("com.apple.Terminal".into()),
             pid: 20,
             path: Some("/Applications/Utilities/Terminal.app".into()),
         }),
-        fixes: vec![
-            "System Settings → Privacy & Security → Screen Recording → enable Terminal".into(),
-        ],
-        note: None,
-    }
+        required: crate::doctor::MACOS_REQUIRED,
+        ..crate::doctor::DoctorInput::default()
+    })
 }
 
 #[cfg(test)]

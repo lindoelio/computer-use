@@ -202,38 +202,129 @@ pub struct ResponsibleApp {
     pub path: Option<String>,
 }
 
+/// One missing permission and the Settings pane that grants it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PermissionFix {
+    /// Stable id: `accessibility`, `screen_recording`, `post_events`, or `input_monitoring`.
+    pub permission: String,
+    /// `x-apple.systempreferences:` URL for that pane.
+    pub url: String,
+    /// App or binary the user enables in that pane.
+    pub target: String,
+    /// One-line instruction.
+    pub instruction: String,
+}
+
+/// Binary identity `doctor` reports so the user can see which TCC subject is active.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DoctorIdentity {
+    /// Path of the running executable.
+    pub path: Option<String>,
+    /// `NSBundle` main bundle identifier. Null for a bare binary.
+    pub bundle_id: Option<String>,
+    /// True when this process is `Computer Use.app`.
+    pub bundled: bool,
+    /// `signed`, `unsigned`, `adhoc`, `unknown`, or null when this OS does not sign the binary.
+    pub signature: Option<String>,
+    /// Apple team id when the signature has one.
+    pub team_id: Option<String>,
+    /// GUI app TCC will attribute this process to, when it could be found.
+    pub responsible: Option<ResponsibleApp>,
+}
+
 /// `doctor` report. Null probes mean this OS does not check them yet.
+///
+/// The response envelope's `ok` means the report was produced (exit 0).
+/// [`Self::permissions_ok`] is the permission aggregate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DoctorReport {
+    /// True when every required permission this OS checks is granted.
+    pub permissions_ok: bool,
+    /// Required permissions that are not granted. Null probes are omitted.
+    pub missing: Vec<String>,
     /// Accessibility trust. Null until the platform probe exists.
     pub accessibility: Option<bool>,
-    /// Screen capture trust. Null until the platform probe exists.
+    /// Screen Recording preflight. Same value as `screen_recording`.
     pub screen_capture: Option<bool>,
-    /// Input monitor / event tap. Null when this process has not tried to install one.
+    /// Screen Recording preflight. Same value as `screen_capture`.
+    pub screen_recording: Option<bool>,
+    /// `CGPreflightPostEventAccess`. Null off macOS.
+    pub post_events: Option<bool>,
+    /// `CGPreflightListenEventAccess`. Not the P6 event tap.
+    pub input_monitoring: Option<bool>,
+    /// P6 event tap created in this process. Null when it was not attempted.
     pub input_monitor: Option<bool>,
+    /// Running binary's bundle id. Null for a bare binary. Same as `identity.bundle_id`.
+    pub bundle_id: Option<String>,
+    /// Path, bundle, signature, and the TCC responsible app.
+    pub identity: DoctorIdentity,
     /// Parent GUI app that must be toggled in Settings, when it could be found.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub responsible_app: Option<ResponsibleApp>,
-    /// Settings paths the user can follow.
+    /// Structured fix for each entry in `missing`, in the same order.
+    pub fix: Vec<PermissionFix>,
+    /// One-line instructions. Same order and text as `fix[].instruction`.
     pub fixes: Vec<String>,
+    /// Linux `x11`, `wayland`, or `x11+wayland`. Null when it does not apply or is unset.
+    pub session: Option<String>,
+    /// Linux AT-SPI bus address is present. Not a connection. Null when not checked.
+    pub atspi_bus: Option<bool>,
+    /// Windows UIAccess on this process. Best effort. Null when not read.
+    pub uiaccess: Option<bool>,
+    /// Windows integrity label. Best effort. Null when not read.
+    pub integrity: Option<String>,
+    /// Readable summary of this report.
+    pub text: String,
     /// Extra context. Omitted when empty.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }
 
-impl DoctorReport {
-    /// Report used on platforms whose probes land in a later phase.
-    pub fn pending(phase: &str) -> Self {
+impl DoctorIdentity {
+    pub(crate) fn blank() -> Self {
         Self {
+            path: None,
+            bundle_id: None,
+            bundled: false,
+            signature: None,
+            team_id: None,
+            responsible: None,
+        }
+    }
+}
+
+impl DoctorReport {
+    pub(crate) fn blank() -> Self {
+        Self {
+            permissions_ok: true,
+            missing: Vec::new(),
             accessibility: None,
             screen_capture: None,
+            screen_recording: None,
+            post_events: None,
+            input_monitoring: None,
             input_monitor: None,
+            bundle_id: None,
+            identity: DoctorIdentity::blank(),
             responsible_app: None,
+            fix: Vec::new(),
             fixes: Vec::new(),
-            note: Some(format!(
-                "accessibility and screen-capture probes land in {phase}"
-            )),
+            session: None,
+            atspi_bus: None,
+            uiaccess: None,
+            integrity: None,
+            text: String::new(),
+            note: None,
         }
+    }
+
+    /// Report used on platforms whose probes land in a later phase.
+    pub fn pending(phase: &str) -> Self {
+        let mut report = Self::blank();
+        let note = format!("accessibility and screen-capture probes land in {phase}");
+        report.text = note.clone();
+        report.note = Some(note);
+        report
     }
 }
 

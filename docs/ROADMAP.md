@@ -116,6 +116,7 @@ src/
   image_util.rs               Encode, max-width, canvas fit, remap math.
   target.rs                   AppTarget and WindowTarget resolution.
   tree.rs                     Numbered text, diff, truncation, redaction. Pure.
+  doctor.rs                   Permission report assembly. Pure. P8.
   element.rs                  Revalidation, allowlist, secure refusal. Pure. P3.
   cache.rs                    Per-session revision files.
   policy.rs                   Built-in deny in P1. TOML, admin, URLs in P6.
@@ -860,7 +861,7 @@ Extend `src/keys.rs` and enigo / `CGEvent` posting.
 - xdotool names: `super`, `ctrl`/`control`, `alt`/`option`, `shift`, `cmd`/`command`/`meta`, `Return`/`Enter`, `BackSpace`, `Delete`, `Escape`, `Tab`, `space`, `Up`/`Down`/`Left`/`Right`, `Home`, `End`, `Page_Up`/`Prior`, `Page_Down`/`Next`, `Insert`, `F1`–`F24`, `plus`, `minus`, and single characters. Combos use `+`. `key` also accepts a space-separated sequence (`ctrl+a Delete`). Unknown words are `invalid_arguments`. `super` is `Modifier::Meta`. F13–F20 have macOS virtual keycodes. F21–F24 are known names and return `unsupported` on macOS (enigo's macOS `Key` enum stops at F20, and they are not posted as keycode 0). Other platforms accept F21–F24 through enigo. `insert` uses the macOS Help key (virtual keycode `0x72`) because enigo has no `Insert` variant there.
 - Clipboard: `arboard` 3.7.0. Linux builds enable `image-data` and not `wayland-data-control`. `clipboard_get` returns text, or `kind: "image"` plus a mode-0600 PNG in the session cache, or `kind: "empty"`. Text wins over an image. `clipboard_set` goes through `policy::decide` and is confirmed. Empty text is `invalid_arguments`. The audit stores `chars` and never the text. A macOS arboard error whose text mentions the pasteboard and permission, denied, or not allowed is `permission_required`. Tests use the in-memory stub and never touch the pasteboard.
 - `zoom` captures a region through the screenshot path and returns the same payload and map. With no window it is a screen region. With `--app` or `--window` the region is window-local logical points (the far edge may equal the window width or height) and is cropped after `capture_window`. `screenshot` still refuses a region together with a window target. Anthropic `zoom` translates to this action, still in image pixels, and dispatch remaps it.
-- `doctor` grows `input_monitor` when the event tap from P6 was created during this process. The JSON gains `bundle_id` of the running binary so the user can see whether TCC is attached to a stable id.
+- `doctor` grows `input_monitor` when the event tap from P6 was created during this process. It stays null when this process has not tried to install the tap. The JSON gains `bundle_id` of the running binary so the user can see whether TCC is attached to a stable id. The full report is specified under [Doctor and packaging corrections](#doctor-and-packaging-corrections).
 
 Helper app, `packaging/macos/`:
 
@@ -897,7 +898,21 @@ computer-use key --keys "super+c"
 - Keysym table: `super+c`, `Return`, `ctrl+alt+Delete`, `plus`.
 - Drag rejects fewer than 2 points and records N moves on the stub.
 - Clipboard stub does not touch the real pasteboard. The trait method is stubbed.
-- `package-macos-app.sh` is invoked in CI only as `bash -n` until P15 builds the zip. P15 runs the script on the release job.
+- `package-macos-app.sh` is syntax-checked on every OS (`bash -n`, and `shellcheck` when the runner has it). The macOS CI job also runs the script against the debug binary and checks the bundle layout, the ad-hoc signature, and the plists. The release workflow runs it on the arm64 release binary. See [Doctor and packaging corrections](#doctor-and-packaging-corrections).
+
+### Doctor and packaging corrections
+Part B fills in the doctor and the helper bundle. A few P1 and P8 details were wrong or incomplete:
+
+- `--prompt` is the opt-in flag that may show dialogs. `--request` stays an alias so P1 JSON (`"request": true`) still prompts. The default calls `AXIsProcessTrusted`, `CGPreflightScreenCaptureAccess`, `CGPreflightPostEventAccess`, and `CGPreflightListenEventAccess`. It does not call the request variants and it does not open Settings.
+- The response envelope's `ok` means the report was produced. The process exits 0 in that case, including when a permission is missing. `permissions_ok` is the aggregate of required grants, and `missing` lists the ids that are not `Some(true)`. Reusing `ok` for grants would make a missing permission a failed command, which contradicts the exit-code rule and the P1 tests that treat a denied Screen Recording bit as a successful report.
+- `screen_capture` keeps the P1 name. `screen_recording` is the same boolean.
+- `input_monitoring` is `CGPreflightListenEventAccess`. `input_monitor` stays the P6 tap flag.
+- Post Event and Accessibility are the same System Settings pane. Apple maps both TCC services to Accessibility, so both fixes use `x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility`. Screen Recording uses `Privacy_ScreenCapture`. Input Monitoring uses `Privacy_ListenEvent`.
+- Each missing permission has a `fix` object (`permission`, `url`, `target`, `instruction`) and the same instruction string in `fixes`. `doctor --open-settings` runs `open` on the first URL. The one-shot command also writes the `text` summary to stderr. `exec` and `serve` do not.
+- `identity` carries the executable path, the bundle id (`null` for a bare binary), whether the process is inside `Computer Use.app`, `codesign -dv` status (`signed`, `unsigned`, `adhoc`, or `unknown`) and team id, and the TCC responsible app already reported as `responsible_app`. When the binary is not the bundle, the note tells the user to symlink `Computer Use.app/Contents/MacOS/computer-use` into `~/.local/bin`.
+- Linux and Windows keep the null permission probes and the P13 / P12 note. Linux adds `session` (`x11`, `wayland`, or `x11+wayland`) and `atspi_bus` (address file or `AT_SPI_BUS` only; no bus connection). Windows adds `uiaccess` and `integrity` when a token read works. Those fields are not required grants. `--prompt` and `--open-settings` do not prompt on those platforms.
+- The macOS CI job builds the ad-hoc app. P8 originally deferred that zip to P15. The layout check belongs with the script. P15 still bumps the version, rewrites the README, and publishes.
+- The release workflow step lands here. Signing uses `MACOS_CERTIFICATE_P12`, `MACOS_CERTIFICATE_PASSWORD`, and `APPLE_TEAM_ID`. Notarization also needs `APPLE_ID` and `APPLE_APP_SPECIFIC_PASSWORD`. Without those secrets the artifact is `computer-use-macos-arm64-app-unsigned.zip` and the release notes say so. `docs/PACKAGING.md` has the local commands.
 
 ## P9 — Menu bar, Apple events, Shortcuts, Dock, Spaces
 ### Design
@@ -1148,12 +1163,12 @@ computer-use isolation
 - Rewrite the README usage section from this document: new commands, the default max-width, the policy path, the feature flags, and the permission section. Keep the 0.1.0 examples that still work.
 - CHANGELOG `0.2.0` lists every phase in the keep-a-changelog style already used.
 - Add `docs/` and `packaging/` and `scripts/package-macos-app.sh` to the crate `include` list only if they should ship in the crate tarball. The roadmap should ship. The `.app` script should ship.
-- Release workflow: the macOS job runs `scripts/package-macos-app.sh`, uploads the zip next to the existing tarball, and runs the optional sign/notarize step when secrets are present. Linux release builds with `--features portal`. Windows release builds with the default target dependencies (UIA and `windows-capture` are target deps, not features).
+- Release workflow: P8 part B already runs `scripts/package-macos-app.sh` on the macOS release job, uploads the zip, and signs or notarizes when the secrets in `docs/PACKAGING.md` exist. P15 checks that this still matches the 0.2.0 tag. Linux release builds with `--features portal`. Windows release builds with the default target dependencies (UIA and `windows-capture` are target deps, not features).
 - Confirm `cargo publish --dry-run` includes the README and this roadmap.
 - Update the parity table statuses in this file to match what merged. A row that did not land stays `TODO` and is listed under "Cut from 0.2.0" in the changelog.
 
 ### Tests
-The full CI matrix, plus `bash -n scripts/package-macos-app.sh`, plus a dry-run package on `macos-latest` that unzips and checks `Contents/Info.plist` contains `ai.lindoelio.computer-use`.
+The full CI matrix. P8 part B already runs `bash -n scripts/package-macos-app.sh` and a macOS package check that the bundle id is `ai.lindoelio.computer-use`. P15 repeats that check on the release artifact after the version bump.
 
 ---
 

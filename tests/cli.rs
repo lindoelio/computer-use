@@ -405,10 +405,36 @@ fn doctor_returns_json_on_every_platform() {
     );
     let value: Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
     assert_eq!(value["ok"], true);
+    assert!(value["permissions_ok"].is_boolean());
+    assert!(value["missing"].is_array());
     assert!(value["accessibility"].is_boolean() || value["accessibility"].is_null());
     assert!(value["screen_capture"].is_boolean() || value["screen_capture"].is_null());
+    assert!(value["screen_recording"].is_boolean() || value["screen_recording"].is_null());
+    assert!(value["post_events"].is_boolean() || value["post_events"].is_null());
+    assert!(value["input_monitoring"].is_boolean() || value["input_monitoring"].is_null());
     assert!(value["input_monitor"].is_null());
+    assert!(value["fix"].is_array());
     assert!(value["fixes"].is_array());
+    assert!(value["text"].is_string());
+    assert!(value["identity"].is_object());
+    assert!(value["bundle_id"].is_string() || value["bundle_id"].is_null());
+    #[cfg(target_os = "macos")]
+    if value["accessibility"] == false {
+        assert_eq!(value["permissions_ok"], false);
+        let missing = value["missing"].as_array().unwrap();
+        assert!(missing.iter().any(|item| item == "accessibility"));
+    }
+}
+
+#[test]
+fn doctor_help_lists_prompt_flags() {
+    let output = run(&["doctor", "--help"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--prompt"), "{stdout}");
+    assert!(stdout.contains("--request"), "{stdout}");
+    assert!(stdout.contains("--open-settings"), "{stdout}");
+    assert!(stdout.contains("exits 0"), "{stdout}");
 }
 
 #[test]
