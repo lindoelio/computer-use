@@ -13,7 +13,8 @@ use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use computer_use::protocol::{handle_request_line_opts, LineOptions};
 use computer_use::{
-    parse_region, Action, CallContext, ImageFormat, MouseButton, Response, ScrollDirection,
+    parse_path, parse_region, Action, CallContext, ImageFormat, MouseButton, Response,
+    ScrollDirection,
 };
 
 /// Cross-platform desktop automation for agents.
@@ -134,6 +135,21 @@ enum SessionCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum ClipboardCommand {
+    /// Read text, or write a clipboard image to the session cache.
+    Get,
+    /// Replace the clipboard. Requires a confirm hook.
+    Set {
+        /// Text to write. Empty text is refused.
+        #[arg(long, conflicts_with = "image")]
+        text: Option<String>,
+        /// PNG file to write. Used when `--text` is omitted.
+        #[arg(long, value_name = "PNG", conflicts_with = "text")]
+        image: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum PolicyCommand {
     /// Report allow or deny for `--app`.
     Check,
@@ -193,15 +209,39 @@ enum CliCommand {
         /// Click twice. With `--element`, this presses twice.
         #[arg(long)]
         double: bool,
+        /// Click count, 1, 2, or 3. `--count 3` is a triple click.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=3))]
+        count: u8,
+    },
+
+    /// Click three times. Alias of `click --count 3`.
+    #[command(name = "triple-click", visible_alias = "triple_click")]
+    TripleClick {
+        /// Logical x coordinate.
+        #[arg(long)]
+        x: i32,
+        /// Logical y coordinate.
+        #[arg(long)]
+        y: i32,
+        /// Mouse button. Default: left.
+        #[arg(long, value_enum, default_value = "left")]
+        button: CliButton,
     },
 
     /// Press an element from the current tree. `--count` may be 1, 2, or 3.
+    ///
+    /// `--button right` runs `AXShowMenu` when the element advertises it.
+    /// Otherwise, and for middle, back, and forward, the click is aimed at
+    /// the element center.
     ///
     /// Example: computer-use press --app Notes --element 12 --count 2
     Press {
         /// How many times to press. Default: 1.
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=3))]
         count: u8,
+        /// Mouse button. Default: left.
+        #[arg(long, value_enum, default_value = "left")]
+        button: CliButton,
     },
 
     /// Set an element's value. Secure fields are refused.
@@ -264,6 +304,55 @@ enum CliCommand {
         y: i32,
     },
 
+    /// Drag from the first point through the rest, then release.
+    ///
+    /// `--path` is a flat `x,y,x,y` list with at least two points.
+    ///
+    /// Example: computer-use drag --path 10,20,200,40
+    Drag {
+        /// Flat logical points, `x,y,x,y`.
+        #[arg(long, value_name = "X,Y,X,Y")]
+        path: String,
+        /// Mouse button. Default: left.
+        #[arg(long, value_enum, default_value = "left")]
+        button: CliButton,
+    },
+
+    /// Press a mouse button and leave it down until `mouse-up`.
+    ///
+    /// A one-shot `mouse-down` releases the button when this process exits.
+    /// The button stays down across requests in `serve` and steps in `batch`.
+    ///
+    /// Example: computer-use mouse-down --x 10 --y 20 --button left
+    #[command(name = "mouse-down", visible_alias = "mouse_down")]
+    MouseDown {
+        /// Logical x coordinate.
+        #[arg(long)]
+        x: i32,
+        /// Logical y coordinate.
+        #[arg(long)]
+        y: i32,
+        /// Mouse button. Default: left.
+        #[arg(long, value_enum, default_value = "left")]
+        button: CliButton,
+    },
+
+    /// Release a mouse button pressed by `mouse-down`.
+    ///
+    /// Example: computer-use mouse-up --x 10 --y 20
+    #[command(name = "mouse-up", visible_alias = "mouse_up")]
+    MouseUp {
+        /// Logical x coordinate.
+        #[arg(long)]
+        x: i32,
+        /// Logical y coordinate.
+        #[arg(long)]
+        y: i32,
+        /// Mouse button. Default: left.
+        #[arg(long, value_enum, default_value = "left")]
+        button: CliButton,
+    },
+
     /// Type Unicode text into the focused control.
     ///
     /// Example: computer-use type --text "hello"
@@ -276,14 +365,68 @@ enum CliCommand {
     /// Press a key combination.
     ///
     /// Modifiers: cmd, command, meta, super, ctrl, control, alt, option, shift.
-    /// Keys: enter, tab, esc, space, arrows, f1-f12, letters, digits, and
-    /// backspace, delete, home, end, pageup, pagedown.
+    /// Keys: Return, Enter, BackSpace, Delete, Escape, Tab, space, Up, Down,
+    /// Left, Right, Home, End, Page_Up, Prior, Page_Down, Next, Insert,
+    /// F1–F24, plus, minus, letters, and digits. Names are case-insensitive.
+    /// A space separates a sequence, as in `ctrl+a Delete`.
     ///
-    /// Example: computer-use key --keys "cmd+shift+4"
+    /// Example: computer-use key --keys "super+c"
     Key {
-        /// Combination such as `cmd+c` or `ctrl+shift+tab`.
+        /// Combination such as `super+c` or `ctrl+alt+Delete`.
         #[arg(long, value_name = "COMBO")]
         keys: String,
+    },
+
+    /// Hold one key combination, then release it.
+    ///
+    /// `--ms` above 30000 is `invalid_arguments`. The combo is one xdotool
+    /// name, not a space-separated sequence.
+    ///
+    /// Example: computer-use hold-key --keys shift --ms 400
+    #[command(name = "hold-key", visible_alias = "hold_key")]
+    HoldKey {
+        /// One combination such as `shift` or `ctrl+c`.
+        #[arg(long, value_name = "COMBO")]
+        keys: String,
+        /// Milliseconds to hold. Maximum 30000.
+        #[arg(long, value_name = "N")]
+        ms: u64,
+    },
+
+    /// Read or write the clipboard.
+    ///
+    /// `get` returns text, an image path, or `kind: empty`. `set` is confirmed.
+    /// The audit records the character count and not the text.
+    ///
+    /// Example: computer-use clipboard set --text "hello"
+    Clipboard {
+        #[command(subcommand)]
+        command: ClipboardCommand,
+    },
+
+    /// Screenshot one region. With `--app` or `--window`, the region is
+    /// window-local and its far edge may equal the window size.
+    ///
+    /// Example: computer-use zoom --region 0,0,400,300
+    Zoom {
+        /// Logical region `x,y,width,height`.
+        #[arg(long, value_name = "X,Y,W,H")]
+        region: String,
+        /// File to write. Defaults to a path in the system temp directory.
+        #[arg(long, visible_alias = "path", value_name = "PATH")]
+        output: Option<PathBuf>,
+        /// Image format. Default: png.
+        #[arg(long, value_enum)]
+        format: Option<CliFormat>,
+        /// Scale the image down so its width is at most N pixels. Default: 1440. 0 keeps the source width.
+        #[arg(long, value_name = "N")]
+        max_width: Option<u32>,
+        /// Letterbox into WxH pixels, for example 1440x900. The image is not scaled up.
+        #[arg(long, value_name = "WxH")]
+        canvas: Option<String>,
+        /// Add a standard base64 `data` field to the JSON result.
+        #[arg(long)]
+        base64: bool,
     },
 
     /// Scroll the mouse wheel.
@@ -512,6 +655,12 @@ enum CliButton {
     Right,
     #[value(name = "middle")]
     Middle,
+    /// Button 4.
+    #[value(name = "back")]
+    Back,
+    /// Button 5.
+    #[value(name = "forward")]
+    Forward,
 }
 
 impl From<CliButton> for MouseButton {
@@ -520,6 +669,8 @@ impl From<CliButton> for MouseButton {
             CliButton::Left => Self::Left,
             CliButton::Right => Self::Right,
             CliButton::Middle => Self::Middle,
+            CliButton::Back => Self::Back,
+            CliButton::Forward => Self::Forward,
         }
     }
 }
@@ -676,13 +827,23 @@ fn command_action(
             y,
             button,
             double,
+            count,
         } => Action::Click {
             x: *x,
             y: *y,
             button: MouseButton::from(*button),
             double: *double,
+            count: *count,
         },
-        CliCommand::Press { count } => Action::Press { count: *count },
+        CliCommand::TripleClick { x, y, button } => Action::TripleClick {
+            x: Some(*x),
+            y: Some(*y),
+            button: MouseButton::from(*button),
+        },
+        CliCommand::Press { count, button } => Action::Press {
+            count: *count,
+            button: MouseButton::from(*button),
+        },
         CliCommand::SetValue { value } => Action::SetValue {
             value: value.clone(),
         },
@@ -694,8 +855,57 @@ fn command_action(
         CliCommand::ScrollTo => Action::ScrollTo,
         CliCommand::Focus => Action::Focus,
         CliCommand::Move { x, y } => Action::Move { x: *x, y: *y },
+        CliCommand::Drag { path, button } => Action::Drag {
+            path: parse_path(path).map_err(Response::from_error)?,
+            button: MouseButton::from(*button),
+        },
+        CliCommand::MouseDown { x, y, button } => Action::MouseDown {
+            x: *x,
+            y: *y,
+            button: MouseButton::from(*button),
+        },
+        CliCommand::MouseUp { x, y, button } => Action::MouseUp {
+            x: *x,
+            y: *y,
+            button: MouseButton::from(*button),
+        },
         CliCommand::Type { text } => Action::Type { text: text.clone() },
         CliCommand::Key { keys } => Action::Key { keys: keys.clone() },
+        CliCommand::HoldKey { keys, ms } => Action::HoldKey {
+            keys: keys.clone(),
+            ms: *ms,
+        },
+        CliCommand::Clipboard { command } => match command {
+            ClipboardCommand::Get => Action::ClipboardGet,
+            ClipboardCommand::Set { text, image } => Action::ClipboardSet {
+                text: text.clone(),
+                image: image.as_ref().map(|path| path.display().to_string()),
+            },
+        },
+        CliCommand::Zoom {
+            region,
+            output,
+            format,
+            max_width,
+            canvas,
+            base64,
+        } => Action::Zoom {
+            region: parse_region(region).map_err(Response::from_error)?,
+            output: match output {
+                Some(path) => Some(
+                    path.to_str()
+                        .ok_or_else(|| {
+                            Response::failure("invalid_arguments", "output path is not valid UTF-8")
+                        })?
+                        .to_string(),
+                ),
+                None => None,
+            },
+            format: format.map(ImageFormat::from),
+            max_width: *max_width,
+            canvas: canvas.clone(),
+            base64: *base64,
+        },
         CliCommand::Scroll {
             x,
             y,
@@ -842,6 +1052,8 @@ fn line_options(cli: &Cli) -> LineOptions<'_> {
 }
 
 fn serve(cli: &Cli) -> u8 {
+    let backend = computer_use::create_desktop_backend();
+    let _session = computer_use::InputSession::open(backend.as_ref());
     let stdin = io::stdin();
     let mut lines = stdin.lock().lines();
     let stdout = io::stdout();

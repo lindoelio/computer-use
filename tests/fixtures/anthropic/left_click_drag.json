@@ -10,6 +10,11 @@
       10
     ]
   },
-  "error_code": "unsupported",
-  "error_contains": "P8"
+  "expect": {
+    "action": "drag",
+    "path": [
+      {"x": 0, "y": 0},
+      {"x": 10, "y": 10}
+    ]
+  }
 }

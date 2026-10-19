@@ -268,6 +268,28 @@ fn pointer_event(
         (MouseButton::Middle, PointerPhase::Move) => {
             (CGEventType::MouseMoved, CGMouseButton::Center)
         }
+        (MouseButton::Back, PointerPhase::Down) | (MouseButton::Forward, PointerPhase::Down) => {
+            (CGEventType::OtherMouseDown, CGMouseButton::Center)
+        }
+        (MouseButton::Back, PointerPhase::Up) | (MouseButton::Forward, PointerPhase::Up) => {
+            (CGEventType::OtherMouseUp, CGMouseButton::Center)
+        }
+        (MouseButton::Back, PointerPhase::Drag) | (MouseButton::Forward, PointerPhase::Drag) => {
+            (CGEventType::OtherMouseDragged, CGMouseButton::Center)
+        }
+        (MouseButton::Back, PointerPhase::Move) | (MouseButton::Forward, PointerPhase::Move) => {
+            (CGEventType::MouseMoved, CGMouseButton::Center)
+        }
+    }
+}
+
+/// `kCGMouseEventButtonNumber`. Back is 3 and forward is 4. Left and right use their event type.
+fn button_number(button: MouseButton) -> Option<i64> {
+    match button {
+        MouseButton::Middle => Some(2),
+        MouseButton::Back => Some(3),
+        MouseButton::Forward => Some(4),
+        MouseButton::Left | MouseButton::Right => None,
     }
 }
 
@@ -323,11 +345,22 @@ pub(crate) fn virtual_keycode(key: &str) -> Option<u16> {
         "f10" => 0x6d,
         "f11" => 0x67,
         "f12" => 0x6f,
+        "f13" => 0x69,
+        "f14" => 0x6b,
+        "f15" => 0x71,
+        "f16" => 0x6a,
+        "f17" => 0x40,
+        "f18" => 0x4f,
+        "f19" => 0x50,
+        "f20" => 0x5a,
         "home" => 0x73,
         "pageup" => 0x74,
         "delete" => 0x75,
         "end" => 0x77,
         "pagedown" => 0x79,
+        "insert" => 0x72,
+        "minus" => 0x1b,
+        "plus" => 0x18,
         "left" => 0x7b,
         "right" => 0x7c,
         "down" => 0x7d,
@@ -355,6 +388,16 @@ mod posting_math {
         assert_eq!(kind, objc2_core_graphics::CGEventType::OtherMouseUp);
         let (kind, _) = pointer_event(MouseButton::Left, PointerPhase::Move);
         assert_eq!(kind, objc2_core_graphics::CGEventType::MouseMoved);
+        let (kind, _) = pointer_event(MouseButton::Back, PointerPhase::Down);
+        assert_eq!(kind, objc2_core_graphics::CGEventType::OtherMouseDown);
+        assert_eq!(button_number(MouseButton::Back), Some(3));
+        assert_eq!(button_number(MouseButton::Forward), Some(4));
+        assert_eq!(virtual_keycode("f13"), Some(0x69));
+        assert_eq!(virtual_keycode("f20"), Some(0x5a));
+        assert_eq!(virtual_keycode("f24"), None);
+        assert_eq!(virtual_keycode("plus"), Some(0x18));
+        assert_eq!(virtual_keycode("minus"), Some(0x1b));
+        assert_eq!(virtual_keycode("insert"), Some(0x72));
     }
 }
 
@@ -362,7 +405,7 @@ mod posting_math {
 fn perform_input_live(job: &InputJob) -> Result<InputReport, ComputerError> {
     match job.tier {
         TierName::Ax => Err(ComputerError::Unsupported(
-            "tier ax does not post coordinate or keyboard events; pass --element".into(),
+            "tier ax does not post coordinate or keyboard events; pass --element to use an accessibility action".into(),
         )),
         TierName::Activate => run_activate(job),
         TierName::Event => run_events(job, false),
@@ -565,7 +608,17 @@ fn run_foreground(kind: &InputKind) -> Result<(), ComputerError> {
             super::super::input::scroll(*dx, *dy)?;
         }
         InputKind::Type { text } => super::super::input::type_text(text)?,
-        InputKind::Key { modifiers, key } => super::super::input::press_key(modifiers, key)?,
+        InputKind::Key { strokes } => {
+            for stroke in strokes {
+                super::super::input::press_key(&stroke.modifiers, &stroke.key)?;
+            }
+        }
+        InputKind::Drag { points, button } => super::super::input::drag(points, *button)?,
+        InputKind::MouseDown { x, y, button } => super::super::input::button_down(*x, *y, *button)?,
+        InputKind::MouseUp { x, y, button } => super::super::input::button_up(*x, *y, *button)?,
+        InputKind::HoldKey { modifiers, key, ms } => {
+            super::super::input::hold_key(modifiers, key, *ms)?
+        }
     }
     Ok(())
 }
@@ -675,7 +728,24 @@ fn dispatch_kind(
         InputKind::Move { x, y } => post_move(source, target, *x, *y),
         InputKind::Scroll { x, y, dx, dy } => post_scroll(source, target, *x, *y, *dx, *dy),
         InputKind::Type { text } => post_text(source, target, text),
-        InputKind::Key { modifiers, key } => post_key(source, target, modifiers, key),
+        InputKind::Key { strokes } => {
+            for stroke in strokes {
+                post_key(source, target, &stroke.modifiers, &stroke.key)?;
+            }
+            Ok(())
+        }
+        InputKind::Drag { points, button } => post_drag(source, target, points, *button),
+        InputKind::MouseDown { x, y, button } => {
+            post_half(source, target, *x, *y, *button, PointerPhase::Down)?;
+            crate::backend::held::note_button(held_button(target, *x, *y, *button));
+            Ok(())
+        }
+        InputKind::MouseUp { x, y, button } => {
+            post_half(source, target, *x, *y, *button, PointerPhase::Up)?;
+            crate::backend::held::clear_button(*button);
+            Ok(())
+        }
+        InputKind::HoldKey { modifiers, key, ms } => post_hold(source, target, modifiers, key, *ms),
     }
 }
 
@@ -690,24 +760,95 @@ fn post_click(
 ) -> Result<(), ComputerError> {
     use objc2_core_graphics::{CGEvent, CGEventField};
     let point = local_point(target, x, y);
-    let clicks = count.max(1);
-    for click_state in 1..=clicks {
-        for phase in [PointerPhase::Down, PointerPhase::Up] {
-            let (kind, mouse) = pointer_event(button, phase);
-            let event =
-                CGEvent::new_mouse_event(Some(source), kind, point, mouse).ok_or_else(|| {
-                    ComputerError::ExecutionFailed("CGEventCreateMouseEvent failed".into())
-                })?;
-            stamp(&event, target);
-            CGEvent::set_integer_value_field(
-                Some(&event),
-                CGEventField::MouseEventClickState,
-                i64::from(click_state),
-            );
-            CGEvent::post_to_pid(target.pid, Some(&event));
-        }
+    for (half, click_state) in crate::tier::click_state_sequence(count) {
+        let phase = match half {
+            crate::tier::ClickHalf::Down => PointerPhase::Down,
+            crate::tier::ClickHalf::Up => PointerPhase::Up,
+        };
+        let (kind, mouse) = pointer_event(button, phase);
+        let event =
+            CGEvent::new_mouse_event(Some(source), kind, point, mouse).ok_or_else(|| {
+                ComputerError::ExecutionFailed("CGEventCreateMouseEvent failed".into())
+            })?;
+        stamp(&event, target);
+        CGEvent::set_integer_value_field(
+            Some(&event),
+            CGEventField::MouseEventClickState,
+            i64::from(click_state),
+        );
+        set_button_number(&event, button);
+        CGEvent::post_to_pid(target.pid, Some(&event));
     }
     Ok(())
+}
+
+#[cfg(not(test))]
+fn post_half(
+    source: &objc2_core_graphics::CGEventSource,
+    target: &EventTarget,
+    x: i32,
+    y: i32,
+    button: MouseButton,
+    phase: PointerPhase,
+) -> Result<(), ComputerError> {
+    use objc2_core_graphics::CGEvent;
+    let (kind, mouse) = pointer_event(button, phase);
+    let event = CGEvent::new_mouse_event(Some(source), kind, local_point(target, x, y), mouse)
+        .ok_or_else(|| ComputerError::ExecutionFailed("CGEventCreateMouseEvent failed".into()))?;
+    stamp(&event, target);
+    set_button_number(&event, button);
+    CGEvent::post_to_pid(target.pid, Some(&event));
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn post_drag(
+    source: &objc2_core_graphics::CGEventSource,
+    target: &EventTarget,
+    points: &[(i32, i32)],
+    button: MouseButton,
+) -> Result<(), ComputerError> {
+    if points.len() < 2 {
+        return Err(ComputerError::InvalidArguments(
+            "drag needs at least 2 points".into(),
+        ));
+    }
+    let first = points[0];
+    post_half(source, target, first.0, first.1, button, PointerPhase::Down)?;
+    for point in &points[1..] {
+        std::thread::sleep(std::time::Duration::from_millis(8));
+        post_half(source, target, point.0, point.1, button, PointerPhase::Drag)?;
+    }
+    let last = points[points.len() - 1];
+    post_half(source, target, last.0, last.1, button, PointerPhase::Up)
+}
+
+#[cfg(not(test))]
+fn held_button(
+    target: &EventTarget,
+    x: i32,
+    y: i32,
+    button: MouseButton,
+) -> crate::backend::held::HeldButton {
+    crate::backend::held::HeldButton {
+        button,
+        x,
+        y,
+        where_: crate::backend::held::HeldWhere::Event {
+            pid: target.pid,
+            window_id: target.window_id,
+            origin_x: target.origin_x,
+            origin_y: target.origin_y,
+        },
+    }
+}
+
+#[cfg(not(test))]
+fn set_button_number(event: &objc2_core_graphics::CGEvent, button: MouseButton) {
+    use objc2_core_graphics::{CGEvent, CGEventField};
+    if let Some(number) = button_number(button) {
+        CGEvent::set_integer_value_field(Some(event), CGEventField::MouseEventButtonNumber, number);
+    }
 }
 
 #[cfg(not(test))]
@@ -798,6 +939,7 @@ fn post_key(
     modifiers: &[Modifier],
     key: &str,
 ) -> Result<(), ComputerError> {
+    crate::keys::macos_function_gap(key)?;
     let flags = event_flags(modifiers);
     for modifier in modifiers {
         post_keycode(
@@ -817,6 +959,123 @@ fn post_key(
         post_keycode(
             source,
             target,
+            modifier_keycode(*modifier),
+            false,
+            flags,
+            None,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn post_hold(
+    source: &objc2_core_graphics::CGEventSource,
+    target: &EventTarget,
+    modifiers: &[Modifier],
+    key: &str,
+    ms: u64,
+) -> Result<(), ComputerError> {
+    if ms > crate::tier::MAX_HOLD_MS {
+        return Err(ComputerError::InvalidArguments(format!(
+            "hold_key ms must be at most {}",
+            crate::tier::MAX_HOLD_MS
+        )));
+    }
+    crate::keys::macos_function_gap(key)?;
+    let flags = event_flags(modifiers);
+    for modifier in modifiers {
+        post_keycode(
+            source,
+            target,
+            modifier_keycode(*modifier),
+            true,
+            flags,
+            None,
+        )?;
+    }
+    let code = virtual_keycode(key).unwrap_or(0);
+    let unicode = (key.chars().count() == 1 && virtual_keycode(key).is_none()).then_some(key);
+    post_keycode(source, target, code, true, flags, unicode)?;
+    crate::backend::held::note_key(crate::backend::held::HeldKey {
+        modifiers: modifiers.to_vec(),
+        key: key.to_string(),
+        where_: crate::backend::held::HeldWhere::Event {
+            pid: target.pid,
+            window_id: target.window_id,
+            origin_x: target.origin_x,
+            origin_y: target.origin_y,
+        },
+    });
+    if ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+    let released = (|| {
+        post_keycode(source, target, code, false, flags, unicode)?;
+        for modifier in modifiers.iter().rev() {
+            post_keycode(
+                source,
+                target,
+                modifier_keycode(*modifier),
+                false,
+                flags,
+                None,
+            )?;
+        }
+        Ok(())
+    })();
+    if released.is_ok() {
+        crate::backend::held::clear_keys();
+    }
+    released
+}
+
+/// Button up for a button the event tier left down. Called from the process registry.
+#[cfg(not(test))]
+pub(crate) fn release_posted_button(
+    pid: i32,
+    window_id: u32,
+    origin_x: i32,
+    origin_y: i32,
+    x: i32,
+    y: i32,
+    button: MouseButton,
+) -> Result<(), ComputerError> {
+    let target = EventTarget {
+        window_id,
+        pid,
+        origin_x,
+        origin_y,
+    };
+    let source = private_source()?;
+    post_half(&source, &target, x, y, button, PointerPhase::Up)
+}
+
+/// Key up for a hold the event tier did not finish.
+#[cfg(not(test))]
+pub(crate) fn release_posted_key(
+    pid: i32,
+    window_id: u32,
+    origin_x: i32,
+    origin_y: i32,
+    modifiers: &[Modifier],
+    key: &str,
+) -> Result<(), ComputerError> {
+    let target = EventTarget {
+        window_id,
+        pid,
+        origin_x,
+        origin_y,
+    };
+    let source = private_source()?;
+    let flags = event_flags(modifiers);
+    let code = virtual_keycode(key).unwrap_or(0);
+    let unicode = (key.chars().count() == 1 && virtual_keycode(key).is_none()).then_some(key);
+    post_keycode(&source, &target, code, false, flags, unicode)?;
+    for modifier in modifiers.iter().rev() {
+        post_keycode(
+            &source,
+            &target,
             modifier_keycode(*modifier),
             false,
             flags,

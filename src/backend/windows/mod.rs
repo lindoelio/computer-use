@@ -157,6 +157,10 @@ mod tests {
                 app: None,
                 window: None,
                 session: None,
+                tier: None,
+                allow_foreground: false,
+                require_background: false,
+                no_overlay: true,
             })
             .unwrap_err();
         assert_eq!(error.error.code(), "unsupported");

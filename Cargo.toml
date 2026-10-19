@@ -58,6 +58,14 @@ xcap = "0.3.3"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# macOS and Windows pasteboards do not use the Wayland feature.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+arboard = "3.7.0"
+
+# Default features pull `wayland-data-control`. X11 plus image data is enough.
+[target.'cfg(target_os = "linux")'.dependencies]
+arboard = { version = "3.7.0", default-features = false, features = ["image-data"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
 objc2 = "0.6.5"

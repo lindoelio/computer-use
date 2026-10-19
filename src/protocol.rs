@@ -12,22 +12,28 @@ use serde::ser::{Serialize, Serializer};
 use serde::{Deserialize, Serialize as SerializeDerive};
 use serde_json::{json, Map, Value};
 
+use crate::attempt::{self, AttemptFlags};
+use crate::backend::clipboard::ClipboardContents;
 use crate::backend::create_desktop_backend;
 use crate::backend::{validate_key, DesktopBackend, WindowTarget};
 use crate::cache;
 use crate::element::{self, ElementError, ElementOp, ElementOutcome, ElementRequest};
 use crate::error::{ComputerError, ErrorBody};
 use crate::image_util::{self, encode_base64};
-use crate::keys::parse_key_combo;
+use crate::input_session::{self, InputSession};
+use crate::keys::{parse_key_combo, parse_key_sequence};
 use crate::policy;
 use crate::state::collect_state_for;
 use crate::target::{
     filter_windows_for_pid, parse_app_selector, parse_window_selector, resolve_app, resolve_window,
     WindowSelector,
 };
-use crate::tier::{InputJob, InputKind, TierName};
+use crate::tier::{self, InputKind, KeyStroke, TierName};
 use crate::tree::TreeQuery;
-use crate::types::{ImageFormat, Modifier, MouseButton, Region, ScrollDirection};
+use crate::types::{
+    parse_path, region_inside, Frame, ImageFormat, Modifier, MouseButton, Point, Region,
+    ScrollDirection,
+};
 
 const MAX_WAIT_MS: u128 = 24 * 60 * 60 * 1000;
 
@@ -76,6 +82,22 @@ pub enum Action {
         /// Click twice when true. With `element`, this is `press` count 2.
         #[serde(default, skip_serializing_if = "is_false")]
         double: bool,
+        /// Repeat count. 1, 2, or 3. `double: true` means 2 when `count` is 1.
+        #[serde(default = "default_press_count", skip_serializing_if = "is_one")]
+        count: u8,
+    },
+    /// Click three times.
+    #[serde(rename = "triple_click", alias = "triple-click")]
+    TripleClick {
+        /// Logical x. Omit it when `element` is set.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        x: Option<i32>,
+        /// Logical y. Omit it when `element` is set.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        y: Option<i32>,
+        /// Button. Defaults to left.
+        #[serde(default)]
+        button: MouseButton,
     },
     /// Click twice. Equivalent to `click` with `double: true`.
     #[serde(rename = "double_click")]
@@ -95,6 +117,80 @@ pub enum Action {
         /// Repeat count. Defaults to 1.
         #[serde(default = "default_press_count")]
         count: u8,
+        /// Mouse button. Left uses `AXPress`. Right uses `AXShowMenu` when advertised.
+        #[serde(default)]
+        button: MouseButton,
+    },
+    /// Button down at the first point, dragged events through the rest, up at the last.
+    Drag {
+        /// At least two points. A JSON array, or a flat `x,y,x,y` string.
+        #[serde(alias = "points", deserialize_with = "deserialize_path")]
+        path: Vec<Point>,
+        /// Mouse button. Defaults to left.
+        #[serde(default)]
+        button: MouseButton,
+    },
+    /// Button down. A later `mouse_up`, or the end of a one-shot command, releases it.
+    #[serde(alias = "mouse-down")]
+    MouseDown {
+        /// Logical x.
+        x: i32,
+        /// Logical y.
+        y: i32,
+        /// Mouse button. Defaults to left.
+        #[serde(default)]
+        button: MouseButton,
+    },
+    /// Button up.
+    #[serde(alias = "mouse-up")]
+    MouseUp {
+        /// Logical x.
+        x: i32,
+        /// Logical y.
+        y: i32,
+        /// Mouse button. Defaults to left.
+        #[serde(default)]
+        button: MouseButton,
+    },
+    /// Key down, sleep `ms`, key up. One combination. `ms` above 30000 is refused.
+    #[serde(alias = "hold-key")]
+    HoldKey {
+        /// One combo such as `shift` or `ctrl+alt+Delete`.
+        keys: String,
+        /// Milliseconds to hold.
+        ms: u64,
+    },
+    /// Read the clipboard. Text wins over an image. Empty is `kind: empty`.
+    ClipboardGet,
+    /// Write the clipboard. Confirmed. The audit stores the character count, not the text.
+    #[serde(alias = "clipboard-set")]
+    ClipboardSet {
+        /// Text to write. Empty is `invalid_arguments`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        /// PNG path. Used when `text` is absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image: Option<String>,
+    },
+    /// Screenshot of a region. A window target crops that region in window-local points.
+    Zoom {
+        /// File path. A temp path is used when omitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+        /// Logical region, as `x,y,width,height` or an object. Required.
+        region: Region,
+        /// `png` (default) or `jpeg`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        format: Option<ImageFormat>,
+        /// Scale the image down so its width is at most this many pixels.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_width: Option<u32>,
+        /// Letterbox into `WxH` pixels, for example `1440x900`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        canvas: Option<String>,
+        /// Include standard base64 bytes in `data`.
+        #[serde(default, skip_serializing_if = "is_false")]
+        base64: bool,
     },
     /// Set `AXFocused` on an element.
     Focus,
@@ -239,8 +335,26 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn is_one(value: &u8) -> bool {
+    *value == 1
+}
+
 fn default_press_count() -> u8 {
     1
+}
+
+fn deserialize_path<'de, D>(deserializer: D) -> Result<Vec<Point>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::String(text) => parse_path(&text).map_err(de::Error::custom),
+        Value::Array(_) => serde_json::from_value(value).map_err(de::Error::custom),
+        _ => Err(de::Error::custom(
+            "path must be an array of points or an x,y,x,y string",
+        )),
+    }
 }
 
 fn default_stop_on_error() -> bool {
@@ -554,6 +668,11 @@ pub fn dispatch_with_context(
         Err(_) => Response::failure("execution_failed", "action panicked and was recovered"),
     };
     stamp_adapter_name(&mut response, context.adapter.as_deref());
+    // A serve or batch session stays open so a later mouse_up can pair with this down.
+    // A one-shot command has no session, so anything still held is released here.
+    if !input_session::session_open() {
+        let _ = backend.release_held();
+    }
     response
 }
 
@@ -568,6 +687,7 @@ enum PostKind {
 
 fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallContext) -> Response {
     let label = action_label(&action);
+    let chars = clipboard_chars(&action);
     let action = match remap_coordinates(context, action) {
         Ok(action) => action,
         Err(error) => {
@@ -578,10 +698,23 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
                 None,
                 "allow",
                 "default",
+                chars,
                 Response::from_error(error),
             )
         }
     };
+    if let Err(error) = preflight_action(&action) {
+        return finish_action(
+            context,
+            label,
+            &policy::Subject::default(),
+            None,
+            "allow",
+            "default",
+            chars,
+            Response::from_error(error),
+        );
+    }
     let prepared = prepare_action(backend, &action, context);
     if let Some(response) = prepared.stop {
         return finish_action(
@@ -591,6 +724,7 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
             prepared.warning.as_deref(),
             prepared.decision,
             prepared.source,
+            chars,
             response,
         );
     }
@@ -607,6 +741,7 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
                 prepared.warning.as_deref(),
                 prepared.decision,
                 prepared.source,
+                chars,
                 run_batch(backend, context, actions, stop_on_error),
             )
         }
@@ -627,6 +762,27 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
                 max_width,
                 canvas,
                 include_base64: base64,
+                window_crop: false,
+            },
+        )),
+        Action::Zoom {
+            output,
+            region,
+            format,
+            max_width,
+            canvas,
+            base64,
+        } => result_response(screenshot(
+            backend,
+            context,
+            ScreenshotArgs {
+                output,
+                region: Some(region),
+                format,
+                max_width,
+                canvas,
+                include_base64: base64,
+                window_crop: true,
             },
         )),
         Action::Click {
@@ -634,9 +790,21 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
             y,
             button,
             double,
-        } => click(backend, context, x, y, button, double),
-        Action::DoubleClick { x, y, button } => click(backend, context, x, y, button, true),
-        Action::Press { count } => element_command(backend, context, ElementOp::Press { count }),
+            count,
+        } => click(backend, context, x, y, button, double, count),
+        Action::DoubleClick { x, y, button } => click(backend, context, x, y, button, true, 1),
+        Action::TripleClick { x, y, button } => click(backend, context, x, y, button, false, 3),
+        Action::Press { count, button } => {
+            element_command(backend, context, ElementOp::Press { count, button })
+        }
+        Action::Drag { path, button } => drag(backend, context, path, button),
+        Action::MouseDown { x, y, button } => pointer_half(backend, context, x, y, button, true),
+        Action::MouseUp { x, y, button } => pointer_half(backend, context, x, y, button, false),
+        Action::HoldKey { keys, ms } => hold_key(backend, context, &keys, ms),
+        Action::ClipboardGet => result_response(clipboard_get(backend, context)),
+        Action::ClipboardSet { text, image } => {
+            result_response(clipboard_set(backend, text, image))
+        }
         Action::Focus => element_command(backend, context, ElementOp::Focus),
         Action::SetValue { value } => {
             element_command(backend, context, ElementOp::SetValue { value })
@@ -688,6 +856,7 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
                 prepared.warning.as_deref(),
                 prepared.decision,
                 prepared.source,
+                chars,
                 response,
             );
         }
@@ -702,10 +871,12 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
         prepared.warning.as_deref(),
         prepared.decision,
         prepared.source,
+        chars,
         response,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finish_action(
     context: &CallContext,
     label: &str,
@@ -713,6 +884,7 @@ fn finish_action(
     warning: Option<&str>,
     decision: &str,
     source: &str,
+    chars: Option<u64>,
     mut response: Response,
 ) -> Response {
     if let Some(warning) = warning {
@@ -765,6 +937,7 @@ fn finish_action(
         decision: &decision,
         source: &source,
         tier: tier.as_deref(),
+        chars,
     }) {
         push_warning(
             &mut response,
@@ -787,9 +960,17 @@ fn push_warning(response: &mut Response, warning: &str) {
 fn action_label(action: &Action) -> &'static str {
     match action {
         Action::Screenshot { .. } => "screenshot",
+        Action::Zoom { .. } => "zoom",
         Action::Click { .. } => "click",
         Action::DoubleClick { .. } => "double_click",
+        Action::TripleClick { .. } => "triple_click",
         Action::Press { .. } => "press",
+        Action::Drag { .. } => "drag",
+        Action::MouseDown { .. } => "mouse_down",
+        Action::MouseUp { .. } => "mouse_up",
+        Action::HoldKey { .. } => "hold_key",
+        Action::ClipboardGet => "clipboard_get",
+        Action::ClipboardSet { .. } => "clipboard_set",
         Action::Focus => "focus",
         Action::SetValue { .. } => "set_value",
         Action::SelectText { .. } => "select_text",
@@ -827,6 +1008,7 @@ enum PolicyClass {
     Mutate,
     Quit,
     Key,
+    ClipboardSet,
 }
 
 fn policy_class(action: &Action) -> PolicyClass {
@@ -841,11 +1023,15 @@ fn policy_class(action: &Action) -> PolicyClass {
         Action::SessionEnd | Action::SessionPrune { .. } | Action::CursorPosition => {
             PolicyClass::Benign
         }
-        Action::Screenshot { .. } | Action::Tree | Action::GetState | Action::PolicyCheck => {
-            PolicyClass::Observe
-        }
+        Action::Screenshot { .. }
+        | Action::Zoom { .. }
+        | Action::Tree
+        | Action::GetState
+        | Action::PolicyCheck => PolicyClass::Observe,
         Action::Quit { .. } => PolicyClass::Quit,
-        Action::Key { .. } => PolicyClass::Key,
+        Action::Key { .. } | Action::HoldKey { .. } => PolicyClass::Key,
+        Action::ClipboardGet => PolicyClass::Benign,
+        Action::ClipboardSet { .. } => PolicyClass::ClipboardSet,
         _ => PolicyClass::Mutate,
     }
 }
@@ -914,12 +1100,13 @@ fn prepare_action(
     };
     let policy_action = match action {
         Action::Quit { .. } => policy::PolicyAction::Quit,
-        Action::Key { keys } => policy::PolicyAction::Key {
+        Action::Key { keys } | Action::HoldKey { keys, .. } => policy::PolicyAction::Key {
             combo: keys.clone(),
         },
-        Action::Screenshot { .. } | Action::Tree | Action::GetState => {
+        Action::Screenshot { .. } | Action::Zoom { .. } | Action::Tree | Action::GetState => {
             policy::PolicyAction::Observe
         }
+        Action::ClipboardSet { .. } => policy::PolicyAction::ClipboardSet,
         _ => match class {
             PolicyClass::Always => policy::PolicyAction::Always,
             PolicyClass::Benign => policy::PolicyAction::Benign,
@@ -929,6 +1116,7 @@ fn prepare_action(
             PolicyClass::Key => policy::PolicyAction::Key {
                 combo: String::new(),
             },
+            PolicyClass::ClipboardSet => policy::PolicyAction::ClipboardSet,
         },
     };
     let decision = policy::decide(&loaded, &subject, &policy_action);
@@ -955,7 +1143,7 @@ fn prepare_action(
     }
     let mutating = matches!(
         class,
-        PolicyClass::Mutate | PolicyClass::Quit | PolicyClass::Key
+        PolicyClass::Mutate | PolicyClass::Quit | PolicyClass::Key | PolicyClass::ClipboardSet
     );
     if mutating && policy::is_paused() {
         let (decision_name, source) = decision_record(&decision);
@@ -969,7 +1157,7 @@ fn prepare_action(
             source,
         };
     }
-    if let Action::Key { .. } = action {
+    if let Action::Key { .. } | Action::HoldKey { .. } = action {
         if let Some(index) = context.element {
             if let Ok(Some(peek)) = backend.peek_element(
                 context.app.as_deref(),
@@ -1088,7 +1276,7 @@ fn resolve_subject(
     if matches!(class, PolicyClass::Always | PolicyClass::Benign) {
         return Ok(policy::Subject::default());
     }
-    let screenshot = matches!(action, Action::Screenshot { .. });
+    let screenshot = matches!(action, Action::Screenshot { .. } | Action::Zoom { .. });
     let frontmost_observe =
         matches!(action, Action::Tree | Action::GetState) && context.app.is_none();
     let app_text = context.app.clone().or_else(|| {
@@ -1144,7 +1332,7 @@ fn resolve_subject(
     let want_window = context.window.is_some()
         || matches!(
             action,
-            Action::Tree | Action::GetState | Action::Screenshot { .. }
+            Action::Tree | Action::GetState | Action::Screenshot { .. } | Action::Zoom { .. }
         );
     if want_window {
         if let Ok(listed) = backend.list_windows() {
@@ -1161,7 +1349,10 @@ fn resolve_subject(
                 if context.window.is_some()
                     || matches!(
                         action,
-                        Action::Tree | Action::GetState | Action::Screenshot { .. }
+                        Action::Tree
+                            | Action::GetState
+                            | Action::Screenshot { .. }
+                            | Action::Zoom { .. }
                     )
                 {
                     subject.window_title = Some(window.title);
@@ -1287,9 +1478,15 @@ fn result_response(result: Result<Value, ComputerError>) -> Response {
 
 fn post_state_kind(action: &Action) -> PostKind {
     match action {
-        Action::Screenshot { .. } => PostKind::Screenshot,
+        Action::Screenshot { .. } | Action::Zoom { .. } => PostKind::Screenshot,
         Action::Click { .. }
         | Action::DoubleClick { .. }
+        | Action::TripleClick { .. }
+        | Action::Drag { .. }
+        | Action::MouseDown { .. }
+        | Action::MouseUp { .. }
+        | Action::HoldKey { .. }
+        | Action::ClipboardSet { .. }
         | Action::Press { .. }
         | Action::Focus
         | Action::SetValue { .. }
@@ -1314,6 +1511,7 @@ fn post_state_kind(action: &Action) -> PostKind {
         | Action::SessionEnd
         | Action::SessionPrune { .. }
         | Action::CursorPosition
+        | Action::ClipboardGet
         | Action::PolicyCheck
         | Action::Pause
         | Action::Resume => PostKind::ReadOnly,
@@ -1337,6 +1535,7 @@ fn remap_image_action(context: &CallContext, action: Action) -> Result<Action, C
             y,
             button,
             double,
+            count,
         } => {
             let (x, y) = remap_optional_point(context, x, y)?;
             Ok(Action::Click {
@@ -1344,11 +1543,35 @@ fn remap_image_action(context: &CallContext, action: Action) -> Result<Action, C
                 y,
                 button,
                 double,
+                count,
             })
         }
         Action::DoubleClick { x, y, button } => {
             let (x, y) = remap_optional_point(context, x, y)?;
             Ok(Action::DoubleClick { x, y, button })
+        }
+        Action::TripleClick { x, y, button } => {
+            let (x, y) = remap_optional_point(context, x, y)?;
+            Ok(Action::TripleClick { x, y, button })
+        }
+        Action::Drag { path, button } => {
+            let mut mapped = Vec::with_capacity(path.len());
+            for point in path {
+                let (x, y) = remap_point(context, point.x, point.y)?;
+                mapped.push(Point { x, y });
+            }
+            Ok(Action::Drag {
+                path: mapped,
+                button,
+            })
+        }
+        Action::MouseDown { x, y, button } => {
+            let (x, y) = remap_point(context, x, y)?;
+            Ok(Action::MouseDown { x, y, button })
+        }
+        Action::MouseUp { x, y, button } => {
+            let (x, y) = remap_point(context, x, y)?;
+            Ok(Action::MouseUp { x, y, button })
         }
         Action::Move { x, y } => {
             let (x, y) = remap_point(context, x, y)?;
@@ -1385,6 +1608,24 @@ fn remap_image_action(context: &CallContext, action: Action) -> Result<Action, C
                 None => None,
             };
             Ok(Action::Screenshot {
+                output,
+                region,
+                format,
+                max_width,
+                canvas,
+                base64,
+            })
+        }
+        Action::Zoom {
+            output,
+            region,
+            format,
+            max_width,
+            canvas,
+            base64,
+        } => {
+            let region = remap_region(context, region)?;
+            Ok(Action::Zoom {
                 output,
                 region,
                 format,
@@ -1513,6 +1754,8 @@ fn run_batch(
     actions: Vec<Value>,
     stop_on_error: bool,
 ) -> Response {
+    // Steps share one hold. The drop releases only when this is the outermost session.
+    let _session = InputSession::open(backend);
     let mut results = Vec::with_capacity(actions.len());
     let mut first_error: Option<(usize, ErrorBody)> = None;
     for (index, step) in actions.into_iter().enumerate() {
@@ -1715,6 +1958,7 @@ fn attach_post_state(
                     max_width: None,
                     canvas: None,
                     include_base64: false,
+                    window_crop: false,
                 },
             )
         };
@@ -1783,6 +2027,9 @@ struct ScreenshotArgs {
     max_width: Option<u32>,
     canvas: Option<String>,
     include_base64: bool,
+    /// When set, a window target crops `region` in window-local points.
+    /// Screenshot still refuses a region together with a window.
+    window_crop: bool,
 }
 
 fn screenshot(
@@ -1797,8 +2044,10 @@ fn screenshot(
         max_width,
         canvas,
         include_base64,
+        window_crop,
     } = args;
-    if region.is_some() && (context.app.is_some() || context.window.is_some()) {
+    let targeted = context.app.is_some() || context.window.is_some();
+    if region.is_some() && targeted && !window_crop {
         return Err(ComputerError::InvalidArguments(
             "pass a region or a window target, not both".into(),
         ));
@@ -1809,12 +2058,16 @@ fn screenshot(
         .as_deref()
         .map(image_util::parse_canvas)
         .transpose()?;
-    let raw = if context.app.is_some() || context.window.is_some() {
+    let raw = if targeted {
         if let Some(error) = backend.display_block() {
             return Err(error);
         }
         let target = resolve_screenshot_window(backend, context)?;
-        backend.capture_window(&target)?
+        let captured = backend.capture_window(&target)?;
+        match region {
+            Some(region) if window_crop => crop_window_region(captured, region)?,
+            _ => captured,
+        }
     } else {
         backend.capture_screen(region)?
     };
@@ -1893,6 +2146,58 @@ fn window_target(window: &crate::target::WindowInfo) -> WindowTarget {
     }
 }
 
+/// Crop `region` in window-local logical points. The far edge may equal the window size.
+fn crop_window_region(
+    raw: crate::types::RawCapture,
+    region: Region,
+) -> Result<crate::types::RawCapture, ComputerError> {
+    region_inside(region, raw.logical_width, raw.logical_height)?;
+    let scale = raw.frame.scale();
+    let x = logical_to_device(i64::from(region.x), scale)?;
+    let y = logical_to_device(i64::from(region.y), scale)?;
+    let width = logical_len_to_device(region.width, scale)?;
+    let height = logical_len_to_device(region.height, scale)?;
+    let image = raw.frame.image();
+    if x >= image.width() || y >= image.height() {
+        return Err(ComputerError::InvalidArguments(
+            "region is outside the capture".into(),
+        ));
+    }
+    let width = width.min(image.width() - x).max(1);
+    let height = height.min(image.height() - y).max(1);
+    let cropped = image::imageops::crop_imm(image, x, y, width, height).to_image();
+    Ok(crate::types::RawCapture {
+        frame: Frame::from_image(cropped, scale),
+        origin_x: raw.origin_x.saturating_add(region.x),
+        origin_y: raw.origin_y.saturating_add(region.y),
+        logical_width: region.width,
+        logical_height: region.height,
+        capture_source: raw.capture_source,
+        occluded: raw.occluded,
+        warnings: raw.warnings,
+    })
+}
+
+fn logical_to_device(value: i64, scale: f64) -> Result<u32, ComputerError> {
+    if value < 0 {
+        return Err(ComputerError::InvalidArguments(
+            "region is outside the capture".into(),
+        ));
+    }
+    let pixels = (value as f64) * scale;
+    if !pixels.is_finite() || pixels < 0.0 || pixels > f64::from(u32::MAX) {
+        return Err(ComputerError::ExecutionFailed(
+            "region pixel coordinate is out of range".into(),
+        ));
+    }
+    Ok(pixels.round() as u32)
+}
+
+fn logical_len_to_device(value: u32, scale: f64) -> Result<u32, ComputerError> {
+    let pixels = logical_to_device(i64::from(value), scale)?;
+    Ok(pixels.max(1))
+}
+
 fn default_screenshot_path(format: ImageFormat) -> PathBuf {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
@@ -1919,7 +2224,12 @@ fn click(
     y: Option<i32>,
     button: MouseButton,
     double: bool,
+    count: u8,
 ) -> Response {
+    let count = match effective_click_count(double, count) {
+        Ok(count) => count,
+        Err(error) => return Response::from_error(error),
+    };
     match (context.element, x, y) {
         (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
             Response::failure("invalid_arguments", "pass element or x and y, not both")
@@ -1932,10 +2242,27 @@ fn click(
             Response::failure("invalid_arguments", "x and y must be passed together")
         }
         (Some(_index), None, None) => {
-            let count: u8 = if double { 2 } else { 1 };
-            element_command(backend, context, ElementOp::Press { count })
+            element_command(backend, context, ElementOp::Press { count, button })
         }
-        (None, Some(x), Some(y)) => coordinate_click(backend, context, x, y, button, double),
+        (None, Some(x), Some(y)) => coordinate_click(backend, context, x, y, button, count),
+    }
+}
+
+fn effective_click_count(double: bool, count: u8) -> Result<u8, ComputerError> {
+    if count == 0 || count > 3 {
+        return Err(ComputerError::InvalidArguments(
+            "click count must be 1, 2, or 3".into(),
+        ));
+    }
+    if double && count != 1 && count != 2 {
+        return Err(ComputerError::InvalidArguments(
+            "double and count disagree".into(),
+        ));
+    }
+    if double {
+        Ok(2)
+    } else {
+        Ok(count)
     }
 }
 
@@ -1945,13 +2272,13 @@ fn coordinate_click(
     x: i32,
     y: i32,
     button: MouseButton,
-    double: bool,
+    count: u8,
 ) -> Response {
     let kind = InputKind::Click {
         x,
         y,
         button,
-        count: if double { 2 } else { 1 },
+        count,
     };
     // Tier rejection, including synthetic without the feature, happens before hit-testing.
     if let Err(error) = planned_tiers(backend, context) {
@@ -1974,12 +2301,18 @@ fn coordinate_click(
     }
     match run_attempts(backend, context, kind) {
         Ok(report) => {
+            let action_name = match count {
+                2 => "double_click",
+                3 => "triple_click",
+                _ => "click",
+            };
             let body = json!({
-                "action": if double { "double_click" } else { "click" },
+                "action": action_name,
                 "x": x,
                 "y": y,
                 "button": button.as_str(),
-                "double": double,
+                "double": count == 2,
+                "count": count,
                 "hit": hit_value(hit),
             });
             Response::success(finish_input(body, report, warnings))
@@ -2045,6 +2378,10 @@ fn element_command(backend: &dyn DesktopBackend, context: &CallContext, op: Elem
         app: context.app.clone(),
         window: context.window.clone(),
         session: context.session.clone(),
+        tier: context.tier.clone(),
+        allow_foreground: context.allow_foreground,
+        require_background: context.require_background,
+        no_overlay: context.no_overlay,
     };
     match backend.element_action(&request) {
         Ok(outcome) => Response::success(outcome_value(&outcome)),
@@ -2099,7 +2436,7 @@ fn confirm_title(context: &CallContext, action: &str, reason: &str) -> Result<()
 
 fn precheck(op: &ElementOp) -> Result<(), ComputerError> {
     match op {
-        ElementOp::Press { count } => element::validate_count(*count),
+        ElementOp::Press { count, .. } => element::validate_count(*count),
         ElementOp::SetValue { value } => element::validate_text(value, true),
         ElementOp::Type { text } => element::validate_text(text, false),
         ElementOp::SelectText { start, end } => element::validate_range(*start, *end, None),
@@ -2154,36 +2491,284 @@ fn move_mouse(backend: &dyn DesktopBackend, context: &CallContext, x: i32, y: i3
 }
 
 fn press_key(backend: &dyn DesktopBackend, context: &CallContext, keys: &str) -> Response {
-    let combo = match parse_key_combo(keys) {
-        Ok(combo) => combo,
+    let strokes = match key_strokes(keys) {
+        Ok(strokes) => strokes,
         Err(error) => return Response::from_error(error),
     };
-    if let Err(error) = validate_key(&combo.key) {
-        return Response::from_error(error);
-    }
-    let modifiers: Vec<&str> = combo
-        .modifiers
-        .iter()
-        .copied()
-        .map(Modifier::as_str)
-        .collect();
-    let body = json!({
+    let mut body = json!({
         "action": "key",
         "keys": keys,
-        "modifiers": modifiers,
-        "key": combo.key,
     });
-    match run_attempts(
-        backend,
-        context,
-        InputKind::Key {
-            modifiers: combo.modifiers,
-            key: combo.key,
-        },
-    ) {
+    if strokes.len() == 1 {
+        let modifiers: Vec<&str> = strokes[0]
+            .modifiers
+            .iter()
+            .copied()
+            .map(Modifier::as_str)
+            .collect();
+        body["modifiers"] = json!(modifiers);
+        body["key"] = json!(strokes[0].key);
+    } else {
+        body["strokes"] = json!(strokes.len());
+    }
+    match run_attempts(backend, context, InputKind::Key { strokes }) {
         Ok(report) => Response::success(finish_input(body, report, Vec::new())),
         Err(error) => Response::from_error(error),
     }
+}
+
+fn key_strokes(keys: &str) -> Result<Vec<KeyStroke>, ComputerError> {
+    let combos = parse_key_sequence(keys)?;
+    let mut strokes = Vec::with_capacity(combos.len());
+    for combo in combos {
+        validate_key(&combo.key)?;
+        strokes.push(KeyStroke {
+            modifiers: combo.modifiers,
+            key: combo.key,
+        });
+    }
+    Ok(strokes)
+}
+
+fn drag(
+    backend: &dyn DesktopBackend,
+    context: &CallContext,
+    path: Vec<Point>,
+    button: MouseButton,
+) -> Response {
+    if path.len() < 2 {
+        return Response::from_error(ComputerError::InvalidArguments(
+            "drag needs at least 2 points".into(),
+        ));
+    }
+    let points: Vec<(i32, i32)> = path.iter().map(|point| (point.x, point.y)).collect();
+    let moves = points.len() - 1;
+    match run_attempts(backend, context, InputKind::Drag { points, button }) {
+        Ok(report) => Response::success(finish_input(
+            json!({
+                "action": "drag",
+                "button": button.as_str(),
+                "points": path.len(),
+                "moves": moves,
+            }),
+            report,
+            Vec::new(),
+        )),
+        Err(error) => Response::from_error(error),
+    }
+}
+
+fn pointer_half(
+    backend: &dyn DesktopBackend,
+    context: &CallContext,
+    x: i32,
+    y: i32,
+    button: MouseButton,
+    down: bool,
+) -> Response {
+    let kind = if down {
+        InputKind::MouseDown { x, y, button }
+    } else {
+        InputKind::MouseUp { x, y, button }
+    };
+    let name = if down { "mouse_down" } else { "mouse_up" };
+    match run_attempts(backend, context, kind) {
+        Ok(report) => Response::success(finish_input(
+            json!({
+                "action": name,
+                "x": x,
+                "y": y,
+                "button": button.as_str(),
+            }),
+            report,
+            Vec::new(),
+        )),
+        Err(error) => Response::from_error(error),
+    }
+}
+
+fn hold_key(backend: &dyn DesktopBackend, context: &CallContext, keys: &str, ms: u64) -> Response {
+    let stroke = match one_hold(keys, ms) {
+        Ok(stroke) => stroke,
+        Err(error) => return Response::from_error(error),
+    };
+    match run_attempts(
+        backend,
+        context,
+        InputKind::HoldKey {
+            modifiers: stroke.modifiers.clone(),
+            key: stroke.key.clone(),
+            ms,
+        },
+    ) {
+        Ok(report) => Response::success(finish_input(
+            json!({
+                "action": "hold_key",
+                "keys": keys,
+                "key": stroke.key,
+                "ms": ms,
+            }),
+            report,
+            Vec::new(),
+        )),
+        Err(error) => Response::from_error(error),
+    }
+}
+
+fn one_hold(keys: &str, ms: u64) -> Result<KeyStroke, ComputerError> {
+    if ms > tier::MAX_HOLD_MS {
+        return Err(ComputerError::InvalidArguments(format!(
+            "hold_key ms must be at most {}",
+            tier::MAX_HOLD_MS
+        )));
+    }
+    if keys.split_whitespace().count() != 1 {
+        return Err(ComputerError::InvalidArguments(
+            "hold_key accepts one key combination".into(),
+        ));
+    }
+    let combo = parse_key_combo(keys)?;
+    validate_key(&combo.key)?;
+    Ok(KeyStroke {
+        modifiers: combo.modifiers,
+        key: combo.key,
+    })
+}
+
+fn clipboard_chars(action: &Action) -> Option<u64> {
+    match action {
+        Action::ClipboardSet {
+            text: Some(text), ..
+        } => Some(u64::try_from(text.chars().count()).unwrap_or(u64::MAX)),
+        _ => None,
+    }
+}
+
+fn preflight_action(action: &Action) -> Result<(), ComputerError> {
+    match action {
+        Action::Click { double, count, .. } => {
+            effective_click_count(*double, *count)?;
+        }
+        Action::Press { count, .. } => element::validate_count(*count)?,
+        Action::Drag { path, .. } if path.len() < 2 => {
+            return Err(ComputerError::InvalidArguments(
+                "drag needs at least 2 points".into(),
+            ));
+        }
+        Action::HoldKey { keys, ms } => {
+            one_hold(keys, *ms)?;
+        }
+        Action::Key { keys } => {
+            key_strokes(keys)?;
+        }
+        Action::ClipboardSet { text, image } => match (text, image) {
+            (Some(text), None) if text.is_empty() => {
+                return Err(ComputerError::InvalidArguments(
+                    "clipboard text must not be empty".into(),
+                ));
+            }
+            (None, None) => {
+                return Err(ComputerError::InvalidArguments(
+                    "clipboard set requires text or image".into(),
+                ));
+            }
+            (Some(_), Some(_)) => {
+                return Err(ComputerError::InvalidArguments(
+                    "pass clipboard text or image, not both".into(),
+                ));
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+    Ok(())
+}
+
+fn clipboard_get(
+    backend: &dyn DesktopBackend,
+    context: &CallContext,
+) -> Result<serde_json::Value, ComputerError> {
+    match backend.clipboard_get()? {
+        ClipboardContents::Empty => Ok(json!({
+            "action": "clipboard_get",
+            "kind": "empty",
+        })),
+        ClipboardContents::Text(text) => {
+            let chars = text.chars().count();
+            Ok(json!({
+                "action": "clipboard_get",
+                "kind": "text",
+                "text": text,
+                "chars": chars,
+            }))
+        }
+        ClipboardContents::Image {
+            width,
+            height,
+            rgba,
+        } => {
+            let frame = Frame::new(width, height, 1.0, rgba)?;
+            let encoded = image_util::encode_rgba(frame.image(), ImageFormat::Png)?;
+            let dir = cache::session_dir(context.session.as_deref())?;
+            let path = dir.join("clipboard.png");
+            cache::write_secret_bytes(&path, &encoded.bytes)?;
+            Ok(json!({
+                "action": "clipboard_get",
+                "kind": "image",
+                "path": path_string(&path),
+                "width": width,
+                "height": height,
+            }))
+        }
+    }
+}
+
+fn clipboard_set(
+    backend: &dyn DesktopBackend,
+    text: Option<String>,
+    image: Option<String>,
+) -> Result<serde_json::Value, ComputerError> {
+    match (text, image) {
+        (Some(text), None) => {
+            let chars = text.chars().count();
+            backend.clipboard_set_text(&text)?;
+            Ok(json!({
+                "action": "clipboard_set",
+                "kind": "text",
+                "chars": chars,
+            }))
+        }
+        (None, Some(path)) => {
+            let (width, height, rgba) = decode_clipboard_image(&path)?;
+            backend.clipboard_set_image(width, height, &rgba)?;
+            Ok(json!({
+                "action": "clipboard_set",
+                "kind": "image",
+                "width": width,
+                "height": height,
+            }))
+        }
+        _ => Err(ComputerError::InvalidArguments(
+            "clipboard set requires text or image".into(),
+        )),
+    }
+}
+
+fn decode_clipboard_image(path: &str) -> Result<(u32, u32, Vec<u8>), ComputerError> {
+    let image = image::ImageReader::open(path)
+        .map_err(|error| {
+            ComputerError::InvalidArguments(format!("clipboard image could not be opened: {error}"))
+        })?
+        .decode()
+        .map_err(|error| {
+            ComputerError::InvalidArguments(format!(
+                "clipboard image could not be decoded: {error}"
+            ))
+        })?
+        .to_rgba8();
+    let width = image.width();
+    let height = image.height();
+    Ok((width, height, image.into_raw()))
 }
 
 fn scroll(
@@ -2248,88 +2833,19 @@ fn run_attempts(
     context: &CallContext,
     kind: InputKind,
 ) -> Result<crate::tier::InputReport, ComputerError> {
-    let attempts = planned_tiers(backend, context)?;
-    let mut event_error: Option<ComputerError> = None;
-    for (index, tier) in attempts.iter().copied().enumerate() {
-        if tier == TierName::Activate {
-            match activate_block(context)? {
-                Some(blocked) if index > 0 => {
-                    return Err(event_error.unwrap_or(blocked));
-                }
-                Some(blocked) => return Err(blocked),
-                None => {}
-            }
-        }
-        let job = InputJob {
-            tier,
-            kind: kind.clone(),
-            app: context.app.clone(),
-            window: context.window.clone(),
-            allow_foreground: context.allow_foreground,
-            require_background: context.require_background,
-        };
-        match backend.perform_input(&job) {
-            Ok(mut report) => {
-                if !context.no_overlay {
-                    if let Some((x, y)) = crate::tier::input_point(&kind) {
-                        let session = context
-                            .session
-                            .clone()
-                            .unwrap_or_else(|| std::process::id().to_string());
-                        if let Some(warning) = crate::overlay::note_point(x, y, &session) {
-                            report.warnings.push(warning.to_string());
-                        }
-                    }
-                }
-                return Ok(report);
-            }
-            Err(error) => {
-                let next_is_activate = attempts.get(index + 1) == Some(&TierName::Activate);
-                if tier == TierName::Event && error.code() == "execution_failed" && next_is_activate
-                {
-                    let blocked = activate_block(context)?;
-                    let lock_held = blocked.as_ref().is_some_and(is_lock_error);
-                    if crate::tier::fallback_to_activate(lock_held, context.require_background)
-                        && blocked.is_none()
-                    {
-                        event_error = Some(error);
-                        continue;
-                    }
-                }
-                return Err(error);
-            }
-        }
-    }
-    Err(ComputerError::ExecutionFailed("no input tier ran".into()))
+    attempt::run(backend, &attempt_flags(context), kind)
 }
 
-fn activate_block(context: &CallContext) -> Result<Option<ComputerError>, ComputerError> {
-    if context.require_background {
-        return Ok(Some(ComputerError::ExecutionFailed(
-            "--require-background refuses tier activate because it uses the foreground cursor"
-                .into(),
-        )));
+fn attempt_flags(context: &CallContext) -> AttemptFlags {
+    AttemptFlags {
+        app: context.app.clone(),
+        window: context.window.clone(),
+        tier: context.tier.clone(),
+        allow_foreground: context.allow_foreground,
+        require_background: context.require_background,
+        no_overlay: context.no_overlay,
+        session: context.session.clone(),
     }
-    if context.allow_foreground {
-        return Ok(None);
-    }
-    let Some(path) = crate::foreground::lock_path() else {
-        return Ok(None);
-    };
-    match crate::foreground::holder_if_taken(&path) {
-        Ok(None) => Ok(None),
-        Ok(Some(pid)) if pid > 0 => Ok(Some(ComputerError::ExecutionFailed(format!(
-            "foreground.lock is held by pid {pid}"
-        )))),
-        Ok(Some(_)) => Ok(Some(ComputerError::ExecutionFailed(
-            "foreground.lock is held by another session".into(),
-        ))),
-        Err(error) => Err(error.into_computer()),
-    }
-}
-
-fn is_lock_error(error: &ComputerError) -> bool {
-    error.to_string().contains("foreground.lock")
 }
 
 fn finish_input(
@@ -2699,10 +3215,11 @@ mod tests {
                 y,
                 button,
                 double,
+                count,
             } => {
                 assert_eq!(
-                    (*x, *y, *button, *double),
-                    (Some(10), Some(20), MouseButton::Right, true)
+                    (*x, *y, *button, *double, *count),
+                    (Some(10), Some(20), MouseButton::Right, true, 1)
                 );
             }
             other => panic!("unexpected {other:?}"),
@@ -2760,7 +3277,13 @@ mod tests {
             }
         ));
         let press: Action = serde_json::from_str(r#"{"action":"press"}"#).unwrap();
-        assert!(matches!(press, Action::Press { count: 1 }));
+        assert!(matches!(
+            press,
+            Action::Press {
+                count: 1,
+                button: MouseButton::Left
+            }
+        ));
         let renamed: Action =
             serde_json::from_str(r#"{"action":"set-value","value":"hi"}"#).unwrap();
         assert!(matches!(renamed, Action::SetValue { .. }));
@@ -2852,6 +3375,7 @@ mod tests {
                 y: Some(4),
                 button: MouseButton::Left,
                 double: true,
+                count: 1,
             },
         );
         assert!(response.ok);
@@ -2957,6 +3481,7 @@ mod tests {
                 y: Some(0),
                 button: MouseButton::Left,
                 double: false,
+                count: 1,
             },
         );
         assert!(!response.ok);
@@ -3486,6 +4011,7 @@ mod tests {
                 y: Some(10),
                 button: MouseButton::Left,
                 double: false,
+                count: 1,
             },
         );
         assert!(response.ok, "{response:?}");
@@ -3518,6 +4044,7 @@ mod tests {
                 y: None,
                 button: MouseButton::Left,
                 double: false,
+                count: 1,
             },
         );
         assert_eq!(bare.to_value()["error"]["code"], "invalid_arguments");
@@ -3662,6 +4189,7 @@ mod tests {
                 y: Some(4),
                 button: MouseButton::Left,
                 double: false,
+                count: 1,
             },
             &CallContext {
                 app: Some("Notes".into()),
@@ -3744,6 +4272,7 @@ mod tests {
                 y: Some(2),
                 button: MouseButton::Left,
                 double: false,
+                count: 1,
             },
             &CallContext {
                 app: Some("Notes".into()),
@@ -3889,6 +4418,7 @@ mod tests {
                 y: Some(2),
                 button: MouseButton::Left,
                 double: false,
+                count: 1,
             },
         );
         assert_eq!(response.to_value()["error"]["code"], "paused");
@@ -3984,6 +4514,7 @@ mod tests {
                 y: Some(4),
                 button: MouseButton::Left,
                 double: false,
+                count: 1,
             },
             &context,
         );
@@ -4009,6 +4540,7 @@ mod tests {
                 y: Some(4),
                 button: MouseButton::Left,
                 double: false,
+                count: 1,
             },
             &context,
         );
@@ -4037,6 +4569,7 @@ mod tests {
             y: Some(y),
             button: MouseButton::Left,
             double: false,
+            count: 1,
         }
     }
 
@@ -4253,6 +4786,7 @@ mod tests {
                 y: None,
                 button: MouseButton::Left,
                 double: false,
+                count: 1,
             },
         );
         assert_eq!(bad.to_value()["error"]["code"], "invalid_arguments");
@@ -4261,5 +4795,266 @@ mod tests {
         assert_eq!(line["decision"], "allow");
         assert_eq!(line["source"], "default");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drag_hold_click_and_keys_use_the_stub() {
+        let backend = StubBackend::default();
+        let short = dispatch_with(
+            &backend,
+            Action::Drag {
+                path: vec![crate::types::Point { x: 1, y: 1 }],
+                button: MouseButton::Left,
+            },
+        );
+        assert_eq!(short.to_value()["error"]["code"], "invalid_arguments");
+        assert_eq!(backend.moves.load(Ordering::SeqCst), 0);
+
+        let dragged = dispatch_with(
+            &backend,
+            Action::Drag {
+                path: vec![
+                    crate::types::Point { x: 1, y: 2 },
+                    crate::types::Point { x: 3, y: 4 },
+                    crate::types::Point { x: 5, y: 6 },
+                ],
+                button: MouseButton::Left,
+            },
+        );
+        assert!(dragged.ok, "{dragged:?}");
+        assert_eq!(dragged.to_value()["moves"], 2);
+        assert_eq!(backend.moves.load(Ordering::SeqCst), 2);
+        assert_eq!(dragged.to_value()["tier"], "event");
+
+        let ax = dispatch_with_context(
+            &backend,
+            Action::Drag {
+                path: vec![
+                    crate::types::Point { x: 1, y: 2 },
+                    crate::types::Point { x: 3, y: 4 },
+                ],
+                button: MouseButton::Left,
+            },
+            &CallContext {
+                tier: Some("ax".into()),
+                ..CallContext::default()
+            },
+        );
+        assert_eq!(ax.to_value()["error"]["code"], "unsupported");
+        assert!(ax.to_value()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("pass --element"));
+        assert_eq!(backend.moves.load(Ordering::SeqCst), 2);
+
+        let triple = dispatch_with(
+            &backend,
+            Action::TripleClick {
+                x: Some(8),
+                y: Some(9),
+                button: MouseButton::Left,
+            },
+        );
+        assert!(triple.ok, "{triple:?}");
+        assert_eq!(triple.to_value()["action"], "triple_click");
+        assert_eq!(triple.to_value()["count"], 3);
+        assert_eq!(backend.clicks.load(Ordering::SeqCst), 3);
+
+        let held = dispatch_with(
+            &backend,
+            Action::HoldKey {
+                keys: "shift".into(),
+                ms: 40_000,
+            },
+        );
+        assert_eq!(held.to_value()["error"]["code"], "invalid_arguments");
+        assert!(backend.holds_ms.lock().unwrap().is_empty());
+
+        let shift = dispatch_with(
+            &backend,
+            Action::HoldKey {
+                keys: "shift".into(),
+                ms: 400,
+            },
+        );
+        assert!(shift.ok, "{shift:?}");
+        assert_eq!(backend.holds_ms.lock().unwrap().as_slice(), [400]);
+
+        let sequence = dispatch_with(
+            &backend,
+            Action::Key {
+                keys: "super+c Return".into(),
+            },
+        );
+        assert!(sequence.ok, "{sequence:?}");
+        assert_eq!(sequence.to_value()["strokes"], 2);
+        let keys = backend.keys.lock().unwrap();
+        let sequence = &keys[keys.len() - 2..];
+        assert_eq!(sequence[0].1, "c");
+        assert_eq!(sequence[0].0, vec![Modifier::Meta]);
+        assert_eq!(sequence[1].1, "enter");
+        drop(keys);
+
+        let unknown = dispatch_with(
+            &backend,
+            Action::Key {
+                keys: "bogus".into(),
+            },
+        );
+        assert_eq!(unknown.to_value()["error"]["code"], "invalid_arguments");
+    }
+
+    #[test]
+    fn mouse_down_releases_when_the_session_ends() {
+        let backend = StubBackend::default();
+        let down = Action::MouseDown {
+            x: 4,
+            y: 5,
+            button: MouseButton::Left,
+        };
+        let alone = dispatch_with(&backend, down.clone());
+        assert!(alone.ok, "{alone:?}");
+        assert!(backend.held_buttons.lock().unwrap().is_empty());
+        assert_eq!(
+            backend.releases.lock().unwrap().as_slice(),
+            [MouseButton::Left]
+        );
+
+        backend.releases.lock().unwrap().clear();
+        let _session = crate::InputSession::open(&backend);
+        let kept = dispatch_with(&backend, down);
+        assert!(kept.ok, "{kept:?}");
+        assert_eq!(
+            backend.held_buttons.lock().unwrap().as_slice(),
+            [MouseButton::Left]
+        );
+        assert!(backend.releases.lock().unwrap().is_empty());
+        drop(_session);
+        assert!(backend.held_buttons.lock().unwrap().is_empty());
+        assert_eq!(
+            backend.releases.lock().unwrap().as_slice(),
+            [MouseButton::Left]
+        );
+
+        let batch = dispatch_with(
+            &backend,
+            Action::Batch {
+                stop_on_error: true,
+                actions: vec![
+                    json!({"action": "mouse_down", "x": 1, "y": 2}),
+                    json!({"action": "mouse_up", "x": 1, "y": 2}),
+                ],
+            },
+        );
+        assert!(batch.ok, "{batch:?}");
+        assert!(backend.held_buttons.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn clipboard_confirms_and_omits_the_text_from_the_audit() {
+        let dir = temp_dir("clipboard-audit");
+        let _state = crate::audit::push_state_dir(&dir);
+        let _cache = crate::cache::CacheEnv::acquire();
+        let backend = StubBackend::default();
+        let secret = "do-not-log";
+        let response = dispatch_with(
+            &backend,
+            Action::ClipboardSet {
+                text: Some(secret.into()),
+                image: None,
+            },
+        );
+        assert_eq!(response.to_value()["error"]["code"], "confirm_required");
+        assert!(backend.clipboard_text.lock().unwrap().is_none());
+        let line = last_audit(&dir);
+        assert_eq!(line["action"], "clipboard_set");
+        assert_eq!(line["decision"], "confirm");
+        assert_eq!(line["chars"], secret.chars().count() as u64);
+        let encoded = line.to_string();
+        assert!(!encoded.contains(secret));
+        assert!(line.get("text").is_none());
+
+        *backend.clipboard_text.lock().unwrap() = Some("ready".into());
+        let got = dispatch_with(&backend, Action::ClipboardGet);
+        assert!(got.ok, "{got:?}");
+        assert_eq!(got.to_value()["kind"], "text");
+        assert_eq!(got.to_value()["text"], "ready");
+
+        let empty = dispatch_with(
+            &backend,
+            Action::ClipboardSet {
+                text: Some(String::new()),
+                image: None,
+            },
+        );
+        assert_eq!(empty.to_value()["error"]["code"], "invalid_arguments");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zoom_crops_a_window_region_and_rejects_the_far_edge() {
+        let _cache = crate::cache::CacheEnv::acquire();
+        let backend = StubBackend::default();
+        let response = dispatch_with_context(
+            &backend,
+            Action::Zoom {
+                output: None,
+                region: Region::new(0, 0, 10, 10).unwrap(),
+                format: Some(ImageFormat::Png),
+                max_width: Some(0),
+                canvas: None,
+                base64: false,
+            },
+            &CallContext {
+                app: Some("Notes".into()),
+                session: Some("p8-zoom".into()),
+                ..CallContext::default()
+            },
+        );
+        assert!(response.ok, "{response:?}");
+        let value = response.to_value();
+        assert_eq!(value["width"], 20);
+        assert_eq!(value["height"], 20);
+        assert_eq!(value["logical_width"], 10);
+        assert_eq!(value["logical_height"], 10);
+
+        let outside = dispatch_with_context(
+            &backend,
+            Action::Zoom {
+                output: None,
+                region: Region::new(0, 0, 401, 300).unwrap(),
+                format: None,
+                max_width: Some(0),
+                canvas: None,
+                base64: false,
+            },
+            &CallContext {
+                app: Some("Notes".into()),
+                session: Some("p8-zoom-out".into()),
+                ..CallContext::default()
+            },
+        );
+        assert_eq!(outside.to_value()["error"]["code"], "invalid_arguments");
+
+        let both = dispatch_with_context(
+            &backend,
+            Action::Screenshot {
+                output: None,
+                region: Some(Region::new(0, 0, 10, 10).unwrap()),
+                format: None,
+                max_width: None,
+                canvas: None,
+                base64: false,
+            },
+            &CallContext {
+                app: Some("Notes".into()),
+                ..CallContext::default()
+            },
+        );
+        assert_eq!(both.to_value()["error"]["code"], "invalid_arguments");
+        assert!(both.to_value()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not both"));
     }
 }

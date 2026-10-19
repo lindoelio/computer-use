@@ -1,16 +1,15 @@
 //! OpenAI computer-use tool actions.
 //!
 //! Accepts the action object itself, or that object nested under `action`.
-//! `wheel` is an alias of `middle`. `back` and `forward` are not implemented.
-//! A bare `wait` sleeps 0 ms because the schema has no duration. `drag` is
-//! refused until P8.
+//! `wheel` is an alias of `middle`. `back` and `forward` are mouse buttons 4 and 5.
+//! A bare `wait` sleeps 0 ms because the schema has no duration.
 
 use serde_json::{Map, Value};
 
-use super::{as_object, optional_i32, require_i32, require_string, unsupported_until_p8};
+use super::{as_object, optional_i32, require_i32, require_string};
 use crate::error::ComputerError;
 use crate::protocol::Action;
-use crate::types::MouseButton;
+use crate::types::{MouseButton, Point};
 
 pub fn translate(value: &Value) -> Result<Action, ComputerError> {
     let object = as_object(value)?;
@@ -36,7 +35,7 @@ pub fn translate(value: &Value) -> Result<Action, ComputerError> {
             x: require_i32(inner, "x")?,
             y: require_i32(inner, "y")?,
         }),
-        "drag" => Err(unsupported_until_p8("drag")),
+        "drag" => drag(inner),
         "wait" => wait(inner),
         other => Err(ComputerError::InvalidArguments(format!(
             "unknown openai action type {other:?}"
@@ -66,8 +65,8 @@ fn click(object: &Map<String, Value>, double: bool) -> Result<Action, ComputerEr
         "left" => MouseButton::Left,
         "right" => MouseButton::Right,
         "middle" | "wheel" => MouseButton::Middle,
-        "back" => return Err(unsupported_until_p8("click button back")),
-        "forward" => return Err(unsupported_until_p8("click button forward")),
+        "back" => MouseButton::Back,
+        "forward" => MouseButton::Forward,
         other => {
             return Err(ComputerError::InvalidArguments(format!(
                 "unknown click button {other:?}"
@@ -88,8 +87,38 @@ fn click(object: &Map<String, Value>, double: bool) -> Result<Action, ComputerEr
             y: Some(y),
             button,
             double: false,
+            count: 1,
         })
     }
+}
+
+fn drag(object: &Map<String, Value>) -> Result<Action, ComputerError> {
+    let Some(points) = object.get("path").and_then(Value::as_array) else {
+        return Err(ComputerError::InvalidArguments(
+            "path must be an array of points".into(),
+        ));
+    };
+    if points.len() < 2 {
+        return Err(ComputerError::InvalidArguments(
+            "drag needs at least 2 points".into(),
+        ));
+    }
+    let mut path = Vec::with_capacity(points.len());
+    for point in points {
+        let Some(point) = point.as_object() else {
+            return Err(ComputerError::InvalidArguments(
+                "path points must be objects".into(),
+            ));
+        };
+        path.push(Point {
+            x: require_i32(point, "x")?,
+            y: require_i32(point, "y")?,
+        });
+    }
+    Ok(Action::Drag {
+        path,
+        button: MouseButton::Left,
+    })
 }
 
 fn scroll(object: &Map<String, Value>) -> Result<Action, ComputerError> {

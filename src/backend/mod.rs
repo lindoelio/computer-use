@@ -4,7 +4,9 @@
 //! Accessibility and the frontmost window are platform-specific and best-effort.
 
 mod capture;
+pub(crate) mod clipboard;
 mod command;
+pub(crate) mod held;
 mod input;
 
 #[cfg(target_os = "linux")]
@@ -244,6 +246,35 @@ pub trait DesktopBackend: Send + Sync {
         }
     }
 
+    /// Read the clipboard. The default uses the system pasteboard outside tests.
+    ///
+    /// The stub overrides this and never touches the real pasteboard.
+    fn clipboard_get(&self) -> Result<clipboard::ClipboardContents, ComputerError> {
+        clipboard::clipboard_get()
+    }
+
+    /// Write clipboard text. Empty text is refused before this is called.
+    fn clipboard_set_text(&self, text: &str) -> Result<(), ComputerError> {
+        clipboard::clipboard_set_text(text)
+    }
+
+    /// Write an RGBA image to the clipboard.
+    fn clipboard_set_image(
+        &self,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) -> Result<(), ComputerError> {
+        clipboard::clipboard_set_image(width, height, rgba)
+    }
+
+    /// Release mouse buttons and keys this process still holds.
+    ///
+    /// The real registry is process-global. The stub overrides this method.
+    fn release_held(&self) -> Result<(), ComputerError> {
+        held::release_all()
+    }
+
     /// Run one input tier. The default posts nothing.
     ///
     /// `event` and `synthetic` are `unsupported` off macOS. `activate` uses the
@@ -313,7 +344,15 @@ fn off_platform_input<B: DesktopBackend + ?Sized>(
             backend.simulate_scroll(*dx, *dy)?;
         }
         InputKind::Type { text } => backend.simulate_type(text)?,
-        InputKind::Key { modifiers, key } => backend.simulate_key(modifiers, key)?,
+        InputKind::Key { strokes } => {
+            for stroke in strokes {
+                backend.simulate_key(&stroke.modifiers, &stroke.key)?;
+            }
+        }
+        InputKind::Drag { points, button } => input::drag(points, *button)?,
+        InputKind::MouseDown { x, y, button } => input::button_down(*x, *y, *button)?,
+        InputKind::MouseUp { x, y, button } => input::button_up(*x, *y, *button)?,
+        InputKind::HoldKey { modifiers, key, ms } => input::hold_key(modifiers, key, *ms)?,
     }
     Ok(InputReport {
         tier: "activate",

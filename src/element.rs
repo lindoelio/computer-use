@@ -5,6 +5,7 @@
 
 use crate::error::ComputerError;
 use crate::tree::{self, SavedFrame, SigNode, UiNode};
+use crate::types::MouseButton;
 
 /// Each edge may differ by this many screen points and still be the same element.
 ///
@@ -34,10 +35,14 @@ pub const PERFORM_ALLOWLIST: &[&str] = &[
 /// What the caller asked to do to one element index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ElementOp {
-    /// `AXPress`, repeated `count` times. `count` is 1, 2, or 3.
+    /// `AXPress` for the left button. Right uses `AXShowMenu` when the element
+    /// advertises it, otherwise a coordinate click at the element center.
+    /// Middle, back, and forward always click the center.
     Press {
-        /// Repeat count.
+        /// Repeat count. `AXShowMenu` runs once.
         count: u8,
+        /// Mouse button. Defaults to left at the call site.
+        button: MouseButton,
     },
     /// Set `AXFocused` to true.
     Focus,
@@ -105,6 +110,14 @@ pub struct ElementRequest {
     pub window: Option<String>,
     /// Session cache namespace.
     pub session: Option<String>,
+    /// Requested input tier for a center click. Empty is auto.
+    pub tier: Option<String>,
+    /// Skip `foreground.lock` when a center click uses `activate`.
+    pub allow_foreground: bool,
+    /// Do not fall back to `activate` for a center click.
+    pub require_background: bool,
+    /// Skip the overlay helper for a center click.
+    pub no_overlay: bool,
 }
 
 /// One step the backend performs after [`gate`] allows it.
@@ -146,6 +159,17 @@ pub enum Step {
         /// Text to type.
         text: String,
     },
+    /// Click the element center through the input tiers.
+    CenterClick {
+        /// Screen x of the center.
+        x: i32,
+        /// Screen y of the center.
+        y: i32,
+        /// Mouse button.
+        button: MouseButton,
+        /// Click count, 1, 2, or 3.
+        count: u8,
+    },
 }
 
 impl Step {
@@ -153,6 +177,7 @@ impl Step {
     pub fn record_name(&self) -> &str {
         match self {
             Self::Press { .. } => "AXPress",
+            Self::CenterClick { .. } => "center-click",
             Self::Focus | Self::TypeEnigo { .. } => "AXFocused",
             Self::SetValue { .. } | Self::TypeSetValue { .. } => "AXValue",
             Self::SelectText { .. } => "AXSelectedTextRange",
@@ -164,7 +189,7 @@ impl Step {
     /// How many times the stub records this step.
     pub fn repeats(&self) -> u8 {
         match self {
-            Self::Press { count } => *count,
+            Self::Press { count } | Self::CenterClick { count, .. } => *count,
             _ => 1,
         }
     }
@@ -224,7 +249,7 @@ pub fn outcome(
             _ => None,
         },
         count: match request.op {
-            ElementOp::Press { count } => Some(count),
+            ElementOp::Press { count, .. } => Some(count),
             _ => None,
         },
     }
@@ -293,6 +318,8 @@ pub struct Gate {
     pub needs_chars: bool,
     /// Action names copied before the perform.
     pub actions: Vec<String>,
+    /// Center of the element frame, in screen points. Missing when the frame is absent.
+    pub center: Option<(i32, i32)>,
 }
 
 /// Inputs [`gate`] needs. The live node is the re-fetched tree.
@@ -562,7 +589,50 @@ pub fn gate(input: &GateInput<'_>) -> Result<Gate, ElementError> {
         needs_settable,
         needs_chars,
         actions: live.actions.clone(),
+        center: frame_center(live_frame),
     })
+}
+
+fn frame_center(frame: Option<SavedFrame>) -> Option<(i32, i32)> {
+    let frame = frame?;
+    let half_w = i32::try_from(frame.width / 2).ok()?;
+    let half_h = i32::try_from(frame.height / 2).ok()?;
+    Some((
+        frame.x.saturating_add(half_w),
+        frame.y.saturating_add(half_h),
+    ))
+}
+
+/// Left press stays `AXPress`. Right uses `AXShowMenu` when that action is
+/// advertised. Every other button, and a right press without a menu, clicks
+/// the element center through the input tiers.
+pub fn press_route(
+    button: MouseButton,
+    count: u8,
+    actions: &[String],
+    center: Option<(i32, i32)>,
+) -> Result<Vec<Step>, ComputerError> {
+    validate_count(count)?;
+    if button == MouseButton::Left {
+        require_action(actions, "AXPress")?;
+        return Ok(vec![Step::Press { count }]);
+    }
+    if button == MouseButton::Right && actions.iter().any(|action| action == "AXShowMenu") {
+        return Ok(vec![Step::Perform {
+            name: "AXShowMenu".into(),
+        }]);
+    }
+    let Some((x, y)) = center else {
+        return Err(ComputerError::ExecutionFailed(
+            "element has no frame, so a coordinate click cannot be aimed".into(),
+        ));
+    };
+    Ok(vec![Step::CenterClick {
+        x,
+        y,
+        button,
+        count,
+    }])
 }
 
 /// Build the steps that run after settable and character-count reads.
@@ -573,10 +643,8 @@ pub fn steps(
     char_count: Option<i64>,
 ) -> Result<Vec<Step>, ElementError> {
     match op {
-        ElementOp::Press { count } => {
-            validate_count(*count)?;
-            require_action(&gate.actions, "AXPress")?;
-            Ok(vec![Step::Press { count: *count }])
+        ElementOp::Press { count, button } => {
+            press_route(*button, *count, &gate.actions, gate.center).map_err(ElementError::from)
         }
         ElementOp::Focus => Ok(vec![Step::Focus]),
         ElementOp::SetValue { value } => {
@@ -720,7 +788,10 @@ mod tests {
     fn same_role_allows_and_role_identifier_or_frame_changes_are_stale() {
         let cached_ui = window(button("Save", 10.0, &["AXPress"]));
         let (cached, revision) = render_pair(&cached_ui);
-        let op = ElementOp::Press { count: 1 };
+        let op = ElementOp::Press {
+            count: 1,
+            button: MouseButton::Left,
+        };
         let allowed = gate(&input_for(&op, &cached, revision, &cached_ui, 1)).unwrap();
         assert_eq!(allowed.path, vec![0]);
         assert!(!allowed.scroll_first);
@@ -796,7 +867,10 @@ mod tests {
     fn scroll_to_is_requested_when_the_frame_is_outside_the_window() {
         let cached_ui = window(button("Save", 700.0, &["AXPress", "AXScrollToVisible"]));
         let (cached, revision) = render_pair(&cached_ui);
-        let press = ElementOp::Press { count: 1 };
+        let press = ElementOp::Press {
+            count: 1,
+            button: MouseButton::Left,
+        };
         let allowed = gate(&input_for(&press, &cached, revision, &cached_ui, 1)).unwrap();
         assert!(allowed.scroll_first);
         let scroll = ElementOp::ScrollTo;
@@ -815,7 +889,10 @@ mod tests {
     fn require_visible_fails_when_the_element_cannot_scroll() {
         let cached_ui = window(button("Save", 700.0, &["AXPress"]));
         let (cached, revision) = render_pair(&cached_ui);
-        let press = ElementOp::Press { count: 1 };
+        let press = ElementOp::Press {
+            count: 1,
+            button: MouseButton::Left,
+        };
         let mut input = input_for(&press, &cached, revision, &cached_ui, 1);
         input.require_visible = true;
         let error = gate(&input).unwrap_err();

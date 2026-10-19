@@ -6,6 +6,9 @@
       2
     ]
   },
-  "error_code": "unsupported",
-  "error_contains": "P8"
+  "expect": {
+    "action": "triple_click",
+    "x": 1,
+    "y": 2
+  }
 }

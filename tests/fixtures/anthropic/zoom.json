@@ -9,7 +9,7 @@
     ]
   },
   "expect": {
-    "action": "screenshot",
+    "action": "zoom",
     "region": {
       "x": 10,
       "y": 20,

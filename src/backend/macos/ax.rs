@@ -327,7 +327,7 @@ fn element_action_inner(request: &ElementRequest) -> Result<ElementOutcome, Elem
             )),
         }
     }
-    let via = run_steps(element, &planned, &gate, live.app.pid)?;
+    let via = run_steps(element, &planned, &gate, live.app.pid, request)?;
     // A failed re-read must not turn a completed action into an error.
     let mut revision = cached_revision;
     match read_live(&query, false) {
@@ -354,7 +354,9 @@ fn run_steps(
     planned: &[Step],
     gate: &Gate,
     pid: i32,
+    request: &ElementRequest,
 ) -> Result<Option<String>, ElementInterrupt> {
+    let _ = request.index;
     let mut via = None;
     for step in planned {
         match step {
@@ -384,6 +386,44 @@ fn run_steps(
                 set_focused(element)?;
                 super::input::post_text_to_pid(pid, text)?;
                 via = Some("event".into());
+            }
+            Step::CenterClick {
+                x,
+                y,
+                button,
+                count,
+            } => {
+                #[cfg(test)]
+                {
+                    let _ = (x, y, button, count, request);
+                    return Err(ComputerError::ExecutionFailed(
+                        "event posting is disabled in tests".into(),
+                    )
+                    .into());
+                }
+                #[cfg(not(test))]
+                {
+                    let backend = super::MacOsDesktopBackend;
+                    let report = crate::attempt::run(
+                        &backend,
+                        &crate::attempt::AttemptFlags {
+                            app: request.app.clone(),
+                            window: request.window.clone(),
+                            tier: request.tier.clone(),
+                            allow_foreground: request.allow_foreground,
+                            require_background: request.require_background,
+                            no_overlay: request.no_overlay,
+                            session: request.session.clone(),
+                        },
+                        crate::tier::InputKind::Click {
+                            x: *x,
+                            y: *y,
+                            button: *button,
+                            count: *count,
+                        },
+                    )?;
+                    via = Some(report.tier.to_string());
+                }
             }
         }
     }

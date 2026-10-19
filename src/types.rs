@@ -137,6 +137,10 @@ pub enum MouseButton {
     Right,
     /// Middle button or wheel click.
     Middle,
+    /// Button 4. The event tier posts it as other-mouse button number 3.
+    Back,
+    /// Button 5. The event tier posts it as other-mouse button number 4.
+    Forward,
 }
 
 impl MouseButton {
@@ -146,8 +150,60 @@ impl MouseButton {
             Self::Left => "left",
             Self::Right => "right",
             Self::Middle => "middle",
+            Self::Back => "back",
+            Self::Forward => "forward",
         }
     }
+}
+
+/// One logical point. Drag paths are a list of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Point {
+    /// Logical x.
+    pub x: i32,
+    /// Logical y.
+    pub y: i32,
+}
+
+/// Parse a flat `x,y,x,y,...` list. At least two points, and an even count.
+pub fn parse_path(text: &str) -> Result<Vec<Point>, ComputerError> {
+    let parts: Vec<&str> = text.split(',').map(str::trim).collect();
+    if parts.len() < 4 || !parts.len().is_multiple_of(2) || parts.iter().any(|part| part.is_empty())
+    {
+        return Err(ComputerError::InvalidArguments(format!(
+            "path must be at least two x,y points (got {text:?})"
+        )));
+    }
+    let mut points = Vec::with_capacity(parts.len() / 2);
+    for pair in parts.chunks(2) {
+        let x = pair[0].parse::<i32>().map_err(|_| {
+            ComputerError::InvalidArguments(format!("path x is not an integer: {:?}", pair[0]))
+        })?;
+        let y = pair[1].parse::<i32>().map_err(|_| {
+            ComputerError::InvalidArguments(format!("path y is not an integer: {:?}", pair[1]))
+        })?;
+        points.push(Point { x, y });
+    }
+    Ok(points)
+}
+
+/// True when the region sits inside `width` by `height`.
+///
+/// The far edge may equal the width or height. A point on that edge is outside.
+pub fn region_inside(region: Region, width: u32, height: u32) -> Result<(), ComputerError> {
+    if region.x < 0 || region.y < 0 {
+        return Err(ComputerError::InvalidArguments(
+            "region is outside the capture".into(),
+        ));
+    }
+    let right = i64::from(region.x) + i64::from(region.width);
+    let bottom = i64::from(region.y) + i64::from(region.height);
+    if right > i64::from(width) || bottom > i64::from(height) {
+        return Err(ComputerError::InvalidArguments(
+            "region is outside the capture".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Modifier held while another key is pressed.
@@ -389,6 +445,20 @@ mod tests {
         let json = serde_json::to_value(from_object).unwrap();
         assert_eq!(json["width"], 3);
         assert!(serde_json::from_str::<Region>(r#"{"x":1,"y":2,"width":0,"height":4}"#).is_err());
+    }
+
+    #[test]
+    fn path_needs_two_points_and_region_may_touch_the_far_edge() {
+        let path = parse_path("10, 20, 200, 40").unwrap();
+        assert_eq!(path, vec![Point { x: 10, y: 20 }, Point { x: 200, y: 40 }]);
+        assert!(parse_path("1,1").is_err());
+        assert!(parse_path("1,2,3").is_err());
+        let inside = Region::new(0, 0, 400, 300).unwrap();
+        assert!(region_inside(inside, 400, 300).is_ok());
+        let past = Region::new(0, 0, 401, 300).unwrap();
+        assert!(region_inside(past, 400, 300).is_err());
+        assert_eq!(MouseButton::Back.as_str(), "back");
+        assert_eq!(MouseButton::Forward.as_str(), "forward");
     }
 
     #[test]

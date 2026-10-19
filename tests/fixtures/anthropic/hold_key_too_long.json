@@ -1,0 +1,9 @@
+{
+  "request": {
+    "action": "hold_key",
+    "text": "shift",
+    "duration": 31
+  },
+  "error_code": "invalid_arguments",
+  "error_contains": "30"
+}

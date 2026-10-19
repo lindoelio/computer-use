@@ -1180,14 +1180,16 @@ pub fn sensitive_title(title: &str) -> bool {
 
 /// `cmd+q` and `alt+f4`.
 pub fn key_needs_confirm(keys: &str) -> bool {
-    let Ok(combo) = crate::keys::parse_key_combo(keys) else {
+    let Ok(combos) = crate::keys::parse_key_sequence(keys) else {
         return false;
     };
-    let command =
-        combo.modifiers.len() == 1 && combo.modifiers[0] == crate::types::Modifier::Command;
-    let alt = combo.modifiers.len() == 1 && combo.modifiers[0] == crate::types::Modifier::Alt;
-    (command && combo.key.eq_ignore_ascii_case("q"))
-        || (alt && combo.key.eq_ignore_ascii_case("f4"))
+    combos.iter().any(|combo| {
+        let command =
+            combo.modifiers.len() == 1 && combo.modifiers[0] == crate::types::Modifier::Command;
+        let alt = combo.modifiers.len() == 1 && combo.modifiers[0] == crate::types::Modifier::Alt;
+        (command && combo.key.eq_ignore_ascii_case("q"))
+            || (alt && combo.key.eq_ignore_ascii_case("f4"))
+    })
 }
 
 /// Safari, Chrome, Chromium, Edge, Brave, Arc, and Firefox.

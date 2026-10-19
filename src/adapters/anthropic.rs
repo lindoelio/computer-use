@@ -1,15 +1,15 @@
 //! Anthropic `computer_20251124` actions.
 //!
-//! Coordinates stay in image pixels. `zoom` becomes a screenshot region.
-//! Drag, mouse buttons held down, triple-click, and `hold_key` are refused
-//! until P8. `cursor_position` reads the pointer the backend already exposes.
+//! Coordinates stay in image pixels. `zoom` becomes a region capture.
+//! `hold_key` duration is seconds and is converted to milliseconds.
+//! `cursor_position` reads the pointer the backend already exposes.
 
 use serde_json::Value;
 
-use super::{as_object, coordinate_pair, optional_i32, require_string, unsupported_until_p8};
+use super::{as_object, coordinate_pair, optional_i32, require_string};
 use crate::error::ComputerError;
 use crate::protocol::Action;
-use crate::types::{MouseButton, Region, ScrollDirection};
+use crate::types::{MouseButton, Point, Region, ScrollDirection};
 
 pub fn translate(value: &Value) -> Result<Action, ComputerError> {
     let object = as_object(value)?;
@@ -23,14 +23,14 @@ pub fn translate(value: &Value) -> Result<Action, ComputerError> {
         "right_click" => click_at(object, MouseButton::Right, false),
         "middle_click" => click_at(object, MouseButton::Middle, false),
         "double_click" => click_at(object, MouseButton::Left, true),
-        "triple_click" => Err(unsupported_until_p8("triple_click")),
+        "triple_click" => triple_click(object),
         "mouse_move" => {
             let (x, y) = require_coordinate(object)?;
             Ok(Action::Move { x, y })
         }
-        "left_click_drag" => Err(unsupported_until_p8("left_click_drag")),
-        "left_mouse_down" => Err(unsupported_until_p8("left_mouse_down")),
-        "left_mouse_up" => Err(unsupported_until_p8("left_mouse_up")),
+        "left_click_drag" => left_click_drag(object),
+        "left_mouse_down" => mouse_half(object, true),
+        "left_mouse_up" => mouse_half(object, false),
         "scroll" => scroll(object),
         "type" => Ok(Action::Type {
             text: require_string(object, "text")?,
@@ -38,7 +38,7 @@ pub fn translate(value: &Value) -> Result<Action, ComputerError> {
         "key" => Ok(Action::Key {
             keys: require_string(object, "text")?,
         }),
-        "hold_key" => Err(unsupported_until_p8("hold_key")),
+        "hold_key" => hold_key(object),
         "wait" => {
             let seconds = match object.get("duration").and_then(Value::as_f64) {
                 Some(seconds) => seconds,
@@ -90,6 +90,7 @@ fn click_at(
             y: Some(y),
             button,
             double: false,
+            count: 1,
         })
     }
 }
@@ -164,5 +165,90 @@ fn zoom(object: &serde_json::Map<String, Value>) -> Result<Action, ComputerError
         .map_err(|_| ComputerError::InvalidArguments("region width is out of range".into()))?;
     let height = u32::try_from(y2 - y1)
         .map_err(|_| ComputerError::InvalidArguments("region height is out of range".into()))?;
-    Ok(screenshot(Some(Region::new(x1, y1, width, height)?)))
+    Ok(Action::Zoom {
+        output: None,
+        region: Region::new(x1, y1, width, height)?,
+        format: None,
+        max_width: None,
+        canvas: None,
+        base64: false,
+    })
+}
+
+fn triple_click(object: &serde_json::Map<String, Value>) -> Result<Action, ComputerError> {
+    let (x, y) = require_coordinate(object)?;
+    Ok(Action::TripleClick {
+        x: Some(x),
+        y: Some(y),
+        button: MouseButton::Left,
+    })
+}
+
+fn left_click_drag(object: &serde_json::Map<String, Value>) -> Result<Action, ComputerError> {
+    let start = match object.get("start_coordinate") {
+        Some(value) => coordinate_pair(value, "start_coordinate")?,
+        None => {
+            return Err(ComputerError::InvalidArguments(
+                "start_coordinate is required".into(),
+            ))
+        }
+    };
+    let end = require_coordinate(object)?;
+    Ok(Action::Drag {
+        path: vec![
+            Point {
+                x: start.0,
+                y: start.1,
+            },
+            Point { x: end.0, y: end.1 },
+        ],
+        button: MouseButton::Left,
+    })
+}
+
+fn mouse_half(
+    object: &serde_json::Map<String, Value>,
+    down: bool,
+) -> Result<Action, ComputerError> {
+    let (x, y) = require_coordinate(object)?;
+    if down {
+        Ok(Action::MouseDown {
+            x,
+            y,
+            button: MouseButton::Left,
+        })
+    } else {
+        Ok(Action::MouseUp {
+            x,
+            y,
+            button: MouseButton::Left,
+        })
+    }
+}
+
+fn hold_key(object: &serde_json::Map<String, Value>) -> Result<Action, ComputerError> {
+    let keys = require_string(object, "text")?;
+    let seconds = match object.get("duration").and_then(Value::as_f64) {
+        Some(seconds) => seconds,
+        None => {
+            return Err(ComputerError::InvalidArguments(
+                "duration is required".into(),
+            ))
+        }
+    };
+    if !seconds.is_finite() || seconds < 0.0 {
+        return Err(ComputerError::InvalidArguments(
+            "duration must be a non-negative number".into(),
+        ));
+    }
+    let ms = (seconds * 1000.0).round();
+    if ms > 30_000.0 {
+        return Err(ComputerError::InvalidArguments(
+            "hold_key duration must be at most 30 seconds".into(),
+        ));
+    }
+    Ok(Action::HoldKey {
+        keys,
+        ms: ms as u64,
+    })
 }

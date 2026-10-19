@@ -6,6 +6,9 @@
       2
     ]
   },
-  "error_code": "unsupported",
-  "error_contains": "P8"
+  "expect": {
+    "action": "mouse_up",
+    "x": 1,
+    "y": 2
+  }
 }

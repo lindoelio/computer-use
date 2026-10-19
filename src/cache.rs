@@ -450,6 +450,20 @@ fn write_json(path: &Path, snapshot: &Snapshot) -> Result<(), ComputerError> {
     write_secret_json(path, snapshot)
 }
 
+/// Write bytes with mode `0600` on Unix.
+pub fn write_secret_bytes(path: &Path, bytes: &[u8]) -> Result<(), ComputerError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(ComputerError::Io)?;
+    file.write_all(bytes).map_err(ComputerError::Io)?;
+    Ok(())
+}
+
 fn write_secret_json(path: &Path, value: &impl Serialize) -> Result<(), ComputerError> {
     let text = serde_json::to_string(value).map_err(|error| {
         ComputerError::ExecutionFailed(format!("session cache encode failed: {error}"))

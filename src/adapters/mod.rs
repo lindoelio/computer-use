@@ -86,10 +86,6 @@ pub(crate) fn number_i32(value: &Value, key: &str) -> Result<i32, ComputerError>
     Ok(number.round() as i32)
 }
 
-pub(crate) fn unsupported_until_p8(action: &str) -> ComputerError {
-    ComputerError::Unsupported(format!("{action} is not available until P8"))
-}
-
 /// Translate `value` with `adapter`. `native` is not handled here.
 pub fn translate(adapter: &str, value: &Value) -> Result<Action, ComputerError> {
     match adapter {
@@ -162,7 +158,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_wheel_is_middle_and_back_is_unsupported() {
+    fn openai_wheel_is_middle_and_back_and_forward_are_buttons() {
         let wheel = translate_openai(&serde_json::json!({
             "action": {"type": "click", "x": 1, "y": 2, "button": "wheel"}
         }))
@@ -174,19 +170,37 @@ mod tests {
                 y: Some(2),
                 button: crate::types::MouseButton::Middle,
                 double: false,
+                count: 1,
             }
         );
         let back = translate_openai(&serde_json::json!({
             "type": "click", "x": 1, "y": 2, "button": "back"
         }))
-        .unwrap_err();
-        assert_eq!(back.code(), "unsupported");
-        assert!(back.to_string().contains("P8"));
+        .unwrap();
+        assert_eq!(
+            back,
+            Action::Click {
+                x: Some(1),
+                y: Some(2),
+                button: crate::types::MouseButton::Back,
+                double: false,
+                count: 1,
+            }
+        );
         let forward = translate_openai(&serde_json::json!({
             "type": "click", "x": 1, "y": 2, "button": "forward"
         }))
-        .unwrap_err();
-        assert_eq!(forward.code(), "unsupported");
+        .unwrap();
+        assert_eq!(
+            forward,
+            Action::Click {
+                x: Some(1),
+                y: Some(2),
+                button: crate::types::MouseButton::Forward,
+                double: false,
+                count: 1,
+            }
+        );
     }
 
     #[test]

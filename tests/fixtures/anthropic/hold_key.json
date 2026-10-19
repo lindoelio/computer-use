@@ -4,6 +4,9 @@
     "text": "shift",
     "duration": 1
   },
-  "error_code": "unsupported",
-  "error_contains": "P8"
+  "expect": {
+    "action": "hold_key",
+    "keys": "shift",
+    "ms": 1000
+  }
 }

@@ -306,7 +306,7 @@ Native CLI coordinates stay logical screen points. Adapters speak in pixels of t
 ### Input tiers
 Accessibility actions (`press`, `set_value`, `focus`, `perform`, `select_text`, `scroll_to`, and `type --element` when the value is settable) stay on `ax` and do not fall back.
 
-Coordinate click, move, scroll, `type` without an element, `type --element` when the value is not settable, and `key` use `event`, then `activate` when `event` returns `execution_failed`, the caller did not set `--require-background`, and another session does not hold `foreground.lock`. `synthetic` runs only when requested. Drag as its own command stays P8. The event poster already maps mouse-dragged types so P8 can reuse them.
+Coordinate click, move, scroll, drag, mouse down and up, `type` without an element, `type --element` when the value is not settable, `key`, and `hold_key` use `event`, then `activate` when `event` returns `execution_failed`, the caller did not set `--require-background`, and another session does not hold `foreground.lock`. `synthetic` runs only when requested. `--tier ax` on those actions is `unsupported` and tells the caller to pass `--element` for an accessibility action. The event poster maps mouse-dragged types, including other-mouse button numbers for back and forward.
 
 On Linux and Windows the auto plan is `activate` only (the existing enigo path). Explicit `--tier event` and `--tier synthetic` return `unsupported` and name the OS. Explicit `--tier activate` is enigo there. macOS `activate` also takes the lock and restores the previous frontmost app.
 
@@ -347,7 +347,7 @@ OpenAI `computer` tool (the action object, or that object nested under `action`)
 | `type` | Maps to |
 | --- | --- |
 | `screenshot` | `screenshot` of the target window |
-| `click` | `press` or coordinate click. `button` left/right/middle. |
+| `click` | `press` or coordinate click. `button` left/right/middle/back/forward. `wheel` is middle. |
 | `double_click` | click count 2 |
 | `scroll` | `scroll` with `scroll_x` / `scroll_y` |
 | `keypress` | `key` from the `keys` array |
@@ -370,13 +370,13 @@ Anthropic `computer_20251124`:
 | `hold_key` | `hold_key` for `duration` seconds |
 | `scroll` | `scroll` using `scroll_direction` and `scroll_amount` |
 | `wait` | `wait` |
-| `zoom` | `screenshot` of `region: [x1, y1, x2, y2]` in image pixels |
+| `zoom` | `zoom` of `region: [x1, y1, x2, y2]` in image pixels |
 | `cursor_position` | read-only `cursor_position` |
-| `left_mouse_down`, `left_mouse_up` | `unsupported` until P8 |
+| `left_mouse_down`, `left_mouse_up` | `mouse_down` / `mouse_up` at `coordinate` |
 
 If a published patch renames a field, accept the alias in the adapter and add a fixture. Do not guess a second schema in the dispatcher.
 
-`drag`, `triple_click`, `left_click_drag`, `hold_key`, and the OpenAI buttons `back` and `forward` return `unsupported` and name P8. OpenAI `wheel` is `middle`. OpenAI `wait` with no duration sleeps 0 ms, because that schema has no duration. Anthropic `zoom` stays in image pixels on the translated action. Dispatch remaps it with the stored map. The far edge of a region may sit on the image width or height. A point may not.
+OpenAI `wheel` is `middle`. OpenAI `back` and `forward` are mouse buttons 4 and 5. OpenAI `wait` with no duration sleeps 0 ms, because that schema has no duration. Anthropic `hold_key` converts `duration` seconds to milliseconds and refuses a value above 30 seconds. Anthropic `zoom` stays in image pixels on the translated action. Dispatch remaps it with the stored map. The far edge of a region may sit on the image width or height. A point may not.
 
 Adapters force `coord` to `image`, including when the request also sent `coord`. A missing `sessions/<session>/screenshot-map.json` is `invalid_arguments` with the message `take a screenshot first`. A coordinate outside the image is `invalid_arguments`. The response adds `adapter` for `openai` and `anthropic` and omits it for native. There is no detection without `--adapter` or the request field. An action with no coordinates does not need a map.
 
@@ -731,7 +731,7 @@ Batch: first error sets `ok: false` and `stopped_at`. Adapter: missing screensho
 - `session prune` on a temp directory removes empty and stale sessions and keeps a live owner's content.
 
 ### Implementation notes
-Post-action `tree` is `TreeReport.full_text`. The `tree` command's `tree` field is still the chosen full-or-diff text. `cursor_position` is a small read-only action because the backend already exposes the pointer. Drag, triple-click, mouse-button hold, and `hold_key` stay `unsupported` until P8 rather than pretending to work. OpenAI `wait` without a duration is 0 ms so a fixture does not sleep. Batch applies `return_state` once at the end. A step's own `return_state` is ignored so the batch does not snapshot between steps.
+Post-action `tree` is `TreeReport.full_text`. The `tree` command's `tree` field is still the chosen full-or-diff text. `cursor_position` is a small read-only action because the backend already exposes the pointer. P8 part A implements drag, triple-click, mouse down and up, `hold_key`, and OpenAI back/forward. OpenAI `wait` without a duration is 0 ms so a fixture does not sleep. Batch applies `return_state` once at the end. A step's own `return_state` is ignored so the batch does not snapshot between steps.
 
 ## P6 — Safety
 ### Design
@@ -852,13 +852,14 @@ Result adds `tier`, `cursor_moved`, and `focus_restored`.
 ### Design
 Extend `src/keys.rs` and enigo / `CGEvent` posting.
 
-- `drag`: `points: [{x,y}, ...]` at least 2. Down at the first, move through the middle, up at the last. Tier `event` uses mouse-dragged events posted to the pid. Tier `activate` uses enigo button down, move, up.
-- `mouse_down` and `mouse_up` share a button. A down without a later up in the same process is released on `Drop` of the input session.
-- Click `--count 3` is a triple click. `--button right|middle` already exists for coordinates. Extend it to `press`.
-- `hold_key`: press modifiers and key, sleep `--ms`, release. Cap the hold at 30 seconds.
-- xdotool names: accept `super`, `ctrl`, `alt`, `shift`, `Return`, `BackSpace`, `Delete`, `Escape`, `Tab`, `space`, `Up`, `Down`, `Left`, `Right`, `F1`–`F24`, `plus`. Map them through `canonical_key`. `super` is `Modifier::Meta`, which is already the platform meta key.
-- Clipboard: `arboard` 3.7.0. `clipboard_get` returns text, or `kind: "image"` plus a PNG path. `clipboard_set` is a confirmed action. Empty text is `invalid_arguments`. Cap stored text in the audit by omitting it.
-- `zoom` is `screenshot` of a region. The Anthropic adapter already points at it.
+- `drag`: `path` (alias `points`) is `[{x,y}, ...]` or a flat `x,y,x,y` string, at least 2 points. Down at the first, dragged events through every later point, up at the last. Tier `event` posts mouse-dragged events to the pid. Tier `activate` uses enigo button down, move, up. Fewer than 2 points is `invalid_arguments`.
+- `mouse_down` and `mouse_up` share a button. A down without a later up stays down for the rest of a `serve` loop or a `batch`. The input session releases it when the last session on that thread drops, which for a one-shot CLI command is the end of `dispatch` (the process is about to exit). A separate `mouse-down` invocation does not stay down for a later process. Say so in `--help`.
+- Buttons `back` and `forward` are mouse buttons 4 and 5. Tier `event` posts `kCGEventOtherMouse` with button numbers 3 and 4. Tier `activate` uses enigo `Button::Back` and `Button::Forward` on Linux and Windows. enigo has no back or forward button on macOS, so `--tier activate` for those buttons is `unsupported` there and names the event tier. Auto on macOS still tries `event` first.
+- Click `--count 3` and `triple-click` are a triple click. The event tier sets `kCGMouseEventClickState` to 1, then 2, then 3 on each down/up pair. `--button right` on `press` runs `AXShowMenu` once when the element advertises it. Otherwise, and for middle, back, and forward, the click is an event-tier (then activate) click at the element center. A missing frame is `execution_failed`.
+- `hold_key`: one combination, key down, sleep `--ms`, key up. `ms` above 30000 is `invalid_arguments`. A space-separated sequence is refused. `0` is a press and release with no sleep. The stub records the duration and does not sleep.
+- xdotool names: `super`, `ctrl`/`control`, `alt`/`option`, `shift`, `cmd`/`command`/`meta`, `Return`/`Enter`, `BackSpace`, `Delete`, `Escape`, `Tab`, `space`, `Up`/`Down`/`Left`/`Right`, `Home`, `End`, `Page_Up`/`Prior`, `Page_Down`/`Next`, `Insert`, `F1`–`F24`, `plus`, `minus`, and single characters. Combos use `+`. `key` also accepts a space-separated sequence (`ctrl+a Delete`). Unknown words are `invalid_arguments`. `super` is `Modifier::Meta`. F13–F20 have macOS virtual keycodes. F21–F24 are known names and return `unsupported` on macOS (enigo's macOS `Key` enum stops at F20, and they are not posted as keycode 0). Other platforms accept F21–F24 through enigo. `insert` uses the macOS Help key (virtual keycode `0x72`) because enigo has no `Insert` variant there.
+- Clipboard: `arboard` 3.7.0. Linux builds enable `image-data` and not `wayland-data-control`. `clipboard_get` returns text, or `kind: "image"` plus a mode-0600 PNG in the session cache, or `kind: "empty"`. Text wins over an image. `clipboard_set` goes through `policy::decide` and is confirmed. Empty text is `invalid_arguments`. The audit stores `chars` and never the text. A macOS arboard error whose text mentions the pasteboard and permission, denied, or not allowed is `permission_required`. Tests use the in-memory stub and never touch the pasteboard.
+- `zoom` captures a region through the screenshot path and returns the same payload and map. With no window it is a screen region. With `--app` or `--window` the region is window-local logical points (the far edge may equal the window width or height) and is cropped after `capture_window`. `screenshot` still refuses a region together with a window target. Anthropic `zoom` translates to this action, still in image pixels, and dispatch remaps it.
 - `doctor` grows `input_monitor` when the event tap from P6 was created during this process. The JSON gains `bundle_id` of the running binary so the user can see whether TCC is attached to a stable id.
 
 Helper app, `packaging/macos/`:
@@ -890,7 +891,7 @@ computer-use key --keys "super+c"
 ```
 
 ### Failure modes
-`confirm_required` on clipboard set. `invalid_arguments` on a one-point drag, a hold over 30s, or an unknown keysym. `permission_required` when arboard reports the macOS pasteboard permission error.
+`confirm_required` on clipboard set when no confirm hook is configured. `confirm_denied` when the hook fails. `invalid_arguments` on a one-point drag, a hold over 30s, an unknown keysym, an empty clipboard, or a zoom region past the window. `unsupported` for `--tier ax` on coordinate and keyboard actions, for F21–F24 on macOS, and for back/forward on the macOS activate tier. `permission_required` when arboard reports the macOS pasteboard permission error.
 
 ### Tests
 - Keysym table: `super+c`, `Return`, `ctrl+alt+Delete`, `plus`.

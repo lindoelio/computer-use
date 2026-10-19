@@ -125,6 +125,11 @@ pub fn plan(
             format!("tier event is not available on {}", std::env::consts::OS),
         )),
         RequestedTier::Named(TierName::Event) => Ok(vec![TierName::Event]),
+        RequestedTier::Named(TierName::Ax) if matches!(class, InputClass::Background) => {
+            Err(ComputerError::Unsupported(
+                "tier ax does not post coordinate or keyboard events; pass --element to use an accessibility action".into(),
+            ))
+        }
         RequestedTier::Named(tier) => Ok(vec![tier]),
         RequestedTier::Auto => match class {
             InputClass::Accessibility => Ok(vec![TierName::Ax]),
@@ -181,6 +186,40 @@ pub fn first_present<'a>(names: &'a [&'a str], present: &[bool]) -> Option<&'a s
         .find_map(|(name, found)| found.then_some(*name))
 }
 
+/// Hold longer than this is `invalid_arguments`.
+pub const MAX_HOLD_MS: u64 = 30_000;
+
+/// One key tap inside a sequence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyStroke {
+    /// Modifiers in combo order.
+    pub modifiers: Vec<Modifier>,
+    /// Canonical key.
+    pub key: String,
+}
+
+/// Half of one click in [`click_state_sequence`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClickHalf {
+    /// Button down. The click state is the click number.
+    Down,
+    /// Button up with the same click state.
+    Up,
+}
+
+/// Down/up pairs with click states 1, 2, … `count`.
+///
+/// A triple click is `(down, 1), (up, 1), (down, 2), (up, 2), (down, 3), (up, 3)`.
+pub fn click_state_sequence(count: u8) -> Vec<(ClickHalf, u8)> {
+    let clicks = count.max(1);
+    let mut pairs = Vec::with_capacity(usize::from(clicks) * 2);
+    for state in 1..=clicks {
+        pairs.push((ClickHalf::Down, state));
+        pairs.push((ClickHalf::Up, state));
+    }
+    pairs
+}
+
 /// Pointer or keyboard work passed to [`crate::backend::DesktopBackend::perform_input`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct InputJob {
@@ -201,7 +240,7 @@ pub struct InputJob {
 /// One background or foreground input.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InputKind {
-    /// Click `count` times. `count` is 1 or 2 in this phase.
+    /// Click `count` times. `count` is 1, 2, or 3.
     Click {
         /// Screen x.
         x: i32,
@@ -209,7 +248,7 @@ pub enum InputKind {
         y: i32,
         /// Mouse button.
         button: MouseButton,
-        /// 1 for a click, 2 for a double click.
+        /// 1 for a click, 2 for a double click, 3 for a triple click.
         count: u8,
     },
     /// Move. The event tier posts a move to the pid. `activate` moves the system cursor.
@@ -235,12 +274,44 @@ pub enum InputKind {
         /// Text. Not written to the audit log.
         text: String,
     },
-    /// Press a key combination.
+    /// Press one or more key combinations, in order.
     Key {
-        /// Modifiers in combo order.
+        /// Strokes. A space-separated sequence is more than one.
+        strokes: Vec<KeyStroke>,
+    },
+    /// Button down at the first point, dragged events through the rest, up at the last.
+    Drag {
+        /// At least two screen points.
+        points: Vec<(i32, i32)>,
+        /// Mouse button.
+        button: MouseButton,
+    },
+    /// Button down. A later `MouseUp`, or process exit, releases it.
+    MouseDown {
+        /// Screen x.
+        x: i32,
+        /// Screen y.
+        y: i32,
+        /// Mouse button.
+        button: MouseButton,
+    },
+    /// Button up.
+    MouseUp {
+        /// Screen x.
+        x: i32,
+        /// Screen y.
+        y: i32,
+        /// Mouse button.
+        button: MouseButton,
+    },
+    /// Key down, sleep `ms`, key up. `ms` above [`MAX_HOLD_MS`] is refused before this runs.
+    HoldKey {
+        /// Modifiers held for the whole interval.
         modifiers: Vec<Modifier>,
         /// Canonical key.
         key: String,
+        /// Milliseconds to hold. Zero is a press and release with no sleep.
+        ms: u64,
     },
 }
 
@@ -260,13 +331,20 @@ pub struct InputReport {
 /// Screen point for the agent cursor, when this action has one.
 pub fn input_point(kind: &InputKind) -> Option<(i32, i32)> {
     match kind {
-        InputKind::Click { x, y, .. } | InputKind::Move { x, y } => Some((*x, *y)),
+        InputKind::Click { x, y, .. }
+        | InputKind::Move { x, y }
+        | InputKind::MouseDown { x, y, .. }
+        | InputKind::MouseUp { x, y, .. } => Some((*x, *y)),
+        InputKind::Drag { points, .. } => points.last().copied(),
         InputKind::Scroll {
             x: Some(x),
             y: Some(y),
             ..
         } => Some((*x, *y)),
-        InputKind::Scroll { .. } | InputKind::Type { .. } | InputKind::Key { .. } => None,
+        InputKind::Scroll { .. }
+        | InputKind::Type { .. }
+        | InputKind::Key { .. }
+        | InputKind::HoldKey { .. } => None,
     }
 }
 
@@ -386,6 +464,72 @@ mod tests {
         assert_eq!(
             first_present(names, &[true, false, false]),
             Some("SLPSSetFrontProcessWithOptions")
+        );
+    }
+
+    #[test]
+    fn ax_is_unsupported_for_coordinate_and_keyboard_input() {
+        let error = plan(
+            RequestedTier::Named(TierName::Ax),
+            InputClass::Background,
+            Capabilities { event: true },
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "unsupported");
+        assert!(error.to_string().contains("pass --element"));
+        assert_eq!(
+            plan(
+                RequestedTier::Named(TierName::Ax),
+                InputClass::Accessibility,
+                Capabilities { event: true },
+                false
+            )
+            .unwrap(),
+            vec![TierName::Ax]
+        );
+        let drag = InputKind::Drag {
+            points: vec![(1, 2), (3, 4), (8, 9)],
+            button: MouseButton::Left,
+        };
+        assert_eq!(input_point(&drag), Some((8, 9)));
+        assert_eq!(
+            input_point(&InputKind::MouseDown {
+                x: 5,
+                y: 6,
+                button: MouseButton::Right,
+            }),
+            Some((5, 6))
+        );
+        assert!(input_point(&InputKind::HoldKey {
+            modifiers: vec![],
+            key: "shift".into(),
+            ms: 10,
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn triple_click_states_are_three_down_up_pairs() {
+        assert_eq!(
+            click_state_sequence(3),
+            vec![
+                (ClickHalf::Down, 1),
+                (ClickHalf::Up, 1),
+                (ClickHalf::Down, 2),
+                (ClickHalf::Up, 2),
+                (ClickHalf::Down, 3),
+                (ClickHalf::Up, 3),
+            ]
+        );
+        assert_eq!(
+            click_state_sequence(2),
+            vec![
+                (ClickHalf::Down, 1),
+                (ClickHalf::Up, 1),
+                (ClickHalf::Down, 2),
+                (ClickHalf::Up, 2),
+            ]
         );
     }
 

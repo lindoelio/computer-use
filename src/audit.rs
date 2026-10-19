@@ -104,6 +104,8 @@ pub struct AuditRecord<'a> {
     pub source: &'a str,
     /// Input tier when the action reported one.
     pub tier: Option<&'a str>,
+    /// Character count for `clipboard_set`. The text itself is never stored.
+    pub chars: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -124,6 +126,8 @@ struct AuditLine<'a> {
     source: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     tier: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chars: Option<u64>,
 }
 
 /// Append one JSON line. Does nothing when no state directory is available in tests.
@@ -143,6 +147,7 @@ pub fn record(entry: &AuditRecord<'_>) -> Result<(), ComputerError> {
         decision: entry.decision,
         source: entry.source,
         tier: entry.tier,
+        chars: entry.chars,
     };
     let text = serde_json::to_string(&line)
         .map_err(|error| ComputerError::ExecutionFailed(format!("audit encode failed: {error}")))?;
@@ -246,6 +251,7 @@ mod tests {
             decision: "deny",
             source: "builtin",
             tier: Some("ax"),
+            chars: None,
         })
         .unwrap();
         let text = fs::read_to_string(dir.join("audit.jsonl")).unwrap();

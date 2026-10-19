@@ -87,6 +87,16 @@ pub struct StubBackend {
     pub tiers_run: Mutex<Vec<String>>,
     /// Event and synthetic tiers report cursor motion. With `--require-background` they fail first.
     pub event_moves_cursor: bool,
+    /// Buttons still down. One-shot dispatch releases these.
+    pub held_buttons: Mutex<Vec<MouseButton>>,
+    /// Buttons released by [`DesktopBackend::release_held`], not by `mouse_up`.
+    pub releases: Mutex<Vec<MouseButton>>,
+    /// Hold durations recorded without sleeping.
+    pub holds_ms: Mutex<Vec<u64>>,
+    /// In-memory clipboard text. Never the system pasteboard.
+    pub clipboard_text: Mutex<Option<String>>,
+    /// In-memory clipboard RGBA. Used when text is absent.
+    pub clipboard_image: Mutex<Option<Vec<u8>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -139,6 +149,11 @@ impl Default for StubBackend {
             fail_tiers: Mutex::new(Vec::new()),
             tiers_run: Mutex::new(Vec::new()),
             event_moves_cursor: false,
+            held_buttons: Mutex::new(Vec::new()),
+            releases: Mutex::new(Vec::new()),
+            holds_ms: Mutex::new(Vec::new()),
+            clipboard_text: Mutex::new(None),
+            clipboard_image: Mutex::new(None),
         }
     }
 }
@@ -569,6 +584,34 @@ impl DesktopBackend for StubBackend {
                 via = Some("event".into());
                 continue;
             }
+            if let element::Step::CenterClick {
+                x,
+                y,
+                button,
+                count,
+            } = step
+            {
+                let report = crate::attempt::run(
+                    self,
+                    &crate::attempt::AttemptFlags {
+                        app: request.app.clone(),
+                        window: request.window.clone(),
+                        tier: request.tier.clone(),
+                        allow_foreground: request.allow_foreground,
+                        require_background: request.require_background,
+                        no_overlay: request.no_overlay,
+                        session: request.session.clone(),
+                    },
+                    crate::tier::InputKind::Click {
+                        x: *x,
+                        y: *y,
+                        button: *button,
+                        count: *count,
+                    },
+                )?;
+                via = Some(report.tier.to_string());
+                continue;
+            }
             if matches!(step, element::Step::TypeSetValue { .. }) {
                 via = Some("set_value".into());
             }
@@ -730,7 +773,41 @@ impl DesktopBackend for StubBackend {
                 self.simulate_scroll(*dx, *dy)?;
             }
             InputKind::Type { text } => self.simulate_type(text)?,
-            InputKind::Key { modifiers, key } => self.simulate_key(modifiers, key)?,
+            InputKind::Key { strokes } => {
+                for stroke in strokes {
+                    self.simulate_key(&stroke.modifiers, &stroke.key)?;
+                }
+            }
+            InputKind::Drag { points, .. } => {
+                if points.len() < 2 {
+                    return Err(ComputerError::InvalidArguments(
+                        "drag needs at least 2 points".into(),
+                    ));
+                }
+                let moves = u32::try_from(points.len() - 1).unwrap_or(u32::MAX);
+                self.moves.fetch_add(moves, Ordering::SeqCst);
+            }
+            InputKind::MouseDown { button, .. } => {
+                let mut held = self.held_buttons.lock().expect("held");
+                held.retain(|held_button| held_button != button);
+                held.push(*button);
+            }
+            InputKind::MouseUp { button, .. } => {
+                self.held_buttons
+                    .lock()
+                    .expect("held")
+                    .retain(|held_button| held_button != button);
+            }
+            InputKind::HoldKey { modifiers, key, ms } => {
+                if *ms > crate::tier::MAX_HOLD_MS {
+                    return Err(ComputerError::InvalidArguments(format!(
+                        "hold_key ms must be at most {}",
+                        crate::tier::MAX_HOLD_MS
+                    )));
+                }
+                self.holds_ms.lock().expect("holds").push(*ms);
+                self.simulate_key(modifiers, key)?;
+            }
         }
         Ok(InputReport {
             tier: job.tier.as_str(),
@@ -738,6 +815,49 @@ impl DesktopBackend for StubBackend {
             focus_restored: (job.tier == TierName::Activate).then_some(true),
             warnings: Vec::new(),
         })
+    }
+
+    fn clipboard_get(&self) -> Result<crate::backend::clipboard::ClipboardContents, ComputerError> {
+        if let Some(text) = self.clipboard_text.lock().expect("clipboard").clone() {
+            if !text.is_empty() {
+                return Ok(crate::backend::clipboard::ClipboardContents::Text(text));
+            }
+        }
+        if let Some(rgba) = self
+            .clipboard_image
+            .lock()
+            .expect("clipboard image")
+            .clone()
+        {
+            return Ok(crate::backend::clipboard::ClipboardContents::Image {
+                width: 1,
+                height: 1,
+                rgba,
+            });
+        }
+        Ok(crate::backend::clipboard::ClipboardContents::Empty)
+    }
+
+    fn clipboard_set_text(&self, text: &str) -> Result<(), ComputerError> {
+        *self.clipboard_text.lock().expect("clipboard") = Some(text.to_string());
+        Ok(())
+    }
+
+    fn clipboard_set_image(
+        &self,
+        _width: u32,
+        _height: u32,
+        rgba: &[u8],
+    ) -> Result<(), ComputerError> {
+        *self.clipboard_image.lock().expect("clipboard image") = Some(rgba.to_vec());
+        *self.clipboard_text.lock().expect("clipboard") = None;
+        Ok(())
+    }
+
+    fn release_held(&self) -> Result<(), ComputerError> {
+        let held = std::mem::take(&mut *self.held_buttons.lock().expect("held"));
+        self.releases.lock().expect("releases").extend(held);
+        Ok(())
     }
 }
 
@@ -974,6 +1094,10 @@ mod tests {
             app: Some("Notes".into()),
             window: None,
             session: None,
+            tier: None,
+            allow_foreground: false,
+            require_background: false,
+            no_overlay: true,
         }
     }
 
@@ -986,7 +1110,13 @@ mod tests {
         let backend = StubBackend::default();
         backend.seed_element(window(button("Save", 10.0, &["AXPress"])));
         let outcome = backend
-            .element_action(&request(ElementOp::Press { count: 2 }, 1))
+            .element_action(&request(
+                ElementOp::Press {
+                    count: 2,
+                    button: crate::types::MouseButton::Left,
+                },
+                1,
+            ))
             .unwrap();
         assert_eq!(outcome.action, "press");
         assert_eq!(outcome.tier, "ax");
@@ -1021,7 +1151,13 @@ mod tests {
             mutate(&mut live);
             backend.set_live(live);
             let error = backend
-                .element_action(&request(ElementOp::Press { count: 1 }, 1))
+                .element_action(&request(
+                    ElementOp::Press {
+                        count: 1,
+                        button: crate::types::MouseButton::Left,
+                    },
+                    1,
+                ))
                 .unwrap_err();
             assert_eq!(error.error.code(), "stale_element");
             assert!(error.tree.is_some());
@@ -1035,7 +1171,13 @@ mod tests {
         backend.seed_element(window(button("Save", 10.0, &["AXPress"])));
         backend.set_cached_revision(u64::MAX);
         let error = backend
-            .element_action(&request(ElementOp::Press { count: 1 }, 1))
+            .element_action(&request(
+                ElementOp::Press {
+                    count: 1,
+                    button: crate::types::MouseButton::Left,
+                },
+                1,
+            ))
             .unwrap_err();
         assert_eq!(error.error.code(), "stale_element");
         assert!(performs(&backend).is_empty());
@@ -1104,7 +1246,13 @@ mod tests {
             &["AXPress", "AXScrollToVisible"],
         )));
         backend
-            .element_action(&request(ElementOp::Press { count: 1 }, 1))
+            .element_action(&request(
+                ElementOp::Press {
+                    count: 1,
+                    button: crate::types::MouseButton::Left,
+                },
+                1,
+            ))
             .unwrap();
         assert_eq!(
             performs(&backend),
@@ -1129,12 +1277,19 @@ mod tests {
         backend.seed_element(window(button("Save", 10.0, &["AXPress"])));
         let error = backend
             .element_action(&ElementRequest {
-                op: ElementOp::Press { count: 1 },
+                op: ElementOp::Press {
+                    count: 1,
+                    button: crate::types::MouseButton::Left,
+                },
                 index: 1,
                 require_visible: false,
                 app: Some("Terminal".into()),
                 window: None,
                 session: None,
+                tier: None,
+                allow_foreground: false,
+                require_background: false,
+                no_overlay: true,
             })
             .unwrap_err();
         assert_eq!(error.error.code(), "policy_denied");
