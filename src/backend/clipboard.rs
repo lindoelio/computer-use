@@ -108,14 +108,18 @@ fn live_get() -> Result<ClipboardContents, ComputerError> {
 #[cfg(not(test))]
 fn map_error(error: arboard::Error) -> ComputerError {
     let text = error.to_string();
-    let lower = text.to_ascii_lowercase();
+    // Only macOS pasteboard denials are a permission error. Other platforms
+    // report every arboard failure as `execution_failed`.
     #[cfg(target_os = "macos")]
-    if lower.contains("pasteboard")
-        && (lower.contains("permission")
-            || lower.contains("denied")
-            || lower.contains("not allowed"))
     {
-        return ComputerError::PermissionRequired(text);
+        let lower = text.to_ascii_lowercase();
+        if lower.contains("pasteboard")
+            && (lower.contains("permission")
+                || lower.contains("denied")
+                || lower.contains("not allowed"))
+        {
+            return ComputerError::PermissionRequired(text);
+        }
     }
     ComputerError::ExecutionFailed(format!("clipboard failed: {text}"))
 }

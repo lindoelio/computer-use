@@ -199,6 +199,10 @@ pub struct KeyStroke {
 }
 
 /// Half of one click in [`click_state_sequence`].
+///
+/// The macOS event tier posts these pairs. Other platforms keep the helper for
+/// unit tests and do not post events.
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClickHalf {
     /// Button down. The click state is the click number.
@@ -210,6 +214,7 @@ pub enum ClickHalf {
 /// Down/up pairs with click states 1, 2, … `count`.
 ///
 /// A triple click is `(down, 1), (up, 1), (down, 2), (up, 2), (down, 3), (up, 3)`.
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
 pub fn click_state_sequence(count: u8) -> Vec<(ClickHalf, u8)> {
     let clicks = count.max(1);
     let mut pairs = Vec::with_capacity(usize::from(clicks) * 2);

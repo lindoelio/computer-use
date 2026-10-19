@@ -12,6 +12,10 @@ use crate::types::{Modifier, MouseButton};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HeldWhere {
     /// `CGEventPostToPid` into `pid`.
+    ///
+    /// Only the macOS event tier constructs this. Other platforms still match
+    /// it so a recorded event hold returns `unsupported` instead of panicking.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Event {
         /// Target pid.
         pid: i32,
