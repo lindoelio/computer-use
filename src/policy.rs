@@ -254,6 +254,7 @@ fn privacy_or_security(window_title: Option<&str>, ax_identifier: Option<&str>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::fs;
     use std::path::PathBuf;
 
