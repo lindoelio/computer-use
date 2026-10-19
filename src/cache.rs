@@ -76,6 +76,34 @@ pub fn load(
     })
 }
 
+const SCREENSHOT_MAP_FILE: &str = "screenshot-map.json";
+
+/// Write the last screenshot map. This file is not a tree snapshot.
+pub fn store_screenshot_map(
+    session: Option<&str>,
+    map: &crate::image_util::ScreenshotMap,
+) -> Result<(), ComputerError> {
+    let path = session_dir(session)?.join(SCREENSHOT_MAP_FILE);
+    write_secret_json(&path, map)
+}
+
+/// Read the last screenshot map for this session, if one was stored.
+pub fn load_screenshot_map(
+    session: Option<&str>,
+) -> Result<Option<crate::image_util::ScreenshotMap>, ComputerError> {
+    let path = session_dir(session)?.join(SCREENSHOT_MAP_FILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(&path).map_err(ComputerError::Io)?;
+    serde_json::from_str(&text).map(Some).map_err(|error| {
+        ComputerError::ExecutionFailed(format!(
+            "screenshot map {} is not readable: {error}",
+            path.display()
+        ))
+    })
+}
+
 /// Write a snapshot. An older Electron edit is kept when the new one has none.
 pub fn store(session: Option<&str>, snapshot: &Snapshot) -> Result<(), ComputerError> {
     let path = snapshot_path(
@@ -104,6 +132,9 @@ pub fn pending_restores(session: Option<&str>) -> Result<Vec<(i32, ElectronEdit)
         if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
             continue;
         }
+        if path.file_name().and_then(|name| name.to_str()) == Some(SCREENSHOT_MAP_FILE) {
+            continue;
+        }
         let Some(snapshot) = read_snapshot(&path)? else {
             continue;
         };
@@ -126,6 +157,9 @@ pub fn clear_restores(session: Option<&str>, pids: &[i32]) -> Result<(), Compute
         let entry = entry.map_err(ComputerError::Io)?;
         let path = entry.path();
         if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        if path.file_name().and_then(|name| name.to_str()) == Some(SCREENSHOT_MAP_FILE) {
             continue;
         }
         let Some(mut snapshot) = read_snapshot(&path)? else {
@@ -166,7 +200,11 @@ fn read_snapshot(path: &Path) -> Result<Option<Snapshot>, ComputerError> {
 }
 
 fn write_json(path: &Path, snapshot: &Snapshot) -> Result<(), ComputerError> {
-    let text = serde_json::to_string(snapshot).map_err(|error| {
+    write_secret_json(path, snapshot)
+}
+
+fn write_secret_json(path: &Path, value: &impl Serialize) -> Result<(), ComputerError> {
+    let text = serde_json::to_string(value).map_err(|error| {
         ComputerError::ExecutionFailed(format!("session cache encode failed: {error}"))
     })?;
     let mut options = OpenOptions::new();
@@ -223,13 +261,13 @@ fn set_mode(path: &Path, mode: u32) {
 }
 
 #[cfg(test)]
+pub(crate) static CACHE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
 #[allow(unsafe_code)]
 mod tests {
     use super::*;
     use crate::tree::SigNode;
-    use std::sync::Mutex;
-
-    pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn sample(pid: i32, window: u32, value: &str) -> Snapshot {
         Snapshot {
@@ -257,7 +295,7 @@ mod tests {
 
     #[test]
     fn round_trip_under_xdg_cache_home() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = CACHE_ENV_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!(
             "computer-use-cache-{}-{}",
             std::process::id(),
@@ -268,7 +306,7 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        // SAFETY: ENV_LOCK is held, and this test restores the variable before release.
+        // SAFETY: CACHE_ENV_LOCK is held, and this test restores the variable before release.
         // Other tests do not read XDG_CACHE_HOME.
         unsafe { std::env::set_var("XDG_CACHE_HOME", &dir) };
         let session = Some("unit");
@@ -301,6 +339,38 @@ mod tests {
         assert_eq!(pending[0].0, 12);
         clear_restores(session, &[12]).unwrap();
         assert!(pending_restores(session).unwrap().is_empty());
+        let before = load(session, Some("com.apple.Notes"), 12, 34)
+            .unwrap()
+            .unwrap();
+        let map = crate::image_util::prepare_shot(
+            &image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255])),
+            crate::image_util::ShotFit {
+                scale: 2.0,
+                origin_x: 0,
+                origin_y: 0,
+                logical_width: 1,
+                logical_height: 1,
+                max_width: 1440,
+                canvas: None,
+            },
+        )
+        .unwrap()
+        .map;
+        store_screenshot_map(session, &map).unwrap();
+        let after = load(session, Some("com.apple.Notes"), 12, 34)
+            .unwrap()
+            .unwrap();
+        assert_eq!(before, after);
+        let loaded = load_screenshot_map(session).unwrap().expect("map");
+        assert_eq!(loaded.width, map.width);
+        assert!(pending_restores(session).unwrap().is_empty());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let map_path = session_dir(session).unwrap().join("screenshot-map.json");
+            let mode = fs::metadata(&map_path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "mode {mode:o}");
+        }
         // SAFETY: same lock as set_var. The variable is removed before the guard drops.
         unsafe { std::env::remove_var("XDG_CACHE_HOME") };
         let _ = fs::remove_dir_all(&dir);

@@ -7,6 +7,7 @@
 
 mod apps;
 mod ax;
+mod capture;
 mod doctor;
 
 pub(crate) use apps::{activate, launch, list_apps, list_windows, quit};
@@ -39,6 +40,13 @@ pub(crate) fn end_session(session: Option<&str>) -> Result<Vec<i32>, ComputerErr
 /// Process-exit restore. See [`ax::shutdown_sessions`].
 pub(crate) fn shutdown_sessions() {
     ax::shutdown_sessions();
+}
+
+/// Capture one window with ScreenCaptureKit, then an xcap crop if that fails.
+pub(crate) fn capture_window(
+    target: &super::WindowTarget,
+) -> Result<crate::types::RawCapture, ComputerError> {
+    capture::capture_window(target)
 }
 
 use std::time::Duration;

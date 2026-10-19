@@ -180,7 +180,7 @@ Added as clap global args, and as sibling fields of `action` in JSON. `parse_req
 | `--display <id\|virtual>` | `display` | all | P14. |
 | `--require-visible` | `require_visible` | false | Fail when the element is outside the window and scroll-into-view fails or is missing. |
 | `--policy <path>` | none | `~/.config/computer-use/policy.toml` | P6. |
-| `--max-width <n>` | `max_width` | 1440 after P4 | Today the default is "no resize". 0.2.0 changes that for screenshots. |
+| `--max-width <n>` | `max_width` | 1440 | Absent scales a screenshot down to 1440. `0` does not scale. |
 
 `--pretty` still pretty-prints one-shot JSON only. `serve` stays one object per line.
 
@@ -279,6 +279,8 @@ Native CLI coordinates stay logical screen points. Adapters speak in pixels of t
   "origin": {"x": 120, "y": 40},
   "fit": "width",
   "pad": {"x": 0, "y": 0},
+  "content_width": 1440,
+  "content_height": 900,
   "map": {
     "image_to_screen": "screen = origin + (image - pad) * logical_size / image_content_size",
     "screen_to_image": "image = pad + (screen - origin) * image_content_size / logical_size"
@@ -286,7 +288,9 @@ Native CLI coordinates stay logical screen points. Adapters speak in pixels of t
 }
 ```
 
-`image_util::image_to_screen` and `screen_to_image` are pure functions with tests for a 2x Retina window, a non-zero origin, a width cap, and a letterboxed `--canvas 1440x900`. Default fit is width 1440, aspect preserved. `--canvas 1440x900` letterboxes and records `pad`.
+`content_width` and `content_height` are the drawn image inside any letterbox. `pad` is only the top-left inset, so a leftover odd pixel stays on the right or bottom and the formula stays exact. `image_content_size` in the formula is that content size.
+
+`image_util::image_to_screen` and `screen_to_image` are pure functions with tests for a 2x Retina window, a non-zero origin, a width cap, and a letterboxed `--canvas 1440x900`. Default fit is width 1440, aspect preserved. The image is not scaled up. `--canvas 1440x900` letterboxes and records `pad`. When both `--canvas` and `--max-width` are set, the canvas wins. `scale` stays the capture backing scale, not the downscale ratio.
 
 ### Input tiers
 Auto order is `ax`, then `event`, then `activate`. `synthetic` runs only when requested.
@@ -645,6 +649,21 @@ The success object is the map object from [Screenshot map](#screenshot-map) plus
 - A fake RGBA frame runs through encode and the map, and a known pixel round-trips within one logical point.
 - Default max-width is applied by `dispatch` when the field is absent. Explicit `max_width: 0` keeps the source width.
 - CLI test does not capture. It checks that `screenshot --help` mentions `--canvas`.
+
+### Implementation notes
+`dispatch` applies max-width 1440 when `max_width` is absent. `--max-width 0` and JSON `max_width: 0` keep the source width. That used to be `invalid_arguments`. The changelog entry for the new meaning lands in P15.
+
+`SCStreamConfiguration` has no `ignoreShadows` setter. Window capture sets `ignoreShadowsSingleWindow`. `captureImageWithFilter` takes `SCStreamConfiguration`, not `SCScreenshotConfiguration`. Pixel width and height are the window's point size times the backing scale of the screen that contains the window origin. Completion handlers wait at most 5 seconds and pump the main run loop so a main-queue callback cannot hang the CLI. A timeout leaks the block instead of freeing it under a late callback.
+
+The map file is `sessions/<session>/screenshot-map.json`, mode `0600`. It is separate from `<bundle>-<pid>-<window>.json`. Screenshot does not refresh the `tree --diff` baseline, and element actions still do not either.
+
+Full-desktop origin is the top-left of the stitched virtual desktop in screen points (the minimum monitor origin). That is `(0, 0)` when the primary display starts there. A region uses the region origin. A single monitor uses that monitor's origin. Mixed-scale monitors keep one primary scale on the stitched image; the map still divides logical size by content size.
+
+This crate does not call `CGWindowListCreateImage`. xcap remains the desktop path and the window fallback (`capture_source: "xcap"`, `occluded: true`). Success is `capture_source: "sck"`. The stub backend reports `capture_source: "stub"`.
+
+Sheets are read from Accessibility and composited above the parent. Accessibility off, or a sheet with no matching `SCWindow`, skips the sheet and can add a warning. The parent capture still succeeds. Linux and Windows have no window list yet, so `screenshot --app` returns `unsupported` there until P13 and P12. A crop helper exists for when bounds are known.
+
+`--path` is an alias of `--output`.
 
 ## P5 — Post-action state, batch, and schema adapters
 ### Design

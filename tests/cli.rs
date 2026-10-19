@@ -66,6 +66,21 @@ fn help_lists_commands() {
 }
 
 #[test]
+fn screenshot_help_mentions_canvas() {
+    let output = run(&["screenshot", "--help"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--canvas"),
+        "screenshot help missing --canvas:\n{stdout}"
+    );
+}
+
+#[test]
 fn element_commands_reject_bad_arguments_without_acting() {
     let missing = run(&["press", "--count", "1"]);
     let missing_value: Value = serde_json::from_slice(&missing.stdout).unwrap();

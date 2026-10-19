@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
-use crate::backend::DesktopBackend;
+use crate::backend::{DesktopBackend, WindowTarget};
 use crate::element::{self, ElementError, ElementOutcome, ElementRequest, HitInfo};
 use crate::error::ComputerError;
 use crate::policy::{self, quit_is_protected};
@@ -15,7 +15,19 @@ use crate::target::{
     WindowBounds, WindowInfo, WindowList,
 };
 use crate::tree::{self, NodeFrame, SigNode, TreeQuery, TreeReport, UiNode};
-use crate::types::{DisplayInfo, Frame, FrontmostInfo, Modifier, MouseButton, Region};
+use crate::types::{DisplayInfo, Frame, FrontmostInfo, Modifier, MouseButton, RawCapture, Region};
+
+/// Fault injected by [`StubBackend::capture_window`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StubCaptureFault {
+    /// Capture succeeds.
+    #[default]
+    None,
+    /// Screen Recording is off.
+    Permission,
+    /// The window id is absent.
+    MissingWindow,
+}
 
 #[derive(Debug)]
 pub struct StubBackend {
@@ -57,6 +69,10 @@ pub struct StubBackend {
     pub element_fixtures: Mutex<HashMap<(String, i32, u32), ElementFixture>>,
     /// Fresh tree used for revalidation. Empty means the cached tree is still current.
     pub live_override: Mutex<Option<LiveOverride>>,
+    /// Desktop screenshot size in pixels. `None` keeps the 2×2 fixture.
+    pub capture_pixels: Option<(u32, u32)>,
+    /// Window-capture fault. Desktop capture ignores it.
+    pub capture_fault: StubCaptureFault,
 }
 
 #[derive(Clone, Debug)]
@@ -100,18 +116,90 @@ impl Default for StubBackend {
             performs: Mutex::new(Vec::new()),
             element_fixtures: Mutex::new(HashMap::new()),
             live_override: Mutex::new(None),
+            capture_pixels: None,
+            capture_fault: StubCaptureFault::None,
         }
     }
 }
 
 impl DesktopBackend for StubBackend {
     fn screenshot(&self, _region: Option<Region>) -> Result<Frame, ComputerError> {
+        if let Some((width, height)) = self.capture_pixels {
+            let pixels = usize::try_from(width)
+                .ok()
+                .and_then(|width| usize::try_from(height).ok().map(|height| width * height))
+                .ok_or_else(|| ComputerError::ExecutionFailed("stub frame is too large".into()))?;
+            return Frame::new(width, height, 2.0, vec![0; pixels * 4]);
+        }
         Frame::new(
             2,
             2,
             2.0,
             vec![10, 20, 30, 255, 1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255],
         )
+    }
+
+    fn capture_screen(&self, region: Option<Region>) -> Result<RawCapture, ComputerError> {
+        let frame = self.screenshot(region)?;
+        let (origin_x, origin_y, logical_width, logical_height) = if let Some(region) = region {
+            (region.x, region.y, region.width, region.height)
+        } else {
+            let scale = frame.scale();
+            (
+                0,
+                0,
+                ((f64::from(frame.width()) / scale).round() as u32).max(1),
+                ((f64::from(frame.height()) / scale).round() as u32).max(1),
+            )
+        };
+        Ok(RawCapture {
+            frame,
+            origin_x,
+            origin_y,
+            logical_width,
+            logical_height,
+            capture_source: "stub".into(),
+            occluded: false,
+            warnings: Vec::new(),
+        })
+    }
+
+    fn capture_window(&self, target: &WindowTarget) -> Result<RawCapture, ComputerError> {
+        match self.capture_fault {
+            StubCaptureFault::Permission => Err(ComputerError::PermissionRequired(
+                "Screen Recording is off. System Settings → Privacy & Security → Screen Recording"
+                    .into(),
+            )),
+            StubCaptureFault::MissingWindow => Err(ComputerError::WindowNotFound(format!(
+                "cg window {} is not in SCShareableContent",
+                target.window_id
+            ))),
+            StubCaptureFault::None => {
+                if target.bounds.width == 0 || target.bounds.height == 0 {
+                    return Err(ComputerError::InvalidArguments(
+                        "window bounds are empty".into(),
+                    ));
+                }
+                let width = target.bounds.width.saturating_mul(2).max(1);
+                let height = target.bounds.height.saturating_mul(2).max(1);
+                let pixels = usize::try_from(width)
+                    .ok()
+                    .and_then(|width| usize::try_from(height).ok().map(|height| width * height))
+                    .ok_or_else(|| {
+                        ComputerError::ExecutionFailed("stub window frame is too large".into())
+                    })?;
+                Ok(RawCapture {
+                    frame: Frame::new(width, height, 2.0, vec![0; pixels * 4])?,
+                    origin_x: target.bounds.x,
+                    origin_y: target.bounds.y,
+                    logical_width: target.bounds.width,
+                    logical_height: target.bounds.height,
+                    capture_source: "stub".into(),
+                    occluded: false,
+                    warnings: Vec::new(),
+                })
+            }
+        }
     }
 
     fn move_mouse(&self, _x: i32, _y: i32) -> Result<(), ComputerError> {

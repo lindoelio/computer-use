@@ -323,6 +323,27 @@ impl fmt::Debug for Frame {
     }
 }
 
+/// Pixels from one capture, before max-width and canvas fitting.
+#[derive(Clone)]
+pub struct RawCapture {
+    /// Device-pixel buffer and its backing scale.
+    pub frame: Frame,
+    /// Left edge of the buffer in screen points.
+    pub origin_x: i32,
+    /// Top edge of the buffer in screen points.
+    pub origin_y: i32,
+    /// Width of the captured area in screen points.
+    pub logical_width: u32,
+    /// Height of the captured area in screen points.
+    pub logical_height: u32,
+    /// `sck`, `xcap`, or `stub`.
+    pub capture_source: String,
+    /// True when the image is a desktop crop and covered pixels may be wrong.
+    pub occluded: bool,
+    /// Non-fatal notes. Empty when the capture was clean.
+    pub warnings: Vec<String>,
+}
+
 /// Replace missing or invalid scale factors with 1.
 pub(crate) fn normalize_scale(scale: f64) -> f64 {
     if scale.is_finite() && scale > 0.0 {

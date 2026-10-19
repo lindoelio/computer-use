@@ -77,12 +77,16 @@ enum SessionCommand {
 
 #[derive(Debug, Subcommand)]
 enum CliCommand {
-    /// Capture the screen, or a logical region, and write a PNG or JPEG file.
+    /// Capture the screen, a region, or one window, and write a PNG or JPEG file.
     ///
-    /// Example: computer-use screenshot --region 0,0,800,600 --max-width 1280
+    /// `--app` and `--window` capture that window. Without them, the capture is
+    /// the full desktop or `--region`. The default max width is 1440.
+    /// `--max-width 0` keeps the source width. `--canvas 1440x900` letterboxes.
+    ///
+    /// Example: computer-use screenshot --app Notes --window 0 --max-width 1440
     Screenshot {
         /// File to write. Defaults to a path in the system temp directory.
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, visible_alias = "path", value_name = "PATH")]
         output: Option<PathBuf>,
 
         /// Logical region `x,y,width,height` in the same space as click coordinates.
@@ -93,9 +97,13 @@ enum CliCommand {
         #[arg(long, value_enum)]
         format: Option<CliFormat>,
 
-        /// Scale the image down so its width is at most N pixels.
+        /// Scale the image down so its width is at most N pixels. Default: 1440. 0 keeps the source width.
         #[arg(long, value_name = "N")]
         max_width: Option<u32>,
+
+        /// Letterbox into WxH pixels, for example 1440x900. The image is not scaled up.
+        #[arg(long, value_name = "WxH")]
+        canvas: Option<String>,
 
         /// Add a standard base64 `data` field to the JSON result.
         #[arg(long)]
@@ -493,6 +501,7 @@ fn command_action(
             region,
             format,
             max_width,
+            canvas,
             base64,
         } => Action::Screenshot {
             output: match output {
@@ -511,6 +520,7 @@ fn command_action(
             },
             format: format.map(ImageFormat::from),
             max_width: *max_width,
+            canvas: canvas.clone(),
             base64: *base64,
         },
         CliCommand::Click {

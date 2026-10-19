@@ -36,6 +36,10 @@ pub(crate) mod test_backend;
 
 pub use backend::{create_desktop_backend, Backend, DesktopBackend};
 pub use error::{ComputerError, ErrorBody};
+pub use image_util::{
+    encode_image, image_to_screen, screen_to_image, EncodedImage, MapFormulas, MapPoint,
+    ScreenshotMap,
+};
 pub use keys::{parse_key_combo, KeyCombo};
 pub use protocol::{
     dispatch, dispatch_context, dispatch_with, handle_request_line, parse_request, Action,

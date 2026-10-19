@@ -15,7 +15,66 @@ pub(crate) fn list_displays() -> Result<Vec<DisplayInfo>, ComputerError> {
     Ok(monitors.iter().map(display_from_monitor).collect())
 }
 
+/// Geometry of one xcap capture, in screen points.
+struct Shot {
+    frame: Frame,
+    origin_x: i32,
+    origin_y: i32,
+    logical_width: u32,
+    logical_height: u32,
+}
+
 pub(crate) fn capture(region: Option<Region>) -> Result<Frame, ComputerError> {
+    Ok(capture_described(region)?.frame)
+}
+
+/// Full desktop or region, labeled `xcap`. The origin is the top-left of the
+/// stitched virtual desktop, or the region origin.
+pub(crate) fn capture_screen(
+    region: Option<Region>,
+) -> Result<crate::types::RawCapture, ComputerError> {
+    let shot = capture_described(region)?;
+    Ok(described_to_raw(shot, "xcap", false, Vec::new()))
+}
+
+/// Crop the desktop image to `bounds`. Covered pixels may belong to another window.
+pub(crate) fn crop_window(
+    bounds: crate::target::WindowBounds,
+) -> Result<crate::types::RawCapture, ComputerError> {
+    if bounds.width == 0 || bounds.height == 0 {
+        return Err(ComputerError::InvalidArguments(
+            "window bounds are empty".into(),
+        ));
+    }
+    let region = Region::new(bounds.x, bounds.y, bounds.width, bounds.height)?;
+    let shot = capture_described(Some(region))?;
+    Ok(described_to_raw(
+        shot,
+        "xcap",
+        true,
+        vec!["cropped the desktop image; covered pixels may be wrong".into()],
+    ))
+}
+
+fn described_to_raw(
+    shot: Shot,
+    source: &str,
+    occluded: bool,
+    warnings: Vec<String>,
+) -> crate::types::RawCapture {
+    crate::types::RawCapture {
+        frame: shot.frame,
+        origin_x: shot.origin_x,
+        origin_y: shot.origin_y,
+        logical_width: shot.logical_width,
+        logical_height: shot.logical_height,
+        capture_source: source.to_string(),
+        occluded,
+        warnings,
+    }
+}
+
+fn capture_described(region: Option<Region>) -> Result<Shot, ComputerError> {
     let monitors = monitors()?;
     if monitors.is_empty() {
         return Err(ComputerError::ExecutionFailed(
@@ -48,10 +107,16 @@ fn display_from_monitor(monitor: &xcap::Monitor) -> DisplayInfo {
     }
 }
 
-fn capture_monitor(monitor: &xcap::Monitor) -> Result<Frame, ComputerError> {
+fn capture_monitor(monitor: &xcap::Monitor) -> Result<Shot, ComputerError> {
     let image = capture_image(monitor)?;
     let scale = normalize_scale(f64::from(monitor.scale_factor()));
-    Ok(Frame::from_image(image, scale))
+    Ok(Shot {
+        frame: Frame::from_image(image, scale),
+        origin_x: monitor.x(),
+        origin_y: monitor.y(),
+        logical_width: monitor.width().max(1),
+        logical_height: monitor.height().max(1),
+    })
 }
 
 fn capture_image(monitor: &xcap::Monitor) -> Result<image::RgbaImage, ComputerError> {
@@ -60,7 +125,7 @@ fn capture_image(monitor: &xcap::Monitor) -> Result<image::RgbaImage, ComputerEr
     })
 }
 
-fn capture_all(monitors: &[xcap::Monitor]) -> Result<Frame, ComputerError> {
+fn capture_all(monitors: &[xcap::Monitor]) -> Result<Shot, ComputerError> {
     let min_x = monitors
         .iter()
         .map(|monitor| i64::from(monitor.x()))
@@ -95,10 +160,26 @@ fn capture_all(monitors: &[xcap::Monitor]) -> Result<Frame, ComputerError> {
         image::imageops::overlay(&mut canvas, image, *px, *py);
     }
     let scale = primary_scale(monitors);
-    Ok(Frame::from_image(canvas, scale))
+    let max_x = monitors
+        .iter()
+        .map(|monitor| i64::from(monitor.x()) + i64::from(monitor.width()))
+        .max()
+        .unwrap_or(min_x);
+    let max_y = monitors
+        .iter()
+        .map(|monitor| i64::from(monitor.y()) + i64::from(monitor.height()))
+        .max()
+        .unwrap_or(min_y);
+    Ok(Shot {
+        frame: Frame::from_image(canvas, scale),
+        origin_x: i32::try_from(min_x).unwrap_or(i32::MIN),
+        origin_y: i32::try_from(min_y).unwrap_or(i32::MIN),
+        logical_width: u32::try_from(max_x - min_x).unwrap_or(1).max(1),
+        logical_height: u32::try_from(max_y - min_y).unwrap_or(1).max(1),
+    })
 }
 
-fn capture_region(monitors: &[xcap::Monitor], region: Region) -> Result<Frame, ComputerError> {
+fn capture_region(monitors: &[xcap::Monitor], region: Region) -> Result<Shot, ComputerError> {
     let region_box = region_bounds(region);
     if let Some(monitor) = monitors
         .iter()
@@ -111,7 +192,13 @@ fn capture_region(monitors: &[xcap::Monitor], region: Region) -> Result<Frame, C
         let width = logical_len_to_px(i64::from(region.width), scale)?;
         let height = logical_len_to_px(i64::from(region.height), scale)?;
         let cropped = crop_clamped(&image, x, y, width, height)?;
-        return Ok(Frame::from_image(cropped, scale));
+        return Ok(Shot {
+            frame: Frame::from_image(cropped, scale),
+            origin_x: region.x,
+            origin_y: region.y,
+            logical_width: region.width,
+            logical_height: region.height,
+        });
     }
 
     let intersecting: Vec<&xcap::Monitor> = monitors
@@ -126,7 +213,7 @@ fn capture_region(monitors: &[xcap::Monitor], region: Region) -> Result<Frame, C
     stitch_region(&intersecting, region)
 }
 
-fn stitch_region(monitors: &[&xcap::Monitor], region: Region) -> Result<Frame, ComputerError> {
+fn stitch_region(monitors: &[&xcap::Monitor], region: Region) -> Result<Shot, ComputerError> {
     let scale = monitors
         .iter()
         .copied()
@@ -175,7 +262,13 @@ fn stitch_region(monitors: &[&xcap::Monitor], region: Region) -> Result<Frame, C
             "region did not overlap a captured display".into(),
         ));
     }
-    Ok(Frame::from_image(canvas, scale))
+    Ok(Shot {
+        frame: Frame::from_image(canvas, scale),
+        origin_x: region.x,
+        origin_y: region.y,
+        logical_width: region.width,
+        logical_height: region.height,
+    })
 }
 
 fn primary_scale(monitors: &[xcap::Monitor]) -> f64 {

@@ -13,13 +13,17 @@ use serde::{Deserialize, Serialize as SerializeDerive};
 use serde_json::{json, Map, Value};
 
 use crate::backend::create_desktop_backend;
-use crate::backend::{validate_key, DesktopBackend};
+use crate::backend::{validate_key, DesktopBackend, WindowTarget};
+use crate::cache;
 use crate::element::{self, ElementError, ElementOp, ElementOutcome, ElementRequest};
 use crate::error::{ComputerError, ErrorBody};
-use crate::image_util::{encode_base64, encode_image};
+use crate::image_util::{self, encode_base64};
 use crate::keys::parse_key_combo;
 use crate::state::collect_state_for;
-use crate::target::{filter_windows_for_pid, parse_app_selector, resolve_app};
+use crate::target::{
+    filter_windows_for_pid, parse_app_selector, parse_window_selector, resolve_app, resolve_window,
+    WindowSelector,
+};
 use crate::tree::TreeQuery;
 use crate::types::{ImageFormat, Modifier, MouseButton, Region, ScrollDirection};
 
@@ -45,8 +49,13 @@ pub enum Action {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         format: Option<ImageFormat>,
         /// Scale the image down so its width is at most this many pixels.
+        ///
+        /// Absent means 1440. `0` keeps the source width.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_width: Option<u32>,
+        /// Letterbox into `WxH` pixels, for example `1440x900`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        canvas: Option<String>,
         /// Include standard base64 bytes in `data`.
         #[serde(default, skip_serializing_if = "is_false")]
         base64: bool,
@@ -381,8 +390,20 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
             region,
             format,
             max_width,
+            canvas,
             base64,
-        } => screenshot(backend, output, region, format, max_width, base64),
+        } => screenshot(
+            backend,
+            context,
+            ScreenshotArgs {
+                output,
+                region,
+                format,
+                max_width,
+                canvas,
+                include_base64: base64,
+            },
+        ),
         Action::Click {
             x,
             y,
@@ -433,17 +454,58 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
     }
 }
 
-fn screenshot(
-    backend: &dyn DesktopBackend,
+struct ScreenshotArgs {
     output: Option<String>,
     region: Option<Region>,
     format: Option<ImageFormat>,
     max_width: Option<u32>,
+    canvas: Option<String>,
     include_base64: bool,
+}
+
+fn screenshot(
+    backend: &dyn DesktopBackend,
+    context: &CallContext,
+    args: ScreenshotArgs,
 ) -> Result<Value, ComputerError> {
+    let ScreenshotArgs {
+        output,
+        region,
+        format,
+        max_width,
+        canvas,
+        include_base64,
+    } = args;
+    if region.is_some() && (context.app.is_some() || context.window.is_some()) {
+        return Err(ComputerError::InvalidArguments(
+            "pass a region or a window target, not both".into(),
+        ));
+    }
     let format = format.unwrap_or_default();
-    let frame = backend.screenshot(region)?;
-    let encoded = encode_image(&frame, format, max_width)?;
+    let max_width = max_width.unwrap_or(image_util::DEFAULT_SCREENSHOT_MAX_WIDTH);
+    let canvas = canvas
+        .as_deref()
+        .map(image_util::parse_canvas)
+        .transpose()?;
+    let raw = if context.app.is_some() || context.window.is_some() {
+        let target = resolve_screenshot_window(backend, context)?;
+        backend.capture_window(&target)?
+    } else {
+        backend.capture_screen(region)?
+    };
+    let prepared = image_util::prepare_shot(
+        raw.frame.image(),
+        image_util::ShotFit {
+            scale: raw.frame.scale(),
+            origin_x: raw.origin_x,
+            origin_y: raw.origin_y,
+            logical_width: raw.logical_width,
+            logical_height: raw.logical_height,
+            max_width,
+            canvas,
+        },
+    )?;
+    let encoded = image_util::encode_rgba(&prepared.image, format)?;
     let path = match output {
         Some(path) => PathBuf::from(path),
         None => default_screenshot_path(format),
@@ -454,17 +516,56 @@ fn screenshot(
         }
     }
     fs::write(&path, &encoded.bytes)?;
-    let mut body = json!({
-        "path": path_string(&path),
-        "width": encoded.width,
-        "height": encoded.height,
-        "scale": frame.scale(),
-        "format": format.as_str(),
-    });
+    let mut warnings = raw.warnings;
+    if let Err(error) = cache::store_screenshot_map(context.session.as_deref(), &prepared.map) {
+        warnings.push(format!("screenshot map was not cached: {error}"));
+    }
+    let mut body = serde_json::to_value(&prepared.map).map_err(|error| {
+        ComputerError::ExecutionFailed(format!("screenshot map encode failed: {error}"))
+    })?;
+    body["path"] = json!(path_string(&path));
+    body["format"] = json!(format.as_str());
+    body["capture_source"] = json!(raw.capture_source);
+    if raw.occluded {
+        body["occluded"] = json!(true);
+    }
+    if !warnings.is_empty() {
+        body["warnings"] = json!(warnings);
+    }
     if include_base64 {
         body["data"] = json!(encode_base64(&encoded.bytes));
     }
     Ok(body)
+}
+
+fn resolve_screenshot_window(
+    backend: &dyn DesktopBackend,
+    context: &CallContext,
+) -> Result<WindowTarget, ComputerError> {
+    let listed = backend.list_windows()?;
+    if let Some(app) = context.app.as_deref() {
+        let apps = backend.list_apps(true)?;
+        let selector = parse_app_selector(app)?;
+        let app = resolve_app(&apps, &selector)?;
+        let owned = filter_windows_for_pid(&listed.windows, app.pid);
+        let selector = match context.window.as_deref() {
+            Some(window) => parse_window_selector(window)?,
+            None => WindowSelector::Index(0),
+        };
+        let window = resolve_window(&owned, &selector)?;
+        return Ok(window_target(window));
+    }
+    let selector = parse_window_selector(context.window.as_deref().unwrap_or(""))?;
+    let window = resolve_window(&listed.windows, &selector)?;
+    Ok(window_target(window))
+}
+
+fn window_target(window: &crate::target::WindowInfo) -> WindowTarget {
+    WindowTarget {
+        window_id: window.id,
+        pid: window.pid,
+        bounds: window.bounds,
+    }
 }
 
 fn default_screenshot_path(format: ImageFormat) -> PathBuf {
@@ -1256,6 +1357,7 @@ mod tests {
         assert_eq!(response.to_value()["cursor"]["x"], 4);
         assert!(response.ok);
 
+        let _cache = crate::cache::CACHE_ENV_LOCK.lock().unwrap();
         let shot = dispatch_with(
             &backend,
             Action::Screenshot {
@@ -1263,6 +1365,7 @@ mod tests {
                 region: None,
                 format: Some(ImageFormat::Png),
                 max_width: Some(1),
+                canvas: None,
                 base64: true,
             },
         );
@@ -1279,7 +1382,15 @@ mod tests {
             &[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']
         );
         assert!(value["data"].as_str().unwrap().starts_with("iVBOR"));
+        assert_eq!(value["capture_source"], "stub");
+        assert_eq!(value["origin"]["x"], 0);
+        assert_eq!(value["origin"]["y"], 0);
+        assert_eq!(value["fit"], "width");
+        assert!(value["map"]["image_to_screen"].is_string());
         let _ = fs::remove_file(path);
+        if let Ok(dir) = crate::cache::session_dir(None) {
+            let _ = fs::remove_file(dir.join("screenshot-map.json"));
+        }
 
         let failed = StubBackend {
             fail_click: true,
@@ -1306,6 +1417,146 @@ mod tests {
         });
         assert!(response.ok);
         assert_eq!(response.to_value()["waited_ms"], 0);
+    }
+
+    fn shot(max_width: Option<u32>, canvas: Option<&str>) -> Action {
+        Action::Screenshot {
+            output: None,
+            region: None,
+            format: Some(ImageFormat::Png),
+            max_width,
+            canvas: canvas.map(str::to_string),
+            base64: false,
+        }
+    }
+
+    #[test]
+    fn dispatch_applies_default_max_width_and_keeps_explicit_zero() {
+        let _cache = crate::cache::CACHE_ENV_LOCK.lock().unwrap();
+        let backend = StubBackend {
+            capture_pixels: Some((1600, 1000)),
+            ..StubBackend::default()
+        };
+        let response = dispatch_with_context(
+            &backend,
+            shot(None, None),
+            &CallContext {
+                session: Some("p4-default-width".into()),
+                ..CallContext::default()
+            },
+        );
+        assert!(response.ok, "{response:?}");
+        let value = response.to_value();
+        assert_eq!(value["width"], 1440);
+        assert_eq!(value["height"], 900);
+        assert_eq!(value["scale"], 2.0);
+        assert_eq!(value["logical_width"], 800);
+        assert_eq!(value["logical_height"], 500);
+        assert_eq!(value["fit"], "width");
+        assert_eq!(value["capture_source"], "stub");
+        assert_eq!(value["content_width"], 1440);
+        let path = value["path"].as_str().unwrap();
+        let _ = fs::remove_file(path);
+        let map = crate::cache::load_screenshot_map(Some("p4-default-width"))
+            .unwrap()
+            .expect("map");
+        assert_eq!(map.width, 1440);
+        let _ = fs::remove_dir_all(crate::cache::session_dir(Some("p4-default-width")).unwrap());
+
+        let full = dispatch_with_context(
+            &backend,
+            shot(Some(0), None),
+            &CallContext {
+                session: Some("p4-zero-width".into()),
+                ..CallContext::default()
+            },
+        );
+        assert!(full.ok, "{full:?}");
+        assert_eq!(full.to_value()["width"], 1600);
+        assert_eq!(full.to_value()["height"], 1000);
+        assert_eq!(full.to_value()["fit"], "none");
+        let path = full.to_value()["path"].as_str().unwrap().to_string();
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(crate::cache::session_dir(Some("p4-zero-width")).unwrap());
+    }
+
+    #[test]
+    fn dispatch_window_capture_records_origin_and_faults() {
+        let _cache = crate::cache::CACHE_ENV_LOCK.lock().unwrap();
+        let backend = StubBackend::default();
+        let response = dispatch_with_context(
+            &backend,
+            shot(Some(0), None),
+            &CallContext {
+                app: Some("Notes".into()),
+                window: Some("0".into()),
+                session: Some("p4-window".into()),
+                ..CallContext::default()
+            },
+        );
+        assert!(response.ok, "{response:?}");
+        let value = response.to_value();
+        assert_eq!(value["capture_source"], "stub");
+        assert_eq!(value["origin"]["x"], 10);
+        assert_eq!(value["origin"]["y"], 20);
+        assert_eq!(value["logical_width"], 400);
+        assert_eq!(value["logical_height"], 300);
+        assert_eq!(value["width"], 800);
+        assert_eq!(value["fit"], "none");
+        let path = value["path"].as_str().unwrap();
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(crate::cache::session_dir(Some("p4-window")).unwrap());
+
+        let denied = StubBackend {
+            capture_fault: crate::test_backend::StubCaptureFault::Permission,
+            ..StubBackend::default()
+        };
+        let response = dispatch_with_context(
+            &denied,
+            shot(Some(0), None),
+            &CallContext {
+                app: Some("Notes".into()),
+                ..CallContext::default()
+            },
+        );
+        assert!(!response.ok);
+        assert_eq!(response.to_value()["error"]["code"], "permission_required");
+        assert!(response.to_value()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Screen Recording"));
+
+        let missing = StubBackend {
+            capture_fault: crate::test_backend::StubCaptureFault::MissingWindow,
+            ..StubBackend::default()
+        };
+        let response = dispatch_with_context(
+            &missing,
+            shot(Some(0), None),
+            &CallContext {
+                window: Some("id:100".into()),
+                ..CallContext::default()
+            },
+        );
+        assert!(!response.ok);
+        assert_eq!(response.to_value()["error"]["code"], "window_not_found");
+
+        let both = dispatch_with_context(
+            &backend,
+            Action::Screenshot {
+                output: None,
+                region: Some(Region::new(0, 0, 8, 9).unwrap()),
+                format: None,
+                max_width: Some(0),
+                canvas: None,
+                base64: false,
+            },
+            &CallContext {
+                app: Some("Notes".into()),
+                ..CallContext::default()
+            },
+        );
+        assert_eq!(both.to_value()["error"]["code"], "invalid_arguments");
     }
 
     #[test]

@@ -59,8 +59,10 @@ block2 = "0.6"
 objc2 = "0.6.5"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "NSRunningApplication",
+    "NSScreen",
     "NSWorkspace",
     "block2",
+    "objc2-core-foundation",
 ] }
 objc2-application-services = { version = "0.3.2", default-features = false, features = [
     "AXError",
@@ -81,15 +83,36 @@ objc2-core-foundation = { version = "0.3.2", default-features = false, features 
     "CFURL",
 ] }
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = [
+    "CGBitmapContext",
+    "CGColorSpace",
+    "CGContext",
     "CGGeometry",
+    "CGImage",
     "CGWindow",
 ] }
+objc2-core-media = { version = "0.3.2", default-features = false, features = [
+    "CMSampleBuffer",
+] }
+dispatch2 = "0.3"
 objc2-foundation = { version = "0.3.2", default-features = false, features = [
     "NSArray",
     "NSBundle",
     "NSError",
+    "NSProcessInfo",
     "NSString",
     "NSURL",
+] }
+objc2-screen-capture-kit = { version = "0.3.2", default-features = false, features = [
+    "SCError",
+    "SCScreenshotManager",
+    "SCShareableContent",
+    "SCStream",
+    "block2",
+    "dispatch2",
+    "libc",
+    "objc2-core-foundation",
+    "objc2-core-graphics",
+    "objc2-core-media",
 ] }
 
 [profile.release]

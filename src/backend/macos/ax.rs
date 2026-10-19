@@ -33,7 +33,7 @@ use crate::error::ComputerError;
 use crate::policy;
 use crate::target::{
     bounds_match_frame, filter_windows_for_pid, parse_app_selector, parse_window_selector,
-    resolve_app, resolve_window, ActivationPolicy, AppInfo, WindowInfo,
+    resolve_app, resolve_window, ActivationPolicy, AppInfo, WindowBounds, WindowInfo,
 };
 use crate::tree::{
     self, ElectronEdit, FlagState, NodeFrame, TreeQuery, TreeReport, UiNode, CHILD_CAP, DEPTH_CAP,
@@ -1213,6 +1213,97 @@ fn match_cg_window(windows: &[WindowInfo], pid: i32, frame: Option<NodeFrame>) -
 fn trusted() -> bool {
     // SAFETY: AXIsProcessTrusted reads the TCC bit for this process and does not prompt.
     unsafe { AXIsProcessTrusted() }
+}
+
+/// Frames of sheets or modals attached to the window that matches `bounds`.
+///
+/// An empty list means Accessibility is off, the window was not joined, or no
+/// sheet was found. This read does not write the tree cache or Electron flags.
+pub(crate) fn attached_sheets(pid: i32, bounds: WindowBounds) -> Vec<NodeFrame> {
+    if !trusted() {
+        return Vec::new();
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let Ok(app) = application(pid) else {
+        return Vec::new();
+    };
+    ignore_timeout(&app);
+    let Ok(windows) = copy_windows(&app, deadline) else {
+        return Vec::new();
+    };
+    let Some(parent_index) = windows.iter().position(|window| {
+        window
+            .frame
+            .is_some_and(|frame| bounds_match_frame(bounds, frame))
+    }) else {
+        return Vec::new();
+    };
+    let mut sheets = Vec::new();
+    collect_sheet_frames(&windows[parent_index].element, &mut sheets, 0, deadline);
+    for (index, window) in windows.iter().enumerate() {
+        if index == parent_index {
+            continue;
+        }
+        if frame_is_sheet(&window.element) {
+            if let Some(frame) = window.frame {
+                push_sheet(&mut sheets, frame);
+            }
+        }
+    }
+    sheets
+}
+
+fn collect_sheet_frames(
+    element: &AXUIElement,
+    sheets: &mut Vec<NodeFrame>,
+    depth: usize,
+    deadline: Instant,
+) {
+    if depth > 4 || Instant::now() >= deadline {
+        return;
+    }
+    if let Ok((elements, _)) = copy_elements(element, "AXSheets", 8, deadline) {
+        for child in &elements {
+            if let Some(frame) = copy_frame(child) {
+                push_sheet(sheets, frame);
+            }
+        }
+    }
+    let Ok((children, _)) = copy_child_elements(element, 16, deadline) else {
+        return;
+    };
+    for child in &children {
+        if frame_is_sheet(child) {
+            if let Some(frame) = copy_frame(child) {
+                push_sheet(sheets, frame);
+            }
+        }
+        collect_sheet_frames(child, sheets, depth + 1, deadline);
+    }
+}
+
+fn frame_is_sheet(element: &AXUIElement) -> bool {
+    let role = copy_string(element, "AXRole")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let subrole = copy_string(element, "AXSubrole")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    role == "AXSheet" || role == "AXModal" || subrole.contains("Sheet") || subrole.contains("Modal")
+}
+
+fn push_sheet(sheets: &mut Vec<NodeFrame>, frame: NodeFrame) {
+    let duplicate = sheets.iter().any(|existing| {
+        (existing.x - frame.x).abs() <= 2.0
+            && (existing.y - frame.y).abs() <= 2.0
+            && (existing.width - frame.width).abs() <= 2.0
+            && (existing.height - frame.height).abs() <= 2.0
+    });
+    if !duplicate && frame.width > 0.0 && frame.height > 0.0 {
+        sheets.push(frame);
+    }
 }
 
 fn ensure_trusted() -> Result<(), WalkError> {

@@ -16,9 +16,20 @@ mod windows;
 
 use crate::element::{ElementError, ElementOutcome, ElementRequest, HitInfo};
 use crate::error::ComputerError;
-use crate::target::{AppInfo, DoctorReport, LaunchResult, QuitResult, WindowList};
+use crate::target::{AppInfo, DoctorReport, LaunchResult, QuitResult, WindowBounds, WindowList};
 use crate::tree::{TreeQuery, TreeReport};
-use crate::types::{DisplayInfo, Frame, FrontmostInfo, Modifier, MouseButton, Region};
+use crate::types::{DisplayInfo, Frame, FrontmostInfo, Modifier, MouseButton, RawCapture, Region};
+
+/// One window selected for capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowTarget {
+    /// Platform window id. On macOS this is the CG window id.
+    pub window_id: u32,
+    /// Owning process id.
+    pub pid: i32,
+    /// Screen bounds in logical points.
+    pub bounds: WindowBounds,
+}
 
 /// Error for an operation this operating system does not implement.
 pub(crate) fn unsupported(operation: &str) -> ComputerError {
@@ -36,6 +47,26 @@ pub use input::validate_key;
 pub trait DesktopBackend: Send + Sync {
     /// Capture the desktop, or a logical region of it, as RGBA pixels.
     fn screenshot(&self, region: Option<Region>) -> Result<Frame, ComputerError>;
+
+    /// Desktop or region capture plus the map inputs (origin and logical size).
+    fn capture_screen(&self, region: Option<Region>) -> Result<RawCapture, ComputerError> {
+        capture::capture_screen(region)
+    }
+
+    /// Capture one window. macOS uses ScreenCaptureKit. Other platforms crop
+    /// the desktop image when the bounds are known.
+    fn capture_window(&self, target: &WindowTarget) -> Result<RawCapture, ComputerError> {
+        #[cfg(target_os = "macos")]
+        {
+            macos::capture_window(target)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = target.pid;
+            let _ = target.window_id;
+            capture::crop_window(target.bounds)
+        }
+    }
 
     /// Move the pointer without clicking.
     fn move_mouse(&self, x: i32, y: i32) -> Result<(), ComputerError>;
