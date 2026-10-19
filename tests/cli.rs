@@ -36,10 +36,18 @@ fn help_lists_commands() {
         "get-state",
         "wait",
         "displays",
+        "list-apps",
+        "list-windows",
+        "launch",
+        "activate",
+        "quit",
+        "doctor",
         "serve",
         "exec",
         "--pretty",
         "--json",
+        "--app",
+        "--window",
     ] {
         assert!(stdout.contains(needle), "help missing {needle}:\n{stdout}");
     }
@@ -130,6 +138,62 @@ fn assert_json_wait(args: &[&str]) {
     assert_eq!(value["ok"], true);
     assert_eq!(value["id"], 1);
     assert_eq!(value["waited_ms"], 1);
+}
+
+#[test]
+fn doctor_returns_json_on_every_platform() {
+    let output = run(&["doctor"]);
+    assert!(
+        output.status.success(),
+        "stderr: {} stdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let value: Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert_eq!(value["ok"], true);
+    assert!(value["accessibility"].is_boolean() || value["accessibility"].is_null());
+    assert!(value["screen_capture"].is_boolean() || value["screen_capture"].is_null());
+    assert!(value["input_monitor"].is_null());
+    assert!(value["fixes"].is_array());
+}
+
+#[test]
+fn launch_terminal_is_denied_or_unsupported() {
+    let output = run(&["launch", "com.apple.Terminal"]);
+    assert!(!output.status.success());
+    let value: Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert_eq!(value["ok"], false);
+    let code = value["error"]["code"].as_str().unwrap();
+    if cfg!(target_os = "macos") {
+        assert_eq!(code, "policy_denied", "{value}");
+    } else {
+        assert_eq!(code, "unsupported", "{value}");
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(message.contains(std::env::consts::OS), "{message}");
+    }
+}
+
+#[test]
+fn list_apps_returns_json() {
+    let output = run(&["list-apps"]);
+    let value: Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout))
+        .expect("list-apps stdout is JSON");
+    if cfg!(target_os = "macos") {
+        assert!(output.status.success(), "{value}");
+        assert!(value["apps"].is_array());
+    } else {
+        assert!(!output.status.success());
+        assert_eq!(value["error"]["code"], "unsupported");
+    }
+}
+
+#[test]
+fn activate_without_app_is_a_json_error() {
+    let output = run(&["activate"]);
+    assert_eq!(output.status.code(), Some(1));
+    let value: Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["code"], "invalid_arguments");
 }
 
 #[test]

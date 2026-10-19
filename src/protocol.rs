@@ -17,7 +17,8 @@ use crate::backend::{validate_key, DesktopBackend};
 use crate::error::{ComputerError, ErrorBody};
 use crate::image_util::{encode_base64, encode_image};
 use crate::keys::parse_key_combo;
-use crate::state::collect_state;
+use crate::state::collect_state_targeting;
+use crate::target::{filter_windows_for_pid, parse_app_selector, resolve_app, AppSelector};
 use crate::types::{ImageFormat, Modifier, MouseButton, Region, ScrollDirection};
 
 const MAX_WAIT_MS: u128 = 24 * 60 * 60 * 1000;
@@ -125,32 +126,153 @@ pub enum Action {
     },
     /// List displays without capturing pixels.
     Displays,
+    /// List running applications. `all` includes accessory and prohibited apps.
+    ListApps {
+        /// Include accessory and prohibited activation policies.
+        #[serde(default, rename = "all")]
+        all: bool,
+    },
+    /// List on-screen windows. `app` comes from the shared request context.
+    ListWindows,
+    /// Launch an application named by the shared `app` field.
+    Launch,
+    /// Activate an application named by the shared `app` field.
+    Activate,
+    /// Ask an application to quit. Does not force-terminate.
+    Quit,
+    /// Report accessibility and screen-capture permission.
+    Doctor {
+        /// Prompt for Accessibility and Screen Recording when true.
+        #[serde(default)]
+        request: bool,
+    },
 }
 
 fn is_false(value: &bool) -> bool {
     !*value
 }
 
-/// A JSON request: an optional `id` plus an [`Action`].
+/// Flags shared by every action. JSON keys are removed before the action is decoded.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CallContext {
+    /// Target application: name, bundle id, or pid.
+    pub app: Option<String>,
+    /// Target window: title, z-order index, or `id:<number>`.
+    pub window: Option<String>,
+    /// Element index in the current revision. Used from P3.
+    pub element: Option<u32>,
+    /// Emit a tree diff when a baseline exists.
+    pub diff: bool,
+    /// Replace the tree baseline with the full tree.
+    pub full: bool,
+    /// Attach post-action state. Used from P5.
+    pub return_state: bool,
+    /// Attach a screenshot with post-action state. Used from P5.
+    pub include_screenshot: bool,
+    /// Coordinate space name. Used from P5.
+    pub coord: Option<String>,
+    /// Cache namespace. Defaults to the process id in later phases.
+    pub session: Option<String>,
+    /// Input tier name. Used from P7.
+    pub tier: Option<String>,
+    /// Adapter name. Used from P5.
+    pub adapter: Option<String>,
+    /// Display filter. Used from P14.
+    pub display: Option<String>,
+}
+
+/// A JSON request: an optional `id`, shared flags, and an [`Action`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Request {
     /// Caller-supplied id, echoed on the response when present.
     pub id: Option<Value>,
     /// Action to run.
     pub action: Action,
+    /// Flags that were siblings of `action`.
+    pub context: CallContext,
 }
 
-/// Parse one JSON object. `id` is removed before the action is decoded.
+/// Parse one JSON object. `id` and the shared flag keys are removed before the action is decoded.
 pub fn parse_request(mut value: Value) -> Result<Request, ComputerError> {
     if !value.is_object() {
         return Err(ComputerError::InvalidArguments(
             "request must be a JSON object".into(),
         ));
     }
-    let id = value.as_object_mut().and_then(|object| object.remove("id"));
+    let object = value
+        .as_object_mut()
+        .expect("object check above guarantees a map");
+    let id = object.remove("id");
+    let context = take_context(object)?;
     let action = serde_json::from_value(value)
         .map_err(|error| ComputerError::InvalidArguments(error.to_string()))?;
-    Ok(Request { id, action })
+    Ok(Request {
+        id,
+        action,
+        context,
+    })
+}
+
+fn take_context(object: &mut Map<String, Value>) -> Result<CallContext, ComputerError> {
+    Ok(CallContext {
+        app: take_stringish(object, "app")?,
+        window: take_stringish(object, "window")?,
+        element: take_optional_u32(object, "element")?,
+        diff: take_bool(object, "diff")?,
+        full: take_bool(object, "full")?,
+        return_state: take_bool(object, "return_state")?,
+        include_screenshot: take_bool(object, "include_screenshot")?,
+        coord: take_stringish(object, "coord")?,
+        session: take_stringish(object, "session")?,
+        tier: take_stringish(object, "tier")?,
+        adapter: take_stringish(object, "adapter")?,
+        display: take_stringish(object, "display")?,
+    })
+}
+
+fn take_stringish(
+    object: &mut Map<String, Value>,
+    key: &str,
+) -> Result<Option<String>, ComputerError> {
+    match object.remove(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text)),
+        Some(Value::Number(number)) => Ok(Some(number.to_string())),
+        Some(_) => Err(ComputerError::InvalidArguments(format!(
+            "{key} must be a string or number"
+        ))),
+    }
+}
+
+fn take_bool(object: &mut Map<String, Value>, key: &str) -> Result<bool, ComputerError> {
+    match object.remove(key) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(value)) => Ok(value),
+        Some(_) => Err(ComputerError::InvalidArguments(format!(
+            "{key} must be a boolean"
+        ))),
+    }
+}
+
+fn take_optional_u32(
+    object: &mut Map<String, Value>,
+    key: &str,
+) -> Result<Option<u32>, ComputerError> {
+    match object.remove(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(number)) => number
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .map(Some)
+            .ok_or_else(|| ComputerError::InvalidArguments(format!("{key} is out of range"))),
+        Some(Value::String(text)) => text
+            .parse::<u32>()
+            .map(Some)
+            .map_err(|_| ComputerError::InvalidArguments(format!("{key} must be an integer"))),
+        Some(_) => Err(ComputerError::InvalidArguments(format!(
+            "{key} must be an integer"
+        ))),
+    }
 }
 
 /// Decode one JSON line and dispatch it.
@@ -165,26 +287,42 @@ pub fn handle_request_line(line: &str) -> Response {
     };
     let id = value.get("id").cloned();
     match parse_request(value) {
-        Ok(request) => dispatch(request.action).with_id(request.id),
+        Ok(request) => dispatch_context(request.action, &request.context).with_id(request.id),
         Err(error) => Response::from_error(error).with_id(id),
     }
 }
 
 /// Run `action` on the platform backend.
 pub fn dispatch(action: Action) -> Response {
+    dispatch_context(action, &CallContext::default())
+}
+
+/// Run `action` with shared flags on the platform backend.
+pub fn dispatch_context(action: Action, context: &CallContext) -> Response {
     let backend = create_desktop_backend();
-    dispatch_with(backend.as_ref(), action)
+    dispatch_with_context(backend.as_ref(), action, context)
 }
 
 /// Run `action` on `backend`. Panics inside the backend become an error response.
 pub fn dispatch_with(backend: &dyn DesktopBackend, action: Action) -> Response {
-    match catch_unwind(AssertUnwindSafe(|| dispatch_inner(backend, action))) {
+    dispatch_with_context(backend, action, &CallContext::default())
+}
+
+/// Run `action` on `backend` with shared flags.
+pub fn dispatch_with_context(
+    backend: &dyn DesktopBackend,
+    action: Action,
+    context: &CallContext,
+) -> Response {
+    match catch_unwind(AssertUnwindSafe(|| {
+        dispatch_inner(backend, action, context)
+    })) {
         Ok(response) => response,
         Err(_) => Response::failure("execution_failed", "action panicked and was recovered"),
     }
 }
 
-fn dispatch_inner(backend: &dyn DesktopBackend, action: Action) -> Response {
+fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallContext) -> Response {
     let result = match action {
         Action::Screenshot {
             output,
@@ -211,9 +349,18 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action) -> Response {
             direction,
             amount,
         } => scroll(backend, x, y, dx, dy, direction, amount),
-        Action::GetState => Ok(collect_state(backend)),
+        Action::GetState => Ok(collect_state_targeting(
+            backend,
+            app_name_for_state(backend, context.app.as_deref()).as_deref(),
+        )),
         Action::Wait { ms, seconds } => wait(ms, seconds),
         Action::Displays => displays(backend),
+        Action::ListApps { all } => list_apps(backend, all),
+        Action::ListWindows => list_windows(backend, context.app.as_deref()),
+        Action::Launch => launch(backend, context.app.as_deref()),
+        Action::Activate => activate(backend, context.app.as_deref(), context.window.as_deref()),
+        Action::Quit => quit(backend, context.app.as_deref()),
+        Action::Doctor { request } => doctor(backend, request),
     };
     match result {
         Ok(value) => Response::success(value),
@@ -436,6 +583,106 @@ pub(crate) fn resolve_wait(ms: Option<u64>, seconds: Option<f64>) -> Result<u64,
 fn displays(backend: &dyn DesktopBackend) -> Result<Value, ComputerError> {
     let displays = backend.list_displays()?;
     Ok(json!({"displays": displays}))
+}
+
+/// Name passed to the current accessibility inspector.
+///
+/// A pid or bundle id is resolved to the localized name when the inventory
+/// is available. A failure keeps the raw selector so the inspector can try it.
+fn app_name_for_state(backend: &dyn DesktopBackend, app: Option<&str>) -> Option<String> {
+    let app = app?;
+    let Ok(selector) = parse_app_selector(app) else {
+        return Some(app.to_string());
+    };
+    match selector {
+        AppSelector::Name(name) => Some(name),
+        other => match backend.list_apps(true) {
+            Ok(apps) => resolve_app(&apps, &other)
+                .ok()
+                .map(|item| item.name.clone())
+                .or_else(|| Some(app.to_string())),
+            Err(_) => Some(app.to_string()),
+        },
+    }
+}
+
+fn list_apps(backend: &dyn DesktopBackend, all: bool) -> Result<Value, ComputerError> {
+    let apps = backend.list_apps(all)?;
+    Ok(json!({"apps": apps}))
+}
+
+fn list_windows(backend: &dyn DesktopBackend, app: Option<&str>) -> Result<Value, ComputerError> {
+    let listed = backend.list_windows()?;
+    let windows = match app {
+        None => listed.windows,
+        Some(app) => {
+            let selector = parse_app_selector(app)?;
+            let apps = backend.list_apps(true)?;
+            let info = resolve_app(&apps, &selector)?;
+            filter_windows_for_pid(&listed.windows, info.pid)
+        }
+    };
+    let mut body = json!({"windows": windows});
+    if let Some(note) = listed.note {
+        body["note"] = json!(note);
+    }
+    Ok(body)
+}
+
+fn launch(backend: &dyn DesktopBackend, app: Option<&str>) -> Result<Value, ComputerError> {
+    let app = require_app(app)?;
+    let result = backend.launch(app)?;
+    Ok(json!({
+        "action": "launch",
+        "name": result.name,
+        "bundle_id": result.bundle_id,
+        "pid": result.pid,
+        "path": result.path,
+    }))
+}
+
+fn activate(
+    backend: &dyn DesktopBackend,
+    app: Option<&str>,
+    window: Option<&str>,
+) -> Result<Value, ComputerError> {
+    let app = require_app(app)?;
+    let result = backend.activate(app, window)?;
+    Ok(json!({
+        "action": "activate",
+        "name": result.name,
+        "bundle_id": result.bundle_id,
+        "pid": result.pid,
+        "path": result.path,
+        "window_id": result.window_id,
+        "window_title": result.window_title,
+    }))
+}
+
+fn quit(backend: &dyn DesktopBackend, app: Option<&str>) -> Result<Value, ComputerError> {
+    let app = require_app(app)?;
+    let result = backend.quit(app)?;
+    Ok(json!({
+        "action": "quit",
+        "name": result.name,
+        "bundle_id": result.bundle_id,
+        "pid": result.pid,
+        "accepted": result.accepted,
+    }))
+}
+
+fn doctor(backend: &dyn DesktopBackend, request: bool) -> Result<Value, ComputerError> {
+    let report = backend.doctor(request)?;
+    serde_json::to_value(report).map_err(|error| {
+        ComputerError::ExecutionFailed(format!("failed to encode doctor report: {error}"))
+    })
+}
+
+fn require_app(app: Option<&str>) -> Result<&str, ComputerError> {
+    match app.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(app) => Ok(app),
+        None => Err(ComputerError::InvalidArguments("app is required".into())),
+    }
 }
 
 /// JSON result printed by the CLI and returned by [`dispatch`].
@@ -830,5 +1077,178 @@ mod tests {
         });
         assert!(response.ok);
         assert_eq!(response.to_value()["waited_ms"], 0);
+    }
+
+    #[test]
+    fn shared_flags_are_stripped_before_the_action_decodes() {
+        let request = parse_request(json!({
+            "id": 4,
+            "action": "list_windows",
+            "app": "Foo \"Bar\"",
+            "window": 0,
+            "element": "3",
+            "diff": true,
+            "full": false,
+            "return_state": true
+        }))
+        .unwrap();
+        assert_eq!(request.id, Some(json!(4)));
+        assert!(matches!(request.action, Action::ListWindows));
+        assert_eq!(request.context.app.as_deref(), Some("Foo \"Bar\""));
+        assert_eq!(request.context.window.as_deref(), Some("0"));
+        assert_eq!(request.context.element, Some(3));
+        assert!(request.context.diff);
+        assert!(!request.context.full);
+        assert!(request.context.return_state);
+    }
+
+    fn ctx(app: &str) -> CallContext {
+        CallContext {
+            app: Some(app.to_string()),
+            ..CallContext::default()
+        }
+    }
+
+    #[test]
+    fn stub_inventory_launch_and_doctor() {
+        let backend = StubBackend::default();
+
+        let response = dispatch_with(&backend, Action::ListApps { all: false });
+        assert!(response.ok);
+        let value = response.to_value();
+        let apps = value["apps"].as_array().unwrap();
+        assert!(apps.iter().any(|app| app["name"] == "Notes"));
+        assert!(apps.iter().all(|app| app["name"] != "Widget"));
+
+        let response = dispatch_with(&backend, Action::ListApps { all: true });
+        let value = response.to_value();
+        assert!(value["apps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|app| app["pid"] == 77));
+
+        let response = dispatch_with_context(&backend, Action::ListWindows, &ctx("Notes"));
+        assert!(response.ok, "{response:?}");
+        let value = response.to_value();
+        let windows = &value["windows"];
+        assert_eq!(windows.as_array().unwrap().len(), 2);
+        assert_eq!(windows[0]["z"], 0);
+        assert_eq!(windows[0]["id"], 100);
+        assert_eq!(windows[1]["z"], 1);
+        assert_eq!(windows[1]["title"], "Welcome");
+        assert_eq!(windows[0]["ax_matched"], false);
+        assert!(value["note"].as_str().unwrap().contains("P2"));
+
+        let response = dispatch_with_context(&backend, Action::Launch, &ctx("Notes"));
+        assert!(response.ok, "{response:?}");
+        assert_eq!(response.to_value()["pid"], 10);
+        assert_eq!(response.to_value()["action"], "launch");
+        assert_eq!(backend.launched.lock().unwrap().as_slice(), ["Notes"]);
+
+        let response = dispatch_with_context(&backend, Action::Launch, &ctx("com.apple.Terminal"));
+        assert!(!response.ok);
+        assert_eq!(response.to_value()["error"]["code"], "policy_denied");
+        assert_eq!(backend.launched.lock().unwrap().len(), 1);
+
+        let response = dispatch_with_context(&backend, Action::Activate, &ctx("10"));
+        assert!(response.ok, "{response:?}");
+        assert!(response.to_value()["window_id"].is_null());
+        assert_eq!(backend.activated.lock().unwrap().len(), 1);
+
+        let mut context = ctx("Notes");
+        context.window = Some("Welcome".into());
+        let response = dispatch_with_context(&backend, Action::Activate, &context);
+        assert_eq!(response.to_value()["window_id"], 101);
+        assert_eq!(response.to_value()["window_title"], "Welcome");
+
+        let response = dispatch_with_context(&backend, Action::Quit, &ctx("Terminal"));
+        assert_eq!(response.to_value()["error"]["code"], "policy_denied");
+        assert!(backend.quit.lock().unwrap().is_empty());
+
+        let response = dispatch_with_context(&backend, Action::Quit, &ctx("412"));
+        assert!(response.ok, "{response:?}");
+        assert_eq!(response.to_value()["accepted"], true);
+        assert_eq!(response.to_value()["name"], "Foo \"Bar\"");
+
+        let response = dispatch_with(&backend, Action::Launch);
+        assert_eq!(response.to_value()["error"]["code"], "invalid_arguments");
+
+        let response = dispatch_with(&backend, Action::Doctor { request: false });
+        let value = response.to_value();
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["accessibility"], true);
+        assert_eq!(value["screen_capture"], false);
+        assert!(value["input_monitor"].is_null());
+        assert_eq!(value["responsible_app"]["name"], "Terminal");
+        assert!(value["fixes"][0]
+            .as_str()
+            .unwrap()
+            .contains("Screen Recording"));
+
+        let response = dispatch_with(&backend, Action::GetState);
+        assert!(response.ok);
+        let seen = backend.accessibility_apps.lock().unwrap().clone();
+        assert_eq!(seen.last(), Some(&None));
+
+        let response = dispatch_with_context(&backend, Action::GetState, &ctx("412"));
+        assert_eq!(response.to_value()["accessibility"]["role"], "window");
+        let seen = backend.accessibility_apps.lock().unwrap().clone();
+        assert_eq!(
+            seen.last().and_then(|name| name.as_deref()),
+            Some("Foo \"Bar\"")
+        );
+    }
+
+    #[test]
+    fn stub_refuses_privacy_window_and_self_quit() {
+        let mut backend = StubBackend::default();
+        backend.apps.push(crate::target::AppInfo {
+            name: "System Settings".into(),
+            bundle_id: Some("com.apple.systempreferences".into()),
+            pid: 50,
+            path: Some(
+                "/System/Applications/System Settings.app/Contents/MacOS/System Settings".into(),
+            ),
+            active: false,
+            hidden: false,
+        });
+        backend.windows.push(crate::target::WindowInfo {
+            id: 9,
+            pid: 50,
+            app: "System Settings".into(),
+            title: "Privacy & Security".into(),
+            z: 4,
+            bounds: crate::target::WindowBounds {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            },
+            layer: 0,
+            on_screen: true,
+            ax_matched: false,
+        });
+        let mut context = ctx("com.apple.systempreferences");
+        context.window = Some("Privacy".into());
+        let response = dispatch_with_context(&backend, Action::Activate, &context);
+        assert_eq!(response.to_value()["error"]["code"], "policy_denied");
+        assert!(backend.activated.lock().unwrap().is_empty());
+
+        let response = dispatch_with_context(&backend, Action::Activate, &ctx("System Settings"));
+        assert!(response.ok, "{response:?}");
+
+        let self_pid = std::process::id() as i32;
+        backend.apps.retain(|app| app.pid != self_pid);
+        backend.apps.push(crate::target::AppInfo {
+            name: "computer-use".into(),
+            bundle_id: None,
+            pid: self_pid,
+            path: None,
+            active: false,
+            hidden: false,
+        });
+        let response = dispatch_with_context(&backend, Action::Quit, &ctx(&self_pid.to_string()));
+        assert_eq!(response.to_value()["error"]["code"], "policy_denied");
     }
 }

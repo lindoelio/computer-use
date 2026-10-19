@@ -3,7 +3,13 @@
 //! Screenshots and input are shared. The accessibility tree comes from
 //! System Events through `osascript` (JavaScript for Automation), adapted
 //! from the Bezalel macOS backend and bounded so a deep tree cannot hang
-//! the process.
+//! the process. App inventory and `doctor` use AppKit and CoreGraphics.
+
+mod apps;
+mod doctor;
+
+pub(crate) use apps::{activate, launch, list_apps, list_windows, quit};
+pub(crate) use doctor::doctor;
 
 use std::time::Duration;
 

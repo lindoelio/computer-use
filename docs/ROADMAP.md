@@ -52,10 +52,10 @@ Versions below were the crates.io maxima checked on 2026-10-18. Re-check once at
 | `block2` | 0.6 | P1 | Completion handlers. Use the release that `objc2` 0.6.5 accepts. |
 | `objc2-app-kit` | 0.3.2 | P1 | `NSWorkspace`, `NSRunningApplication`, `NSScreen`, `NSWindow`, `NSEvent`, `NSMenu`. Enable only the features those types need. |
 | `objc2-application-services` | 0.3.2 | P1 | Feature `AXUIElement`: `AXUIElement`, `AXObserver`, `AXError`, `AXUIElementSetMessagingTimeout`. |
-| `objc2-core-graphics` | 0.3.2 | P1 | Features `CGEvent`, `CGEventSource`, `CGEventTypes`, `CGWindow`, `CGDirectDisplay`. Window list, event post, event tap, preflight. |
+| `objc2-core-graphics` | 0.3.2 | P1 | P1 enables `CGWindow` and `CGGeometry` (window list, preflight, request). `CGEvent`, `CGEventSource`, `CGEventTypes`, and `CGDirectDisplay` land with the phases that post events. |
 | `core-graphics` | 0.25.0 | P1 fallback | Servo bindings. Use only if an `objc2-core-graphics` 0.3.2 feature flag omits a C function (`CGWindowListCopyWindowInfo`, `CGPreflightScreenCaptureAccess`). Do not take both stacks into one function. |
-| `accessibility-sys` | 0.2.0 | P1 | `AXIsProcessTrustedWithOptions` and `kAXTrustedCheckOptionPrompt` when the objc2 binding does not export them. |
-| `dirs` | 6 | P1 | Cache and state directories on Windows. Unix paths below are explicit and do not need `dirs`. |
+| `accessibility-sys` | 0.2.0 | — | Not a dependency. `objc2-application-services` exports `AXIsProcessTrustedWithOptions` and `kAXTrustedCheckOptionPrompt`. |
+| `dirs` | 6 | P2 | Cache directories. Deferred from P1 because P1 writes no cache files. Unix session paths stay explicit. |
 | `objc2-screen-capture-kit` | 0.3.2 | P4 | `SCShareableContent`, `SCContentFilter`, `SCScreenshotManager`, `SCStreamConfiguration`. |
 | `arboard` | 3.7.0 | P8 | `Clipboard::get_text`, `set_text`, `get_image`, `set_image`. MSRV 1.71. |
 | `toml` | 0.9 | P6 | `policy.toml`. Fall back to 0.8 if 0.9's `from_str` signature moved. |
@@ -86,6 +86,8 @@ portal = ["dep:ashpd", "dep:pipewire", "dep:reis", "dep:tokio"]
 
 `cdp` and `skylight` are the heavy optional switches. `portal` is off in default Linux CI and on in the Linux release binary, because `libpipewire` is a system package. `cdp` is pure Rust and must compile on all three OS targets. `skylight` and `virtual-display` compile everywhere: the private-framework code sits in `#[cfg(target_os = "macos")]` and other targets return `unsupported`.
 
+P1 declares those feature names with empty arrays (`cdp = []`, `portal = []`, `virtual-display = ["skylight"]`) so `--all-features` compiles before `chromiumoxide`, `ashpd`, `pipewire`, and `reis` are dependencies. The `dep:` lines in the block above are the end state, attached in P10 and P13.
+
 Platform crates that are not features go in `[target.'cfg(target_os = "...")'.dependencies]` so a macOS build does not fetch `atspi` and a Linux build does not fetch `objc2-app-kit`.
 
 `cargo check --all-features` and `cargo clippy --all-targets --all-features -- -D warnings` must pass on Ubuntu, macOS, and Windows. That is the compile gate for every phase after P1.
@@ -94,7 +96,7 @@ Platform crates that are not features go in `[target.'cfg(target_os = "...")'.de
 `#![forbid(unsafe_code)]` cannot survive in-process Accessibility, ScreenCaptureKit, or a `CGEventTap`. In P1:
 
 - Change both crate attributes to `#![deny(unsafe_code)]`.
-- Put `#![allow(unsafe_code)]` only on the files that call Apple or Win32 directly: `src/backend/macos/ax.rs`, `apps.rs`, `capture.rs`, `input.rs`, `overlay.rs`, `focus.rs`, `doctor.rs`, `src/vision/macos.rs`, `src/vision/windows.rs`.
+- Put `#![allow(unsafe_code)]` only on the files that call Apple or Win32 directly: `src/backend/macos/ax.rs`, `apps.rs`, `capture.rs`, `input.rs`, `overlay.rs`, `focus.rs`, `doctor.rs`, `src/vision/macos.rs`, `src/vision/windows.rs`. P1 allows it only in `apps.rs` and `doctor.rs`. The other files are created in the phase that calls those APIs.
 - `main.rs` stays without unsafe. `policy.rs`, `audit.rs`, `tree.rs`, `cache.rs`, and the adapters stay safe.
 - Each `unsafe` block gets a one-line `SAFETY` comment naming the pointer lifetime and the framework precondition.
 - `uiautomation`, `atspi`, `ashpd`, `x11rb`, `arboard`, and `chromiumoxide` are called through their safe APIs.
@@ -482,6 +484,15 @@ computer-use doctor [--request]
 - z-order is the CG array index. Feed a fake window-info list. Do not call `CGWindowListCopyWindowInfo` in unit tests.
 - CLI help on all three OS includes the new commands. `doctor` returns JSON on all three OS.
 - `tests/cli.rs` version assertion stays `0.1.0`.
+
+### Implementation notes
+
+- A bare `--window` number is the z-order index. A window id uses the `id:` prefix (`ID:` and `index:` are accepted too) so a pid-sized window number is not read as an index.
+- App search scans `/Applications`, `~/Applications`, `/System/Applications`, and `/System/Applications/Utilities`, depth 2. Utilities is both its own root and a child of `/System/Applications`, so Terminal.app is findable without walking into a `.app` bundle. Directory symlinks are not followed.
+- `activate` brings the application forward with `NSApplicationActivateIgnoringOtherApps`. It does not raise one accessibility window. That raise lands with the AX engine.
+- `list-windows` sets `ax_matched: false` and notes that the CG-to-AX join is P2. A null window list while Screen Recording is off is `permission_required`. Empty titles with a non-null list are still success.
+- Parent walk uses `proc_pidinfo` flavor `PROC_PIDT_SHORTBSDINFO`. The parent field on that struct is `pbsi_ppid`. Agent hosts such as `grok` are reparented to launchd, so that walk can stop before a `.app`. When no ancestor bundle exists, `doctor` calls `responsibility_get_pid_responsible_for_pid` in libSystem. That call returns the pid TCC checks, or `-1`. The sibling `responsibility_get_responsible_for_pid` takes four arguments `(pid, *pid_out, *u64_out, *extra)`. A two-argument call leaves the last register uninitialized; the entry loads through it and either faults or returns `-1`.
+- `doctor` on Linux returns the P13 note. Windows returns the P12 note. `--request` does not prompt on those platforms.
 
 ## P2 — Native macOS accessibility tree
 Replaces the JXA tree for observations. `osascript` remains a fallback when `AXUIElementCreateApplication` returns an error that is not a permission error, and the response `note` says `source=osascript`.

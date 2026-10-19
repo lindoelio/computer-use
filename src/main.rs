@@ -3,7 +3,7 @@
 //! Every action prints one JSON object on stdout. `--help` and `--version`
 //! stay human-readable. `--json` and `serve` read newline-delimited requests.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
@@ -12,7 +12,8 @@ use std::process::ExitCode;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use computer_use::{
-    handle_request_line, parse_region, Action, ImageFormat, MouseButton, Response, ScrollDirection,
+    handle_request_line, parse_region, Action, CallContext, ImageFormat, MouseButton, Response,
+    ScrollDirection,
 };
 
 /// Cross-platform desktop automation for agents.
@@ -35,6 +36,14 @@ struct Cli {
     /// Read newline-delimited JSON actions from stdin and write one JSON response per line.
     #[arg(long)]
     json: bool,
+
+    /// Target application: localized name, bundle id, path, or pid.
+    #[arg(long, global = true, value_name = "NAME|BUNDLE|PID")]
+    app: Option<String>,
+
+    /// Target window: title, z-order index (0 is front), or `id:<number>`.
+    #[arg(long, global = true, value_name = "TITLE|INDEX|ID")]
+    window: Option<String>,
 
     #[command(subcommand)]
     command: Option<CliCommand>,
@@ -175,6 +184,62 @@ enum CliCommand {
     /// Example: computer-use displays
     Displays,
 
+    /// List running applications.
+    ///
+    /// Example: computer-use list-apps --all
+    #[command(name = "list-apps", visible_alias = "list_apps")]
+    ListApps {
+        /// Include accessory and prohibited apps.
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// List on-screen windows in z-order. Index 0 is front.
+    ///
+    /// `--app` keeps that application's windows and renumbers z-order.
+    /// `ax_matched` stays false until the accessibility join in a later phase.
+    ///
+    /// Example: computer-use list-windows --app Finder
+    #[command(name = "list-windows", visible_alias = "list_windows")]
+    ListWindows,
+
+    /// Launch an application by name, bundle id, path, or pid.
+    ///
+    /// The positional name wins over `--app`. The command refuses the built-in
+    /// deny list before it asks the system to open anything.
+    ///
+    /// Example: computer-use launch com.apple.TextEdit
+    Launch {
+        /// Application name, bundle id, path, or pid.
+        #[arg(value_name = "APP")]
+        app: Option<String>,
+    },
+
+    /// Bring an application forward.
+    ///
+    /// Requires `--app`. `--window` selects a window and is checked before activation.
+    ///
+    /// Example: computer-use activate --app Notes --window 0
+    Activate,
+
+    /// Ask an application to quit. This does not force-terminate.
+    ///
+    /// Requires `--app`. loginwindow, WindowServer, and this process are refused.
+    ///
+    /// Example: computer-use quit --app Notes
+    Quit,
+
+    /// Report Accessibility and Screen Recording permission.
+    ///
+    /// A normal call does not prompt. `--request` asks for both permissions.
+    ///
+    /// Example: computer-use doctor
+    Doctor {
+        /// Prompt for Accessibility and request Screen Recording.
+        #[arg(long)]
+        request: bool,
+    },
+
     /// Read newline-delimited JSON actions from stdin and write one JSON response per line.
     ///
     /// Example: printf '%s\n' '{"id":1,"action":"wait","ms":10}' | computer-use serve
@@ -290,19 +355,29 @@ fn main() -> ExitCode {
             println!();
             2
         }
-        (Some(command), false) => match command_action(command) {
-            Ok(action) => emit_action(action, cli.pretty),
-            Err(response) => {
-                emit(&response, cli.pretty);
-                1
+        (Some(command), false) => {
+            let context = CallContext {
+                app: cli.app.clone(),
+                window: cli.window.clone(),
+                ..CallContext::default()
+            };
+            match command_action(command, context) {
+                Ok((action, context)) => emit_action(action, &context, cli.pretty),
+                Err(response) => {
+                    emit(&response, cli.pretty);
+                    1
+                }
             }
-        },
+        }
     };
     ExitCode::from(code)
 }
 
-fn command_action(command: &CliCommand) -> Result<Action, Response> {
-    Ok(match command {
+fn command_action(
+    command: &CliCommand,
+    mut context: CallContext,
+) -> Result<(Action, CallContext), Response> {
+    let action = match command {
         CliCommand::Screenshot {
             output,
             region,
@@ -363,17 +438,66 @@ fn command_action(command: &CliCommand) -> Result<Action, Response> {
             seconds: *seconds,
         },
         CliCommand::Displays => Action::Displays,
+        CliCommand::ListApps { all } => Action::ListApps { all: *all },
+        CliCommand::ListWindows => Action::ListWindows,
+        CliCommand::Launch { app } => {
+            match (app, context.app.as_deref()) {
+                (Some(positional), Some(flag)) if positional != flag => {
+                    return Err(Response::failure(
+                        "invalid_arguments",
+                        "launch app and --app disagree",
+                    ));
+                }
+                (Some(positional), _) => context.app = Some(positional.clone()),
+                (None, None) => {
+                    return Err(Response::failure(
+                        "invalid_arguments",
+                        "launch requires an app name, bundle id, path, or pid",
+                    ));
+                }
+                (None, Some(_)) => {}
+            }
+            Action::Launch
+        }
+        CliCommand::Activate => {
+            if context
+                .app
+                .as_deref()
+                .is_none_or(|app| app.trim().is_empty())
+            {
+                return Err(Response::failure(
+                    "invalid_arguments",
+                    "activate requires --app",
+                ));
+            }
+            Action::Activate
+        }
+        CliCommand::Quit => {
+            if context
+                .app
+                .as_deref()
+                .is_none_or(|app| app.trim().is_empty())
+            {
+                return Err(Response::failure(
+                    "invalid_arguments",
+                    "quit requires --app",
+                ));
+            }
+            Action::Quit
+        }
+        CliCommand::Doctor { request } => Action::Doctor { request: *request },
         CliCommand::Serve | CliCommand::Exec { .. } => {
             return Err(Response::failure(
                 "invalid_arguments",
                 "internal error: serve and exec are not desktop actions",
             ))
         }
-    })
+    };
+    Ok((action, context))
 }
 
-fn emit_action(action: Action, pretty: bool) -> u8 {
-    let response = computer_use::dispatch(action);
+fn emit_action(action: Action, context: &CallContext, pretty: bool) -> u8 {
+    let response = computer_use::dispatch_context(action, context);
     let code = u8::from(!response.ok);
     emit(&response, pretty);
     code

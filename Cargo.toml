@@ -2,7 +2,7 @@
 name = "computer-use"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.81"
+rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 description = "Cross-platform desktop automation for agents: screenshots, mouse, keyboard, and accessibility."
 repository = "https://github.com/lindoelio/computer-use"
@@ -34,6 +34,15 @@ path = "src/lib.rs"
 name = "computer-use"
 path = "src/main.rs"
 
+[features]
+default = []
+# Crate dependencies are attached in the phase that uses them.
+# P1 declares the names so `--all-features` compiles on every OS.
+cdp = []
+skylight = []
+virtual-display = ["skylight"]
+portal = []
+
 [dependencies]
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
@@ -43,6 +52,40 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 xcap = "0.3.3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+objc2 = "0.6.5"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "NSRunningApplication",
+    "NSWorkspace",
+    "block2",
+] }
+objc2-application-services = { version = "0.3.2", default-features = false, features = [
+    "AXUIElement",
+    "HIServices",
+] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
+    "CFArray",
+    "CFBase",
+    "CFCGTypes",
+    "CFDate",
+    "CFDictionary",
+    "CFNumber",
+    "CFRunLoop",
+    "CFString",
+] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = [
+    "CGGeometry",
+    "CGWindow",
+] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+    "NSArray",
+    "NSBundle",
+    "NSError",
+    "NSString",
+    "NSURL",
+] }
 
 [profile.release]
 lto = "thin"

@@ -16,14 +16,16 @@
 //! assert_eq!(response.to_value()["waited_ms"].as_u64(), Some(0));
 //! ```
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 pub mod backend;
 pub mod error;
 mod image_util;
 pub mod keys;
+pub mod policy;
 pub mod protocol;
 pub mod state;
+pub mod target;
 pub mod types;
 
 #[cfg(test)]
@@ -33,7 +35,8 @@ pub use backend::{create_desktop_backend, Backend, DesktopBackend};
 pub use error::{ComputerError, ErrorBody};
 pub use keys::{parse_key_combo, KeyCombo};
 pub use protocol::{
-    dispatch, dispatch_with, handle_request_line, parse_request, Action, Request, Response,
+    dispatch, dispatch_context, dispatch_with, handle_request_line, parse_request, Action,
+    CallContext, Request, Response,
 };
 pub use types::{
     parse_region, DisplayInfo, Frame, FrontmostInfo, ImageFormat, Modifier, MouseButton, Region,

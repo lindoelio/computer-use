@@ -12,7 +12,12 @@ use crate::types::{DisplayInfo, FrontmostInfo};
 ///
 /// This function does not panic. A backend panic is caught and reported in `note`.
 pub fn collect_state(backend: &dyn DesktopBackend) -> Value {
-    match catch_unwind(AssertUnwindSafe(|| collect_state_inner(backend))) {
+    collect_state_targeting(backend, None)
+}
+
+/// Same snapshot as [`collect_state`], with `app_name` passed to accessibility.
+pub fn collect_state_targeting(backend: &dyn DesktopBackend, app_name: Option<&str>) -> Value {
+    match catch_unwind(AssertUnwindSafe(|| collect_state_inner(backend, app_name))) {
         Ok(value) => value,
         Err(_) => json!({
             "platform": platform_name(),
@@ -27,7 +32,7 @@ pub fn collect_state(backend: &dyn DesktopBackend) -> Value {
     }
 }
 
-fn collect_state_inner(backend: &dyn DesktopBackend) -> Value {
+fn collect_state_inner(backend: &dyn DesktopBackend, app_name: Option<&str>) -> Value {
     let mut notes = Vec::new();
 
     let displays = match guard("displays", || backend.list_displays()) {
@@ -58,7 +63,7 @@ fn collect_state_inner(backend: &dyn DesktopBackend) -> Value {
         notes.push(note);
     }
 
-    let (accessibility, access_note) = accessibility_value(backend);
+    let (accessibility, access_note) = accessibility_value(backend, app_name);
     if let Some(note) = access_note {
         notes.push(note);
     }
@@ -97,8 +102,11 @@ fn screen_value(display: Option<&DisplayInfo>) -> Value {
     }
 }
 
-fn accessibility_value(backend: &dyn DesktopBackend) -> (Value, Option<String>) {
-    let result = catch_unwind(AssertUnwindSafe(|| backend.inspect_accessibility(None)));
+fn accessibility_value(
+    backend: &dyn DesktopBackend,
+    app_name: Option<&str>,
+) -> (Value, Option<String>) {
+    let result = catch_unwind(AssertUnwindSafe(|| backend.inspect_accessibility(app_name)));
     match result {
         Ok(Ok(text)) => match serde_json::from_str::<Value>(text.trim()) {
             Ok(value) => (value, None),

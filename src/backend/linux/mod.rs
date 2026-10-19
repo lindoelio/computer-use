@@ -7,7 +7,10 @@
 use std::time::Duration;
 
 use crate::error::ComputerError;
+use crate::target::{AppInfo, DoctorReport, LaunchResult, QuitResult, WindowList};
 use crate::types::FrontmostInfo;
+
+use super::unsupported;
 
 use super::command::{run_timeout, stderr_snippet};
 
@@ -68,4 +71,35 @@ pub(crate) fn inspect_accessibility(_app_name: Option<&str>) -> Result<String, C
     Err(ComputerError::Unsupported(
         "accessibility tree is not available on Linux in this build. frontmost window title is reported when xdotool can see it".into(),
     ))
+}
+
+pub(crate) fn list_apps(_all: bool) -> Result<Vec<AppInfo>, ComputerError> {
+    Err(unsupported("list_apps"))
+}
+
+pub(crate) fn list_windows() -> Result<WindowList, ComputerError> {
+    Err(unsupported("list_windows"))
+}
+
+pub(crate) fn launch(_app: &str) -> Result<LaunchResult, ComputerError> {
+    Err(unsupported("launch"))
+}
+
+pub(crate) fn activate(_app: &str, _window: Option<&str>) -> Result<LaunchResult, ComputerError> {
+    Err(unsupported("activate"))
+}
+
+pub(crate) fn quit(_app: &str) -> Result<QuitResult, ComputerError> {
+    Err(unsupported("quit"))
+}
+
+pub(crate) fn doctor(request: bool) -> Result<DoctorReport, ComputerError> {
+    let mut report = DoctorReport::pending("P13");
+    if request {
+        report.note = Some(
+            "accessibility and screen-capture probes land in P13. --request has no effect on this platform"
+                .into(),
+        );
+    }
+    Ok(report)
 }

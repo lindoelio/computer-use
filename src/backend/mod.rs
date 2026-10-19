@@ -15,7 +15,16 @@ mod macos;
 mod windows;
 
 use crate::error::ComputerError;
+use crate::target::{AppInfo, DoctorReport, LaunchResult, QuitResult, WindowList};
 use crate::types::{DisplayInfo, Frame, FrontmostInfo, Modifier, MouseButton, Region};
+
+/// Error for an operation this operating system does not implement.
+pub(crate) fn unsupported(operation: &str) -> ComputerError {
+    ComputerError::Unsupported(format!(
+        "{operation} is not available on {}",
+        std::env::consts::OS
+    ))
+}
 
 pub use input::validate_key;
 
@@ -54,6 +63,36 @@ pub trait DesktopBackend: Send + Sync {
 
     /// Accessibility tree as a JSON string, when the platform can produce one.
     fn inspect_accessibility(&self, app_name: Option<&str>) -> Result<String, ComputerError>;
+
+    /// Running applications. `all` includes accessory and prohibited apps.
+    fn list_apps(&self, _all: bool) -> Result<Vec<AppInfo>, ComputerError> {
+        Err(unsupported("list_apps"))
+    }
+
+    /// On-screen windows in z-order. Index 0 is front.
+    fn list_windows(&self) -> Result<WindowList, ComputerError> {
+        Err(unsupported("list_windows"))
+    }
+
+    /// Launch an application by name, bundle id, or path.
+    fn launch(&self, _app: &str) -> Result<LaunchResult, ComputerError> {
+        Err(unsupported("launch"))
+    }
+
+    /// Bring an application forward. `window` selects a window inside it.
+    fn activate(&self, _app: &str, _window: Option<&str>) -> Result<LaunchResult, ComputerError> {
+        Err(unsupported("activate"))
+    }
+
+    /// Ask an application to quit. This does not force-terminate.
+    fn quit(&self, _app: &str) -> Result<QuitResult, ComputerError> {
+        Err(unsupported("quit"))
+    }
+
+    /// Permission probe. `request` may show a system prompt on macOS.
+    fn doctor(&self, _request: bool) -> Result<DoctorReport, ComputerError> {
+        Err(unsupported("doctor"))
+    }
 }
 
 /// Alias for [`DesktopBackend`].
@@ -80,7 +119,7 @@ pub fn create_desktop_backend() -> Box<dyn DesktopBackend> {
 }
 
 macro_rules! impl_platform_backend {
-    ($ty:ty, $inspect:path, $front:path) => {
+    ($ty:ty, $inspect:path, $front:path, $doctor:path, $list_apps:path, $list_windows:path, $launch:path, $activate:path, $quit:path) => {
         impl DesktopBackend for $ty {
             fn screenshot(&self, region: Option<Region>) -> Result<Frame, ComputerError> {
                 capture::capture(region)
@@ -129,6 +168,34 @@ macro_rules! impl_platform_backend {
             ) -> Result<String, ComputerError> {
                 $inspect(app_name)
             }
+
+            fn list_apps(&self, all: bool) -> Result<Vec<AppInfo>, ComputerError> {
+                $list_apps(all)
+            }
+
+            fn list_windows(&self) -> Result<WindowList, ComputerError> {
+                $list_windows()
+            }
+
+            fn launch(&self, app: &str) -> Result<LaunchResult, ComputerError> {
+                $launch(app)
+            }
+
+            fn activate(
+                &self,
+                app: &str,
+                window: Option<&str>,
+            ) -> Result<LaunchResult, ComputerError> {
+                $activate(app, window)
+            }
+
+            fn quit(&self, app: &str) -> Result<QuitResult, ComputerError> {
+                $quit(app)
+            }
+
+            fn doctor(&self, request: bool) -> Result<DoctorReport, ComputerError> {
+                $doctor(request)
+            }
         }
     };
 }
@@ -137,19 +204,37 @@ macro_rules! impl_platform_backend {
 impl_platform_backend!(
     macos::MacOsDesktopBackend,
     macos::inspect_accessibility,
-    macos::frontmost
+    macos::frontmost,
+    macos::doctor,
+    macos::list_apps,
+    macos::list_windows,
+    macos::launch,
+    macos::activate,
+    macos::quit
 );
 #[cfg(target_os = "linux")]
 impl_platform_backend!(
     linux::LinuxDesktopBackend,
     linux::inspect_accessibility,
-    linux::frontmost
+    linux::frontmost,
+    linux::doctor,
+    linux::list_apps,
+    linux::list_windows,
+    linux::launch,
+    linux::activate,
+    linux::quit
 );
 #[cfg(target_os = "windows")]
 impl_platform_backend!(
     windows::WindowsDesktopBackend,
     windows::inspect_accessibility,
-    windows::frontmost
+    windows::frontmost,
+    windows::doctor,
+    windows::list_apps,
+    windows::list_windows,
+    windows::launch,
+    windows::activate,
+    windows::quit
 );
 
 #[cfg(target_os = "linux")]
