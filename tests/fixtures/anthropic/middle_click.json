@@ -1,0 +1,15 @@
+{
+  "request": {
+    "action": "middle_click",
+    "coordinate": [
+      12,
+      22
+    ]
+  },
+  "expect": {
+    "action": "click",
+    "x": 12,
+    "y": 22,
+    "button": "middle"
+  }
+}

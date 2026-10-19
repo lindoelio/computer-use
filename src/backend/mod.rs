@@ -153,6 +153,14 @@ pub trait DesktopBackend: Send + Sync {
         }
     }
 
+    /// Locked, asleep, or no display. `None` when capture may proceed.
+    ///
+    /// The default is `None` so the stub does not read the live session.
+    /// The macOS backend overrides it.
+    fn display_block(&self) -> Option<ComputerError> {
+        None
+    }
+
     /// Hit-test a screen point. macOS reports the element under the point.
     /// Other platforms return `Ok(None)` and the coordinate click still runs.
     fn hit_test(&self, x: i32, y: i32) -> Result<Option<HitInfo>, ComputerError> {
@@ -235,6 +243,17 @@ macro_rules! impl_platform_backend {
 
             fn list_displays(&self) -> Result<Vec<DisplayInfo>, ComputerError> {
                 capture::list_displays()
+            }
+
+            fn display_block(&self) -> Option<ComputerError> {
+                #[cfg(target_os = "macos")]
+                {
+                    macos::session_display_block()
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    None
+                }
             }
 
             fn frontmost(&self) -> FrontmostInfo {

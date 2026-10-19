@@ -1,0 +1,14 @@
+{
+  "request": {
+    "type": "double_click",
+    "x": 4,
+    "y": 5,
+    "button": "right"
+  },
+  "expect": {
+    "action": "double_click",
+    "x": 4,
+    "y": 5,
+    "button": "right"
+  }
+}

@@ -200,6 +200,26 @@ pub enum Action {
     Tree,
     /// Restore Electron accessibility flags and stop observers.
     SessionEnd,
+    /// Read the pointer. The Anthropic adapter maps `cursor_position` here.
+    CursorPosition,
+    /// Run several actions that share one target and one cache revision sequence.
+    Batch {
+        /// Stop after the first failed step. Defaults to true.
+        #[serde(default = "default_stop_on_error")]
+        stop_on_error: bool,
+        /// Native action objects. A nested `batch` is rejected at dispatch.
+        actions: Vec<Value>,
+    },
+    /// Remove empty session directories and stale ones.
+    #[serde(alias = "session-prune")]
+    SessionPrune {
+        /// Report matches without deleting them.
+        #[serde(default)]
+        dry_run: bool,
+        /// Age in seconds after which a dead owner's session is stale. Absent means 24 hours.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ttl_secs: Option<u64>,
+    },
 }
 
 fn is_false(value: &bool) -> bool {
@@ -208,6 +228,10 @@ fn is_false(value: &bool) -> bool {
 
 fn default_press_count() -> u8 {
     1
+}
+
+fn default_stop_on_error() -> bool {
+    true
 }
 
 /// Flags shared by every action. JSON keys are removed before the action is decoded.
@@ -338,8 +362,17 @@ fn take_optional_u32(
 
 /// Decode one JSON line and dispatch it.
 ///
-/// Parse errors return `ok: false` and do not panic.
+/// Parse errors return `ok: false` and do not panic. The adapter is native
+/// unless the object sets `adapter`.
 pub fn handle_request_line(line: &str) -> Response {
+    handle_request_line_with(line, None)
+}
+
+/// Decode one JSON line. `cli_adapter` is the process `--adapter` flag.
+///
+/// A request field `adapter` wins. `native` skips translation. There is no
+/// detection when both are absent.
+pub fn handle_request_line_with(line: &str, cli_adapter: Option<&str>) -> Response {
     let value = match serde_json::from_str::<Value>(line) {
         Ok(value) => value,
         Err(error) => {
@@ -347,9 +380,74 @@ pub fn handle_request_line(line: &str) -> Response {
         }
     };
     let id = value.get("id").cloned();
-    match parse_request(value) {
+    let echo = match effective_adapter(&value, cli_adapter) {
+        Ok(name) => name,
+        Err(error) => return Response::from_error(error).with_id(id),
+    };
+    match build_request(value, echo.as_deref()) {
         Ok(request) => dispatch_context(request.action, &request.context).with_id(request.id),
-        Err(error) => Response::from_error(error).with_id(id),
+        Err(error) => {
+            let mut response = Response::from_error(error).with_id(id);
+            stamp_adapter_name(&mut response, echo.as_deref());
+            response
+        }
+    }
+}
+
+fn effective_adapter(
+    value: &Value,
+    cli_adapter: Option<&str>,
+) -> Result<Option<String>, ComputerError> {
+    if !value.is_object() {
+        return Ok(None);
+    }
+    let from_request = match value.get("adapter") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) => Some(text.as_str()),
+        Some(_) => {
+            return Err(ComputerError::InvalidArguments(
+                "adapter must be a string".into(),
+            ))
+        }
+    };
+    let name = from_request.or(cli_adapter);
+    match name {
+        None | Some("native") => Ok(None),
+        Some("openai" | "anthropic") => Ok(name.map(str::to_string)),
+        Some(other) => Err(ComputerError::InvalidArguments(format!(
+            "unknown adapter {other:?}"
+        ))),
+    }
+}
+
+fn build_request(value: Value, adapter: Option<&str>) -> Result<Request, ComputerError> {
+    let Some(name) = adapter else {
+        return parse_request(value);
+    };
+    if !value.is_object() {
+        return Err(ComputerError::InvalidArguments(
+            "request must be a JSON object".into(),
+        ));
+    }
+    let mut value = value;
+    let object = value
+        .as_object_mut()
+        .expect("object check above guarantees a map");
+    let id = object.remove("id");
+    let mut context = take_context(object)?;
+    context.coord = Some("image".into());
+    context.adapter = Some(name.to_string());
+    let action = crate::adapters::translate(name, &value)?;
+    Ok(Request {
+        id,
+        action,
+        context,
+    })
+}
+
+fn stamp_adapter_name(response: &mut Response, adapter: Option<&str>) {
+    if let Some(name @ ("openai" | "anthropic")) = adapter {
+        response.fields.insert("adapter".into(), json!(name));
     }
 }
 
@@ -375,16 +473,36 @@ pub fn dispatch_with_context(
     action: Action,
     context: &CallContext,
 ) -> Response {
-    match catch_unwind(AssertUnwindSafe(|| {
+    let mut response = match catch_unwind(AssertUnwindSafe(|| {
         dispatch_inner(backend, action, context)
     })) {
         Ok(response) => response,
         Err(_) => Response::failure("execution_failed", "action panicked and was recovered"),
-    }
+    };
+    stamp_adapter_name(&mut response, context.adapter.as_deref());
+    response
+}
+
+enum PostKind {
+    /// Successful or failed mutating action. `return_state` snapshots afterward.
+    Mutating,
+    /// `return_state` and `include_screenshot` are ignored.
+    ReadOnly,
+    /// The action already captured. `include_screenshot` reuses that body.
+    Screenshot,
 }
 
 fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallContext) -> Response {
-    let result = match action {
+    let action = match remap_coordinates(context, action) {
+        Ok(action) => action,
+        Err(error) => return Response::from_error(error),
+    };
+    let kind = post_state_kind(&action);
+    let response = match action {
+        Action::Batch {
+            actions,
+            stop_on_error,
+        } => return run_batch(backend, context, actions, stop_on_error),
         Action::Screenshot {
             output,
             region,
@@ -392,7 +510,7 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
             max_width,
             canvas,
             base64,
-        } => screenshot(
+        } => result_response(screenshot(
             backend,
             context,
             ScreenshotArgs {
@@ -403,31 +521,29 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
                 canvas,
                 include_base64: base64,
             },
-        ),
+        )),
         Action::Click {
             x,
             y,
             button,
             double,
-        } => return click(backend, context, x, y, button, double),
-        Action::DoubleClick { x, y, button } => return click(backend, context, x, y, button, true),
-        Action::Press { count } => {
-            return element_command(backend, context, ElementOp::Press { count })
-        }
-        Action::Focus => return element_command(backend, context, ElementOp::Focus),
+        } => click(backend, context, x, y, button, double),
+        Action::DoubleClick { x, y, button } => click(backend, context, x, y, button, true),
+        Action::Press { count } => element_command(backend, context, ElementOp::Press { count }),
+        Action::Focus => element_command(backend, context, ElementOp::Focus),
         Action::SetValue { value } => {
-            return element_command(backend, context, ElementOp::SetValue { value })
+            element_command(backend, context, ElementOp::SetValue { value })
         }
         Action::SelectText { start, end } => {
-            return element_command(backend, context, ElementOp::SelectText { start, end })
+            element_command(backend, context, ElementOp::SelectText { start, end })
         }
         Action::PerformAction { name } => {
-            return element_command(backend, context, ElementOp::Perform { name })
+            element_command(backend, context, ElementOp::Perform { name })
         }
-        Action::ScrollTo => return element_command(backend, context, ElementOp::ScrollTo),
-        Action::Move { x, y } => move_mouse(backend, x, y),
-        Action::Type { text } => return type_command(backend, context, text),
-        Action::Key { keys } => press_key(backend, &keys),
+        Action::ScrollTo => element_command(backend, context, ElementOp::ScrollTo),
+        Action::Move { x, y } => result_response(move_mouse(backend, x, y)),
+        Action::Type { text } => type_command(backend, context, text),
+        Action::Key { keys } => result_response(press_key(backend, &keys)),
         Action::Scroll {
             x,
             y,
@@ -435,23 +551,514 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
             dy,
             direction,
             amount,
-        } => scroll(backend, x, y, dx, dy, direction, amount),
-        Action::GetState => Ok(collect_state_for(backend, &tree_query(context))),
-        Action::Tree => tree_action(backend, context),
-        Action::SessionEnd => session_end(backend, context),
-        Action::Wait { ms, seconds } => wait(ms, seconds),
-        Action::Displays => displays(backend),
-        Action::ListApps { all } => list_apps(backend, all),
-        Action::ListWindows => list_windows(backend, context.app.as_deref()),
-        Action::Launch => launch(backend, context.app.as_deref()),
-        Action::Activate => activate(backend, context.app.as_deref(), context.window.as_deref()),
-        Action::Quit => quit(backend, context.app.as_deref()),
-        Action::Doctor { request } => doctor(backend, request),
+        } => result_response(scroll(backend, x, y, dx, dy, direction, amount)),
+        Action::GetState => result_response(Ok(collect_state_for(backend, &tree_query(context)))),
+        Action::Tree => result_response(tree_action(backend, context)),
+        Action::SessionEnd => result_response(session_end(backend, context)),
+        Action::Wait { ms, seconds } => result_response(wait(ms, seconds)),
+        Action::Displays => result_response(displays(backend)),
+        Action::ListApps { all } => result_response(list_apps(backend, all)),
+        Action::ListWindows => result_response(list_windows(backend, context.app.as_deref())),
+        Action::Launch => result_response(launch(backend, context.app.as_deref())),
+        Action::Activate => result_response(activate(
+            backend,
+            context.app.as_deref(),
+            context.window.as_deref(),
+        )),
+        Action::Quit => result_response(quit(backend, context.app.as_deref())),
+        Action::Doctor { request } => result_response(doctor(backend, request)),
+        Action::CursorPosition => result_response(cursor_position(backend)),
+        Action::SessionPrune { dry_run, ttl_secs } => {
+            result_response(session_prune(dry_run, ttl_secs))
+        }
     };
+    attach_post_state(backend, context, kind, response)
+}
+
+fn result_response(result: Result<Value, ComputerError>) -> Response {
     match result {
         Ok(value) => Response::success(value),
         Err(error) => Response::from_error(error),
     }
+}
+
+fn post_state_kind(action: &Action) -> PostKind {
+    match action {
+        Action::Screenshot { .. } => PostKind::Screenshot,
+        Action::Click { .. }
+        | Action::DoubleClick { .. }
+        | Action::Press { .. }
+        | Action::Focus
+        | Action::SetValue { .. }
+        | Action::SelectText { .. }
+        | Action::PerformAction { .. }
+        | Action::ScrollTo
+        | Action::Move { .. }
+        | Action::Type { .. }
+        | Action::Key { .. }
+        | Action::Scroll { .. }
+        | Action::Launch
+        | Action::Activate
+        | Action::Quit
+        | Action::Batch { .. } => PostKind::Mutating,
+        Action::GetState
+        | Action::Wait { .. }
+        | Action::Displays
+        | Action::ListApps { .. }
+        | Action::ListWindows
+        | Action::Doctor { .. }
+        | Action::Tree
+        | Action::SessionEnd
+        | Action::SessionPrune { .. }
+        | Action::CursorPosition => PostKind::ReadOnly,
+    }
+}
+
+fn remap_coordinates(context: &CallContext, action: Action) -> Result<Action, ComputerError> {
+    match context.coord.as_deref() {
+        None | Some("screen") => Ok(action),
+        Some("image") => remap_image_action(context, action),
+        Some(other) => Err(ComputerError::InvalidArguments(format!(
+            "coord must be screen or image (got {other})"
+        ))),
+    }
+}
+
+fn remap_image_action(context: &CallContext, action: Action) -> Result<Action, ComputerError> {
+    match action {
+        Action::Click {
+            x,
+            y,
+            button,
+            double,
+        } => {
+            let (x, y) = remap_optional_point(context, x, y)?;
+            Ok(Action::Click {
+                x,
+                y,
+                button,
+                double,
+            })
+        }
+        Action::DoubleClick { x, y, button } => {
+            let (x, y) = remap_optional_point(context, x, y)?;
+            Ok(Action::DoubleClick { x, y, button })
+        }
+        Action::Move { x, y } => {
+            let (x, y) = remap_point(context, x, y)?;
+            Ok(Action::Move { x, y })
+        }
+        Action::Scroll {
+            x,
+            y,
+            dx,
+            dy,
+            direction,
+            amount,
+        } => {
+            let (x, y) = remap_optional_point(context, x, y)?;
+            Ok(Action::Scroll {
+                x,
+                y,
+                dx,
+                dy,
+                direction,
+                amount,
+            })
+        }
+        Action::Screenshot {
+            output,
+            region,
+            format,
+            max_width,
+            canvas,
+            base64,
+        } => {
+            let region = match region {
+                Some(region) => Some(remap_region(context, region)?),
+                None => None,
+            };
+            Ok(Action::Screenshot {
+                output,
+                region,
+                format,
+                max_width,
+                canvas,
+                base64,
+            })
+        }
+        other => Ok(other),
+    }
+}
+
+fn remap_optional_point(
+    context: &CallContext,
+    x: Option<i32>,
+    y: Option<i32>,
+) -> Result<(Option<i32>, Option<i32>), ComputerError> {
+    match (x, y) {
+        (Some(x), Some(y)) => {
+            let (x, y) = remap_point(context, x, y)?;
+            Ok((Some(x), Some(y)))
+        }
+        other => Ok(other),
+    }
+}
+
+fn remap_point(context: &CallContext, x: i32, y: i32) -> Result<(i32, i32), ComputerError> {
+    let map = require_screenshot_map(context)?;
+    ensure_point_inside(&map, x, y)?;
+    let (screen_x, screen_y) = image_util::image_to_screen(&map, f64::from(x), f64::from(y));
+    Ok((round_screen(screen_x)?, round_screen(screen_y)?))
+}
+
+fn remap_region(context: &CallContext, region: Region) -> Result<Region, ComputerError> {
+    let map = require_screenshot_map(context)?;
+    ensure_region_inside(&map, region)?;
+    let x2 = i64::from(region.x) + i64::from(region.width);
+    let y2 = i64::from(region.y) + i64::from(region.height);
+    let (screen_x1, screen_y1) =
+        image_util::image_to_screen(&map, f64::from(region.x), f64::from(region.y));
+    let (screen_x2, screen_y2) = image_util::image_to_screen(&map, x2 as f64, y2 as f64);
+    let x = round_screen(screen_x1)?;
+    let y = round_screen(screen_y1)?;
+    let far_x = round_screen(screen_x2)?;
+    let far_y = round_screen(screen_y2)?;
+    let width = u32::try_from(i64::from(far_x) - i64::from(x))
+        .unwrap_or(0)
+        .max(1);
+    let height = u32::try_from(i64::from(far_y) - i64::from(y))
+        .unwrap_or(0)
+        .max(1);
+    Region::new(x, y, width, height)
+}
+
+fn require_screenshot_map(
+    context: &CallContext,
+) -> Result<image_util::ScreenshotMap, ComputerError> {
+    match cache::load_screenshot_map(context.session.as_deref())? {
+        Some(map) => Ok(map),
+        None => Err(ComputerError::InvalidArguments(
+            "take a screenshot first".into(),
+        )),
+    }
+}
+
+fn content_box(map: &image_util::ScreenshotMap) -> (i64, i64, i64, i64) {
+    let left = i64::from(map.pad.x);
+    let top = i64::from(map.pad.y);
+    let right = left + i64::from(map.content_width);
+    let bottom = top + i64::from(map.content_height);
+    (left, top, right, bottom)
+}
+
+fn ensure_point_inside(
+    map: &image_util::ScreenshotMap,
+    x: i32,
+    y: i32,
+) -> Result<(), ComputerError> {
+    let (left, top, right, bottom) = content_box(map);
+    let x = i64::from(x);
+    let y = i64::from(y);
+    if x < left || y < top || x >= right || y >= bottom {
+        return Err(ComputerError::InvalidArguments(format!(
+            "coordinate ({x}, {y}) is outside the screenshot"
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_region_inside(
+    map: &image_util::ScreenshotMap,
+    region: Region,
+) -> Result<(), ComputerError> {
+    let (left, top, right, bottom) = content_box(map);
+    let x1 = i64::from(region.x);
+    let y1 = i64::from(region.y);
+    let x2 = x1 + i64::from(region.width);
+    let y2 = y1 + i64::from(region.height);
+    if x1 < left || y1 < top || x1 >= right || y1 >= bottom || x2 > right || y2 > bottom {
+        return Err(ComputerError::InvalidArguments(format!(
+            "region {},{} {}x{} is outside the screenshot",
+            region.x, region.y, region.width, region.height
+        )));
+    }
+    Ok(())
+}
+
+fn round_screen(value: f64) -> Result<i32, ComputerError> {
+    if !value.is_finite() {
+        return Err(ComputerError::InvalidArguments(
+            "coordinate remap was not finite".into(),
+        ));
+    }
+    let rounded = value.round();
+    if rounded < f64::from(i32::MIN) || rounded > f64::from(i32::MAX) {
+        return Err(ComputerError::InvalidArguments(
+            "coordinate remap is out of range".into(),
+        ));
+    }
+    Ok(rounded as i32)
+}
+
+fn run_batch(
+    backend: &dyn DesktopBackend,
+    context: &CallContext,
+    actions: Vec<Value>,
+    stop_on_error: bool,
+) -> Response {
+    let mut results = Vec::with_capacity(actions.len());
+    let mut first_error: Option<(usize, ErrorBody)> = None;
+    for (index, step) in actions.into_iter().enumerate() {
+        let response = dispatch_batch_step(backend, context, step);
+        let failed = !response.ok;
+        if failed && first_error.is_none() {
+            if let Some(error) = response.error.clone() {
+                first_error = Some((index, error));
+            }
+        }
+        results.push(response.to_value());
+        if failed && stop_on_error {
+            return attach_post_state(
+                backend,
+                context,
+                PostKind::Mutating,
+                batch_response(results, Some(index), first_error),
+            );
+        }
+    }
+    attach_post_state(
+        backend,
+        context,
+        PostKind::Mutating,
+        batch_response(results, None, first_error),
+    )
+}
+
+fn dispatch_batch_step(
+    backend: &dyn DesktopBackend,
+    outer: &CallContext,
+    value: Value,
+) -> Response {
+    match prepare_batch_step(outer, value) {
+        Ok((action, context)) => dispatch_with_context(backend, action, &context),
+        Err(error) => Response::from_error(error),
+    }
+}
+
+fn prepare_batch_step(
+    outer: &CallContext,
+    mut value: Value,
+) -> Result<(Action, CallContext), ComputerError> {
+    let Some(object) = value.as_object_mut() else {
+        return Err(ComputerError::InvalidArguments(
+            "batch step must be a JSON object".into(),
+        ));
+    };
+    if object.get("action").and_then(Value::as_str) == Some("batch") {
+        return Err(ComputerError::InvalidArguments(
+            "nested batch is not allowed".into(),
+        ));
+    }
+    let mut context = outer.clone();
+    overlay_context(&mut context, object)?;
+    context.return_state = false;
+    context.include_screenshot = false;
+    let action = serde_json::from_value(value)
+        .map_err(|error| ComputerError::InvalidArguments(error.to_string()))?;
+    Ok((action, context))
+}
+
+fn overlay_context(
+    context: &mut CallContext,
+    object: &mut Map<String, Value>,
+) -> Result<(), ComputerError> {
+    if object.contains_key("app") {
+        context.app = take_stringish(object, "app")?;
+    }
+    if object.contains_key("window") {
+        context.window = take_stringish(object, "window")?;
+    }
+    if object.contains_key("element") {
+        context.element = take_optional_u32(object, "element")?;
+    }
+    if object.contains_key("diff") {
+        context.diff = take_bool(object, "diff")?;
+    }
+    if object.contains_key("full") {
+        context.full = take_bool(object, "full")?;
+    }
+    let _ = object.remove("return_state");
+    let _ = object.remove("include_screenshot");
+    let _ = object.remove("id");
+    let _ = object.remove("stop_on_error");
+    if object.contains_key("coord") {
+        context.coord = take_stringish(object, "coord")?;
+    }
+    if object.contains_key("session") {
+        context.session = take_stringish(object, "session")?;
+    }
+    if object.contains_key("tier") {
+        context.tier = take_stringish(object, "tier")?;
+    }
+    if object.contains_key("adapter") {
+        context.adapter = take_stringish(object, "adapter")?;
+    }
+    if object.contains_key("display") {
+        context.display = take_stringish(object, "display")?;
+    }
+    if object.contains_key("require_visible") {
+        context.require_visible = take_bool(object, "require_visible")?;
+    }
+    Ok(())
+}
+
+fn batch_response(
+    results: Vec<Value>,
+    stopped_at: Option<usize>,
+    first_error: Option<(usize, ErrorBody)>,
+) -> Response {
+    let mut fields = Map::new();
+    fields.insert("action".into(), json!("batch"));
+    fields.insert("results".into(), Value::Array(results));
+    if let Some(index) = stopped_at {
+        fields.insert("stopped_at".into(), json!(index));
+    }
+    match first_error {
+        Some((index, error)) => {
+            let mut response = Response::failure(
+                error.code,
+                format!("batch failed at action {index}: {}", error.message),
+            );
+            response.fields = fields;
+            response
+        }
+        None => Response {
+            ok: true,
+            id: None,
+            error: None,
+            fields,
+        },
+    }
+}
+
+fn attach_post_state(
+    backend: &dyn DesktopBackend,
+    context: &CallContext,
+    kind: PostKind,
+    mut response: Response,
+) -> Response {
+    if !context.return_state || matches!(kind, PostKind::ReadOnly) {
+        return response;
+    }
+    let mut warnings = Vec::new();
+    let mut state = match backend.tree(&tree_query(context)) {
+        Ok(report) => json!({
+            "app": report.app,
+            "pid": report.pid,
+            "window_id": report.window_id,
+            "revision": report.revision,
+            "tree": report.full_text,
+            "diff": report.diff,
+            "truncated": report.truncated,
+        }),
+        Err(error) => {
+            if !response.ok {
+                return response;
+            }
+            warnings.push(format!("tree snapshot failed: {error}"));
+            json!({
+                "app": null,
+                "pid": null,
+                "window_id": null,
+                "revision": null,
+                "tree": null,
+                "diff": null,
+                "truncated": null,
+            })
+        }
+    };
+    if context.include_screenshot {
+        let shot = if response.ok && matches!(kind, PostKind::Screenshot) {
+            Ok(Value::Object(response.fields.clone()))
+        } else if matches!(kind, PostKind::Screenshot) {
+            Err(ComputerError::ExecutionFailed(
+                response
+                    .error
+                    .as_ref()
+                    .map(|error| error.message.clone())
+                    .unwrap_or_else(|| "screenshot failed".into()),
+            ))
+        } else {
+            screenshot(
+                backend,
+                context,
+                ScreenshotArgs {
+                    output: None,
+                    region: None,
+                    format: None,
+                    max_width: None,
+                    canvas: None,
+                    include_base64: false,
+                },
+            )
+        };
+        match shot {
+            Ok(value) => state["screenshot"] = value,
+            Err(error) => {
+                state["screenshot"] = Value::Null;
+                warnings.push(format!("screenshot failed: {error}"));
+            }
+        }
+    }
+    response.fields.insert("state".into(), state);
+    push_warnings(&mut response, warnings);
+    response
+}
+
+fn push_warnings(response: &mut Response, extra: Vec<String>) {
+    if extra.is_empty() {
+        return;
+    }
+    let mut warnings = match response.fields.remove("warnings") {
+        Some(Value::Array(items)) => items,
+        Some(other) => vec![other],
+        None => Vec::new(),
+    };
+    for warning in extra {
+        warnings.push(json!(warning));
+    }
+    response
+        .fields
+        .insert("warnings".into(), Value::Array(warnings));
+}
+
+fn cursor_position(backend: &dyn DesktopBackend) -> Result<Value, ComputerError> {
+    let (x, y) = backend.cursor_position()?;
+    Ok(json!({"action": "cursor_position", "x": x, "y": y}))
+}
+
+fn session_prune(dry_run: bool, ttl_secs: Option<u64>) -> Result<Value, ComputerError> {
+    let ttl = match ttl_secs {
+        Some(seconds) => Duration::from_secs(seconds),
+        None => cache::DEFAULT_SESSION_TTL,
+    };
+    let report = cache::prune_sessions(
+        &cache::sessions_root(),
+        &cache::PruneOptions {
+            dry_run,
+            ttl,
+            now: SystemTime::now(),
+        },
+        &cache::pid_alive,
+    )?;
+    Ok(json!({
+        "action": "session_prune",
+        "dry_run": dry_run,
+        "ttl_secs": ttl.as_secs(),
+        "removed": report.removed,
+        "kept": report.kept,
+    }))
 }
 
 struct ScreenshotArgs {
@@ -488,6 +1095,9 @@ fn screenshot(
         .map(image_util::parse_canvas)
         .transpose()?;
     let raw = if context.app.is_some() || context.window.is_some() {
+        if let Some(error) = backend.display_block() {
+            return Err(error);
+        }
         let target = resolve_screenshot_window(backend, context)?;
         backend.capture_window(&target)?
     } else {
@@ -915,10 +1525,14 @@ fn session_end(
     context: &CallContext,
 ) -> Result<Value, ComputerError> {
     let restored = backend.end_session(context.session.as_deref())?;
-    Ok(json!({
+    let mut body = json!({
         "action": "session_end",
         "restored": restored,
-    }))
+    });
+    if let Err(error) = cache::prune_empty_sessions() {
+        body["warnings"] = json!([format!("session prune failed: {error}")]);
+    }
+    Ok(body)
 }
 
 fn list_apps(backend: &dyn DesktopBackend, all: bool) -> Result<Value, ComputerError> {
@@ -1357,7 +1971,7 @@ mod tests {
         assert_eq!(response.to_value()["cursor"]["x"], 4);
         assert!(response.ok);
 
-        let _cache = crate::cache::CACHE_ENV_LOCK.lock().unwrap();
+        let _cache = crate::cache::CacheEnv::acquire();
         let shot = dispatch_with(
             &backend,
             Action::Screenshot {
@@ -1432,7 +2046,7 @@ mod tests {
 
     #[test]
     fn dispatch_applies_default_max_width_and_keeps_explicit_zero() {
-        let _cache = crate::cache::CACHE_ENV_LOCK.lock().unwrap();
+        let _cache = crate::cache::CacheEnv::acquire();
         let backend = StubBackend {
             capture_pixels: Some((1600, 1000)),
             ..StubBackend::default()
@@ -1482,7 +2096,7 @@ mod tests {
 
     #[test]
     fn dispatch_window_capture_records_origin_and_faults() {
-        let _cache = crate::cache::CACHE_ENV_LOCK.lock().unwrap();
+        let _cache = crate::cache::CacheEnv::acquire();
         let backend = StubBackend::default();
         let response = dispatch_with_context(
             &backend,
@@ -1557,6 +2171,25 @@ mod tests {
             },
         );
         assert_eq!(both.to_value()["error"]["code"], "invalid_arguments");
+
+        let locked = StubBackend {
+            block_display: true,
+            windows: Vec::new(),
+            ..StubBackend::default()
+        };
+        let response = dispatch_with_context(
+            &locked,
+            shot(Some(0), None),
+            &CallContext {
+                app: Some("Notes".into()),
+                ..CallContext::default()
+            },
+        );
+        assert_eq!(response.to_value()["error"]["code"], "display_unavailable");
+        assert!(response.to_value()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("locked"));
     }
 
     #[test]
@@ -1710,6 +2343,7 @@ mod tests {
         let after = dispatch_with_context(&backend, Action::Tree, &ctx("Notes"));
         assert_eq!(after.to_value()["tree"].as_str().unwrap(), "");
 
+        let _cache = crate::cache::CacheEnv::acquire();
         let ended = dispatch_with(&backend, Action::SessionEnd);
         assert!(ended.ok, "{ended:?}");
         assert_eq!(ended.to_value()["action"], "session_end");
@@ -1965,5 +2599,338 @@ mod tests {
             text.contains("~ [1] AXTextArea value: \"a\" -> \"ab\""),
             "{text}"
         );
+    }
+
+    fn sample_map() -> crate::image_util::ScreenshotMap {
+        crate::image_util::ScreenshotMap {
+            width: 1440,
+            height: 900,
+            scale: 2.0,
+            logical_width: 800,
+            logical_height: 500,
+            origin: crate::image_util::MapPoint { x: 120, y: 40 },
+            fit: "width".into(),
+            pad: crate::image_util::MapPoint { x: 0, y: 0 },
+            content_width: 1440,
+            content_height: 900,
+            map: crate::image_util::MapFormulas {
+                image_to_screen:
+                    "screen = origin + (image - pad) * logical_size / image_content_size".into(),
+                screen_to_image:
+                    "image = pad + (screen - origin) * image_content_size / logical_size".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn image_coordinate_on_a_stored_map_becomes_the_screen_point() {
+        let cache = crate::cache::CacheEnv::acquire();
+        assert!(cache.dir().is_dir());
+        let map = sample_map();
+        cache::store_screenshot_map(Some("p5-map"), &map).unwrap();
+        let backend = StubBackend::default();
+        let context = CallContext {
+            coord: Some("image".into()),
+            session: Some("p5-map".into()),
+            ..CallContext::default()
+        };
+        let response = dispatch_with_context(&backend, Action::Move { x: 100, y: 50 }, &context);
+        assert!(response.ok, "{response:?}");
+        let (screen_x, screen_y) = image_util::image_to_screen(&map, 100.0, 50.0);
+        let value = response.to_value();
+        assert_eq!(value["x"], json!(screen_x.round() as i64));
+        assert_eq!(value["y"], json!(screen_y.round() as i64));
+        assert_eq!(value["x"], 176);
+        assert_eq!(value["y"], 68);
+        assert_eq!(backend.moves.load(Ordering::SeqCst), 1);
+
+        let outside = dispatch_with_context(&backend, Action::Move { x: 1440, y: 50 }, &context);
+        assert_eq!(outside.to_value()["error"]["code"], "invalid_arguments");
+        assert!(outside.to_value()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("outside"));
+        assert_eq!(backend.moves.load(Ordering::SeqCst), 1);
+
+        let missing = dispatch_with_context(
+            &backend,
+            Action::Move { x: 1, y: 2 },
+            &CallContext {
+                coord: Some("image".into()),
+                session: Some("no-map".into()),
+                ..CallContext::default()
+            },
+        );
+        assert_eq!(missing.to_value()["error"]["code"], "invalid_arguments");
+        assert!(missing.to_value()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("take a screenshot first"));
+
+        let action =
+            crate::adapters::translate("openai", &json!({"type": "move", "x": 100, "y": 50}))
+                .unwrap();
+        let adapted = dispatch_with_context(
+            &backend,
+            action,
+            &CallContext {
+                coord: Some("image".into()),
+                session: Some("p5-map".into()),
+                adapter: Some("openai".into()),
+                ..CallContext::default()
+            },
+        );
+        assert!(adapted.ok, "{adapted:?}");
+        assert_eq!(adapted.to_value()["adapter"], "openai");
+        assert_eq!(adapted.to_value()["x"], 176);
+        assert_eq!(adapted.to_value()["y"], 68);
+        assert!(adapted.to_value().get("state").is_none());
+
+        let missing_adapter = handle_request_line_with(
+            r#"{"adapter":"anthropic","action":"mouse_move","coordinate":[1,2],"session":"no-map"}"#,
+            None,
+        );
+        assert!(!missing_adapter.ok);
+        assert_eq!(
+            missing_adapter.to_value()["error"]["code"],
+            "invalid_arguments"
+        );
+        assert!(missing_adapter.to_value()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("take a screenshot first"));
+        assert_eq!(missing_adapter.to_value()["adapter"], "anthropic");
+
+        let waited = handle_request_line_with(r#"{"adapter":"openai","type":"wait"}"#, None);
+        assert!(waited.ok, "{waited:?}");
+        assert_eq!(waited.to_value()["adapter"], "openai");
+        assert_eq!(waited.to_value()["waited_ms"], 0);
+    }
+
+    #[test]
+    fn return_state_includes_the_numbered_tree_and_ignores_read_only() {
+        let backend = StubBackend::default();
+        let before = backend.accessibility_apps.lock().unwrap().len();
+        let response = dispatch_with_context(
+            &backend,
+            Action::Click {
+                x: Some(3),
+                y: Some(4),
+                button: MouseButton::Left,
+                double: false,
+            },
+            &CallContext {
+                app: Some("Notes".into()),
+                return_state: true,
+                ..CallContext::default()
+            },
+        );
+        assert!(response.ok, "{response:?}");
+        let value = response.to_value();
+        assert_eq!(value["action"], "click");
+        let tree = value["state"]["tree"].as_str().unwrap();
+        assert!(tree.contains("[0] AXWindow"), "{tree}");
+        assert!(tree.contains("AXTextArea"), "{tree}");
+        assert!(value["state"]["diff"].is_null());
+        assert_eq!(value["state"]["app"], "com.apple.Notes");
+        assert_eq!(value["state"]["pid"], 10);
+        assert_eq!(value["state"]["window_id"], 100);
+        assert!(value.get("warnings").is_none());
+        assert!(backend.accessibility_apps.lock().unwrap().len() > before);
+
+        let displays = dispatch_with_context(
+            &backend,
+            Action::Displays,
+            &CallContext {
+                return_state: true,
+                include_screenshot: true,
+                ..CallContext::default()
+            },
+        );
+        assert!(displays.ok, "{displays:?}");
+        assert!(displays.to_value().get("state").is_none());
+
+        let cursor = dispatch_with(&backend, Action::CursorPosition);
+        assert_eq!(cursor.to_value()["x"], 4);
+        assert_eq!(cursor.to_value()["y"], 5);
+        assert!(cursor.to_value().get("adapter").is_none());
+    }
+
+    #[test]
+    fn return_state_refreshes_the_tree_diff_baseline() {
+        let backend = StubBackend::default();
+        let first = dispatch_with_context(&backend, Action::Tree, &ctx("Notes"));
+        assert!(first.ok, "{first:?}");
+        *backend.stub_value.lock().unwrap() = "ab".into();
+        let mut context = element_context(0);
+        context.return_state = true;
+        let response = dispatch_with_context(&backend, Action::Focus, &context);
+        assert!(response.ok, "{response:?}");
+        let value = response.to_value();
+        let diff = value["state"]["diff"].as_str().unwrap();
+        assert!(
+            diff.contains("~ [1] AXTextArea value: \"a\" -> \"ab\""),
+            "{diff}"
+        );
+        assert!(value["state"]["tree"]
+            .as_str()
+            .unwrap()
+            .contains("value=\"ab\""));
+        *backend.stub_value.lock().unwrap() = "abc".into();
+        let next = dispatch_with_context(&backend, Action::Tree, &ctx("Notes"));
+        let value = next.to_value();
+        let text = value["tree"].as_str().unwrap();
+        assert!(
+            text.contains("~ [1] AXTextArea value: \"ab\" -> \"abc\""),
+            "{text}"
+        );
+        assert!(!text.contains("\"a\" -> \"abc\""), "{text}");
+    }
+
+    #[test]
+    fn include_screenshot_failure_keeps_the_action_result() {
+        let backend = StubBackend {
+            capture_fault: crate::test_backend::StubCaptureFault::Permission,
+            ..StubBackend::default()
+        };
+        let response = dispatch_with_context(
+            &backend,
+            Action::Click {
+                x: Some(1),
+                y: Some(2),
+                button: MouseButton::Left,
+                double: false,
+            },
+            &CallContext {
+                app: Some("Notes".into()),
+                return_state: true,
+                include_screenshot: true,
+                ..CallContext::default()
+            },
+        );
+        assert!(response.ok, "{response:?}");
+        let value = response.to_value();
+        assert_eq!(value["action"], "click");
+        assert_eq!(value["x"], 1);
+        assert_eq!(value["y"], 2);
+        assert!(value["state"]["tree"]
+            .as_str()
+            .unwrap()
+            .contains("AXWindow"));
+        assert!(value["state"]["screenshot"].is_null());
+        let warnings = value["warnings"].as_array().unwrap();
+        assert!(warnings
+            .iter()
+            .any(|item| { item.as_str().unwrap().contains("screenshot failed") }));
+        assert_eq!(backend.clicks.load(Ordering::SeqCst), 1);
+    }
+
+    fn batch_clicks(stop_on_error: bool) -> Value {
+        json!({
+            "action": "batch",
+            "stop_on_error": stop_on_error,
+            "actions": [
+                {"action": "click", "x": 1, "y": 2},
+                {"action": "click", "x": 3, "y": 4}
+            ]
+        })
+    }
+
+    #[test]
+    fn batch_stop_on_error_controls_the_second_attempt() {
+        let stopped = StubBackend {
+            fail_click: true,
+            ..StubBackend::default()
+        };
+        let request = parse_request(batch_clicks(true)).unwrap();
+        let response = dispatch_with_context(&stopped, request.action, &request.context);
+        assert!(!response.ok);
+        let value = response.to_value();
+        assert_eq!(value["error"]["code"], "execution_failed");
+        assert_eq!(value["stopped_at"], 0);
+        assert_eq!(value["results"].as_array().unwrap().len(), 1);
+        assert!(!value["results"][0]["ok"].as_bool().unwrap());
+        assert_eq!(stopped.click_attempts.load(Ordering::SeqCst), 1);
+        assert!(value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("batch failed at action 0"));
+
+        let both = StubBackend {
+            fail_click: true,
+            ..StubBackend::default()
+        };
+        let request = parse_request(batch_clicks(false)).unwrap();
+        let response = dispatch_with_context(&both, request.action, &request.context);
+        assert!(!response.ok);
+        let value = response.to_value();
+        assert!(value.get("stopped_at").is_none(), "{value}");
+        assert_eq!(value["results"].as_array().unwrap().len(), 2);
+        assert!(!value["results"][1]["ok"].as_bool().unwrap());
+        assert_eq!(both.click_attempts.load(Ordering::SeqCst), 2);
+
+        let nested = parse_request(json!({
+            "action": "batch",
+            "actions": [{"action": "batch", "actions": []}]
+        }))
+        .unwrap();
+        let response = dispatch_with(&StubBackend::default(), nested.action);
+        assert_eq!(response.to_value()["error"]["code"], "invalid_arguments");
+        assert_eq!(response.to_value()["stopped_at"], 0);
+        assert!(response.to_value()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("nested batch"));
+
+        let backend = StubBackend::default();
+        backend.seed_element(notes_button());
+        let request = parse_request(json!({
+            "action": "batch",
+            "app": "Notes",
+            "actions": [
+                {"action": "press", "element": 1},
+                {"action": "focus", "element": 1}
+            ]
+        }))
+        .unwrap();
+        assert!(matches!(
+            request.action,
+            Action::Batch {
+                stop_on_error: true,
+                ..
+            }
+        ));
+        let response = dispatch_with_context(&backend, request.action, &request.context);
+        assert!(response.ok, "{response:?}");
+        let results = response.to_value()["results"].clone();
+        assert_eq!(results[0]["action"], "press");
+        assert_eq!(results[0]["element"], 1);
+        assert_eq!(results[1]["action"], "focus");
+        assert!(response.to_value().get("state").is_none());
+    }
+
+    #[test]
+    fn session_prune_action_removes_an_empty_temp_session() {
+        let _cache = crate::cache::CacheEnv::acquire();
+        let dir = cache::session_dir(Some("empty-session")).unwrap();
+        assert!(dir.join("owner.json").is_file());
+        let response = dispatch(Action::SessionPrune {
+            dry_run: true,
+            ttl_secs: Some(0),
+        });
+        assert!(response.ok, "{response:?}");
+        assert_eq!(response.to_value()["dry_run"], true);
+        assert!(response.to_value()["removed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|name| name == "empty-session"));
+        assert!(dir.exists());
+        let response = dispatch(Action::SessionPrune {
+            dry_run: false,
+            ttl_secs: Some(0),
+        });
+        assert!(response.ok, "{response:?}");
+        assert!(!dir.exists());
     }
 }

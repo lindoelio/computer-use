@@ -1,0 +1,9 @@
+{
+  "request": {
+    "type": "wait"
+  },
+  "expect": {
+    "action": "wait",
+    "ms": 0
+  }
+}

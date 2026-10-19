@@ -1,0 +1,16 @@
+{
+  "request": {
+    "type": "scroll",
+    "x": 10,
+    "y": 20,
+    "scroll_x": 1,
+    "scroll_y": -2
+  },
+  "expect": {
+    "action": "scroll",
+    "x": 10,
+    "y": 20,
+    "dx": 1,
+    "dy": -2
+  }
+}

@@ -86,9 +86,14 @@ objc2-core-graphics = { version = "0.3.2", default-features = false, features = 
     "CGBitmapContext",
     "CGColorSpace",
     "CGContext",
+    "CGDirectDisplay",
+    "CGDisplayConfiguration",
+    "CGError",
     "CGGeometry",
     "CGImage",
+    "CGSession",
     "CGWindow",
+    "libc",
 ] }
 objc2-core-media = { version = "0.3.2", default-features = false, features = [
     "CMSampleBuffer",

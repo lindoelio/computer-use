@@ -1,0 +1,8 @@
+{
+  "request": {
+    "action": "cursor_position"
+  },
+  "expect": {
+    "action": "cursor_position"
+  }
+}

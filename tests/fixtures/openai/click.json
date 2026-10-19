@@ -1,0 +1,14 @@
+{
+  "request": {
+    "type": "click",
+    "x": 10,
+    "y": 20,
+    "button": "left"
+  },
+  "expect": {
+    "action": "click",
+    "x": 10,
+    "y": 20,
+    "button": "left"
+  }
+}

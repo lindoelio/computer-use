@@ -11,6 +11,7 @@ mod capture;
 mod doctor;
 
 pub(crate) use apps::{activate, launch, list_apps, list_windows, quit};
+pub(crate) use capture::session_display_block;
 pub(crate) use doctor::doctor;
 
 use crate::tree::{TreeQuery, TreeReport};

@@ -1,0 +1,15 @@
+{
+  "request": {
+    "action": "left_click",
+    "coordinate": [
+      10,
+      20
+    ]
+  },
+  "expect": {
+    "action": "click",
+    "x": 10,
+    "y": 20,
+    "button": "left"
+  }
+}

@@ -12,8 +12,8 @@ use std::process::ExitCode;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use computer_use::{
-    handle_request_line, parse_region, Action, CallContext, ImageFormat, MouseButton, Response,
-    ScrollDirection,
+    handle_request_line_with, parse_region, Action, CallContext, ImageFormat, MouseButton,
+    Response, ScrollDirection,
 };
 
 /// Cross-platform desktop automation for agents.
@@ -65,6 +65,22 @@ struct Cli {
     #[arg(long, global = true, value_name = "ID")]
     session: Option<String>,
 
+    /// Attach the post-action accessibility tree.
+    #[arg(long = "state", global = true)]
+    state: bool,
+
+    /// With `--state`, also attach a screenshot. A window target captures that window.
+    #[arg(long = "screenshot", global = true)]
+    include_screenshot: bool,
+
+    /// How to read `x` and `y`: `screen` points or `image` pixels of the last screenshot.
+    #[arg(long, global = true, value_name = "screen|image")]
+    coord: Option<String>,
+
+    /// Schema translator for `exec`, `serve`, and `--json`.
+    #[arg(long, global = true, value_name = "native|openai|anthropic")]
+    adapter: Option<String>,
+
     #[command(subcommand)]
     command: Option<CliCommand>,
 }
@@ -73,6 +89,20 @@ struct Cli {
 enum SessionCommand {
     /// Restore Electron accessibility flags this process changed and stop observers.
     End,
+    /// Remove empty session directories and stale ones.
+    ///
+    /// An empty directory has no snapshot and no screenshot map. It is removed
+    /// even when its owner pid is alive. Content is kept while that pid is
+    /// alive. Content whose owner is dead or unknown is removed after `--ttl`
+    /// seconds (default 24 hours).
+    Prune {
+        /// Report matches without deleting them.
+        #[arg(long)]
+        dry_run: bool,
+        /// Age in seconds after which a dead owner's session is stale.
+        #[arg(long, default_value_t = 86_400)]
+        ttl: u64,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -447,12 +477,12 @@ fn run() -> u8 {
 
     match (&cli.command, cli.json) {
         (Some(CliCommand::Exec { json }), _) => {
-            let response = handle_request_line(json);
+            let response = handle_request_line_with(json, cli.adapter.as_deref());
             let code = u8::from(!response.ok);
             emit(&response, cli.pretty);
             code
         }
-        (Some(CliCommand::Serve), _) | (None, true) => serve(),
+        (Some(CliCommand::Serve), _) | (None, true) => serve(cli.adapter.as_deref()),
         (Some(_), true) => {
             emit(
                 &Response::failure(
@@ -470,6 +500,10 @@ fn run() -> u8 {
             2
         }
         (Some(command), false) => {
+            if let Some(response) = reject_non_native_adapter(cli.adapter.as_deref()) {
+                emit(&response, cli.pretty);
+                return 1;
+            }
             let context = CallContext {
                 app: cli.app.clone(),
                 window: cli.window.clone(),
@@ -478,6 +512,9 @@ fn run() -> u8 {
                 full: cli.full,
                 session: cli.session.clone(),
                 require_visible: cli.require_visible,
+                return_state: cli.state,
+                include_screenshot: cli.include_screenshot,
+                coord: cli.coord.clone(),
                 ..CallContext::default()
             };
             match command_action(command, context) {
@@ -620,6 +657,10 @@ fn command_action(
         CliCommand::Tree => Action::Tree,
         CliCommand::Session { command } => match command {
             SessionCommand::End => Action::SessionEnd,
+            SessionCommand::Prune { dry_run, ttl } => Action::SessionPrune {
+                dry_run: *dry_run,
+                ttl_secs: Some(*ttl),
+            },
         },
         CliCommand::Serve | CliCommand::Exec { .. } => {
             return Err(Response::failure(
@@ -638,7 +679,21 @@ fn emit_action(action: Action, context: &CallContext, pretty: bool) -> u8 {
     code
 }
 
-fn serve() -> u8 {
+fn reject_non_native_adapter(adapter: Option<&str>) -> Option<Response> {
+    match adapter {
+        None | Some("native") => None,
+        Some(name @ ("openai" | "anthropic")) => Some(Response::failure(
+            "invalid_arguments",
+            format!("--adapter {name} applies to exec, serve, and --json"),
+        )),
+        Some(other) => Some(Response::failure(
+            "invalid_arguments",
+            format!("unknown adapter {other:?}"),
+        )),
+    }
+}
+
+fn serve(cli_adapter: Option<&str>) -> u8 {
     let stdin = io::stdin();
     let mut lines = stdin.lock().lines();
     let stdout = io::stdout();
@@ -657,7 +712,7 @@ fn serve() -> u8 {
         if line.trim().is_empty() {
             continue;
         }
-        let response = handle_request_line(&line);
+        let response = handle_request_line_with(&line, cli_adapter);
         if write!(out, "{}", response.to_json_line(false)).is_err() || out.flush().is_err() {
             return 1;
         }

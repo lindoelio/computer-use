@@ -1,0 +1,11 @@
+{
+  "request": {
+    "action": "left_mouse_down",
+    "coordinate": [
+      1,
+      2
+    ]
+  },
+  "error_code": "unsupported",
+  "error_contains": "P8"
+}

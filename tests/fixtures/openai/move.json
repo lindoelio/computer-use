@@ -1,0 +1,12 @@
+{
+  "request": {
+    "type": "move",
+    "x": 8,
+    "y": 9
+  },
+  "expect": {
+    "action": "move",
+    "x": 8,
+    "y": 9
+  }
+}

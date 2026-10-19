@@ -1,0 +1,15 @@
+{
+  "request": {
+    "action": "left_click_drag",
+    "start_coordinate": [
+      0,
+      0
+    ],
+    "coordinate": [
+      10,
+      10
+    ]
+  },
+  "error_code": "unsupported",
+  "error_contains": "P8"
+}

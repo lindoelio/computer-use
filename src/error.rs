@@ -65,6 +65,10 @@ pub enum ComputerError {
     /// Chrome DevTools is not enabled or no debugging port is open.
     #[error("cdp unavailable: {0}")]
     CdpUnavailable(String),
+
+    /// The screen is locked, asleep, or no display is attached.
+    #[error("display unavailable: {0}")]
+    DisplayUnavailable(String),
 }
 
 impl ComputerError {
@@ -86,6 +90,7 @@ impl ComputerError {
             Self::BlockedUrl(_) => "blocked_url",
             Self::Paused(_) => "paused",
             Self::CdpUnavailable(_) => "cdp_unavailable",
+            Self::DisplayUnavailable(_) => "display_unavailable",
         }
     }
 }
@@ -162,5 +167,8 @@ mod tests {
             ComputerError::CdpUnavailable("feature off".into()).code(),
             "cdp_unavailable"
         );
+        let err = ComputerError::DisplayUnavailable("the screen is locked".into());
+        assert_eq!(err.code(), "display_unavailable");
+        assert_eq!(err.to_string(), "display unavailable: the screen is locked");
     }
 }

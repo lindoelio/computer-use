@@ -57,9 +57,49 @@ pub(crate) fn classify_sck_error(domain: &str, code: i64, message: &str) -> Capt
 }
 
 /// True when neither shareable-content query contained the CG window id.
-#[cfg(any(test, target_os = "macos"))]
-pub(crate) fn window_absent(on_screen_found: bool, off_screen_found: bool) -> bool {
+#[cfg(test)]
+fn window_absent(on_screen_found: bool, off_screen_found: bool) -> bool {
     !on_screen_found && !off_screen_found
+}
+
+/// Facts a capture path can observe. Tests pass fakes; macOS fills them from CoreGraphics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DisplayFacts {
+    /// `CGSSessionScreenIsLocked` was true.
+    pub screen_locked: bool,
+    /// An active display reported `CGDisplayIsAsleep`.
+    pub display_asleep: bool,
+    /// Displays reported by the capture API. `None` means the caller did not ask.
+    pub display_count: Option<usize>,
+    /// Windows ScreenCaptureKit returned. `None` means the caller did not ask.
+    pub shareable_window_count: Option<usize>,
+}
+
+/// Why capture cannot run, checked before `window_not_found`.
+pub(crate) fn display_block_reason(facts: DisplayFacts) -> Option<&'static str> {
+    if facts.screen_locked {
+        return Some("the screen is locked");
+    }
+    if facts.display_asleep {
+        return Some("the display is asleep");
+    }
+    if facts.display_count == Some(0) {
+        return Some("no display available");
+    }
+    if facts.shareable_window_count == Some(0) {
+        return Some("ScreenCaptureKit returned no windows");
+    }
+    None
+}
+
+/// `display_unavailable` when the screen cannot be captured, otherwise `window_not_found`.
+pub(crate) fn error_for_missing_window(facts: DisplayFacts, window_id: u32) -> ComputerError {
+    if let Some(reason) = display_block_reason(facts) {
+        return ComputerError::DisplayUnavailable(reason.into());
+    }
+    ComputerError::WindowNotFound(format!(
+        "cg window {window_id} is not in SCShareableContent"
+    ))
 }
 
 /// Integer point stored on the screenshot map.
@@ -682,6 +722,60 @@ mod tests {
         assert!(window_absent(false, false));
         assert!(!window_absent(true, false));
         assert!(!window_absent(false, true));
+    }
+
+    #[test]
+    fn display_facts_map_before_window_not_found() {
+        let clear = DisplayFacts {
+            screen_locked: false,
+            display_asleep: false,
+            display_count: Some(1),
+            shareable_window_count: Some(2),
+        };
+        assert!(display_block_reason(clear).is_none());
+        let missing = error_for_missing_window(clear, 42);
+        assert_eq!(missing.code(), "window_not_found");
+        assert!(missing.to_string().contains("42"));
+
+        let locked = DisplayFacts {
+            screen_locked: true,
+            ..clear
+        };
+        let error = error_for_missing_window(locked, 42);
+        assert_eq!(error.code(), "display_unavailable");
+        assert!(error.to_string().contains("locked"));
+
+        let asleep = DisplayFacts {
+            display_asleep: true,
+            display_count: Some(0),
+            shareable_window_count: Some(0),
+            ..clear
+        };
+        assert_eq!(
+            error_for_missing_window(asleep, 7).code(),
+            "display_unavailable"
+        );
+        assert!(error_for_missing_window(asleep, 7)
+            .to_string()
+            .contains("asleep"));
+
+        let no_display = DisplayFacts {
+            display_count: Some(0),
+            shareable_window_count: None,
+            ..clear
+        };
+        assert_eq!(
+            display_block_reason(no_display),
+            Some("no display available")
+        );
+
+        let no_windows = DisplayFacts {
+            shareable_window_count: Some(0),
+            ..clear
+        };
+        let error = error_for_missing_window(no_windows, 9);
+        assert_eq!(error.code(), "display_unavailable");
+        assert!(error.to_string().contains("no windows"));
     }
 
     #[test]

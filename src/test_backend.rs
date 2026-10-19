@@ -61,6 +61,8 @@ pub struct StubBackend {
     pub fail_scroll: bool,
     /// Coordinate hit-test returns an error. The click still runs.
     pub fail_hit: bool,
+    /// Click attempts, including ones [`Self::fail_click`] rejects.
+    pub click_attempts: AtomicU32,
     /// Role and title returned by [`DesktopBackend::hit_test`].
     pub hit: Mutex<Option<HitInfo>>,
     /// Actions the stub performed, as `(name, element index)`.
@@ -73,6 +75,8 @@ pub struct StubBackend {
     pub capture_pixels: Option<(u32, u32)>,
     /// Window-capture fault. Desktop capture ignores it.
     pub capture_fault: StubCaptureFault,
+    /// When true, screenshot reports `display_unavailable` before it resolves a window.
+    pub block_display: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -112,17 +116,29 @@ impl Default for StubBackend {
             char_count: None,
             fail_scroll: false,
             fail_hit: false,
+            click_attempts: AtomicU32::new(0),
             hit: Mutex::new(None),
             performs: Mutex::new(Vec::new()),
             element_fixtures: Mutex::new(HashMap::new()),
             live_override: Mutex::new(None),
             capture_pixels: None,
             capture_fault: StubCaptureFault::None,
+            block_display: false,
         }
     }
 }
 
 impl DesktopBackend for StubBackend {
+    fn display_block(&self) -> Option<ComputerError> {
+        if self.block_display {
+            Some(ComputerError::DisplayUnavailable(
+                "the screen is locked".into(),
+            ))
+        } else {
+            None
+        }
+    }
+
     fn screenshot(&self, _region: Option<Region>) -> Result<Frame, ComputerError> {
         if let Some((width, height)) = self.capture_pixels {
             let pixels = usize::try_from(width)
@@ -208,6 +224,7 @@ impl DesktopBackend for StubBackend {
     }
 
     fn simulate_click(&self, _x: i32, _y: i32, _button: MouseButton) -> Result<(), ComputerError> {
+        self.click_attempts.fetch_add(1, Ordering::SeqCst);
         if self.fail_click {
             return Err(ComputerError::ExecutionFailed("click failed".into()));
         }
@@ -403,8 +420,12 @@ impl DesktopBackend for StubBackend {
         );
         let mut baselines = self.baselines.lock().expect("baselines");
         let previous = baselines.get(&key).cloned();
+        let diff = previous
+            .as_ref()
+            .map(|previous| tree::diff_trees(previous, &rendered.root));
         let printed = tree::choose_text(previous.as_ref(), &rendered, query.full);
         baselines.insert(key, rendered.root.clone());
+        let app = info.bundle_id.clone().or_else(|| Some(info.name.clone()));
         Ok(TreeReport {
             pid,
             window_id,
@@ -412,6 +433,9 @@ impl DesktopBackend for StubBackend {
             source: "stub".into(),
             truncated: rendered.truncated,
             tree: printed,
+            full_text: rendered.text,
+            diff,
+            app,
             note: None,
             legacy: None,
         })

@@ -1,0 +1,10 @@
+{
+  "request": {
+    "type": "type",
+    "text": "hello"
+  },
+  "expect": {
+    "action": "type",
+    "text": "hello"
+  }
+}

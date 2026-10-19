@@ -1,0 +1,10 @@
+{
+  "request": {
+    "action": "key",
+    "text": "ctrl+s"
+  },
+  "expect": {
+    "action": "key",
+    "keys": "ctrl+s"
+  }
+}

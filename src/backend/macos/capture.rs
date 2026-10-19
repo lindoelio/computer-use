@@ -23,10 +23,13 @@ use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, AnyThread, DefinedClass, MainThreadMarker};
 use objc2_app_kit::NSScreen;
 use objc2_core_foundation::{
-    kCFRunLoopDefaultMode, CFRetained, CFRunLoop, CGFloat, CGPoint, CGRect, CGSize,
+    kCFBooleanTrue, kCFRunLoopDefaultMode, CFBoolean, CFDictionary, CFRetained, CFRunLoop,
+    CFString, CGFloat, CGPoint, CGRect, CGSize,
 };
 use objc2_core_graphics::{
-    CGBitmapContextCreate, CGColorSpace, CGContext, CGImage, CGPreflightScreenCaptureAccess,
+    CGBitmapContextCreate, CGColorSpace, CGContext, CGDisplayIsAsleep, CGError,
+    CGGetActiveDisplayList, CGImage, CGPreflightScreenCaptureAccess,
+    CGSessionCopyCurrentDictionary,
 };
 use objc2_core_media::CMSampleBuffer;
 use objc2_foundation::{NSError, NSObject, NSObjectProtocol, NSProcessInfo};
@@ -38,7 +41,9 @@ use objc2_screen_capture_kit::{
 use super::ax;
 use crate::backend::WindowTarget;
 use crate::error::ComputerError;
-use crate::image_util::{self, classify_sck_error, CaptureFault, Layer};
+use crate::image_util::{
+    self, classify_sck_error, error_for_missing_window, CaptureFault, DisplayFacts, Layer,
+};
 use crate::tree::NodeFrame;
 use crate::types::{Frame, RawCapture};
 
@@ -56,6 +61,9 @@ pub(crate) fn capture_window(target: &WindowTarget) -> Result<RawCapture, Comput
     }
     if !CGPreflightScreenCaptureAccess() {
         return Err(ComputerError::PermissionRequired(SCREEN_RECORDING.into()));
+    }
+    if let Some(error) = session_display_block() {
+        return Err(error);
     }
     match capture_sck(target) {
         Ok(raw) => Ok(raw),
@@ -157,14 +165,12 @@ fn shareable_with_window(
     match shareable(false) {
         Ok(content) => {
             let windows = sc_windows(&content);
-            let off_screen_found = windows.iter().any(|window| window_id(window) == id);
-            if off_screen_found {
+            if windows.iter().any(|window| window_id(window) == id) {
                 return Ok((content, windows));
             }
-            if first_ok && image_util::window_absent(false, off_screen_found) {
-                return Err(ComputerError::WindowNotFound(format!(
-                    "cg window {id} is not in SCShareableContent"
-                )));
+            let facts = probe_facts(sc_display_count(&content), windows.len());
+            if first_ok || image_util::display_block_reason(facts).is_some() {
+                return Err(error_for_missing_window(facts, id));
             }
             Err(ComputerError::ExecutionFailed(format!(
                 "cg window {id} was not listed and a shareable-content query failed"
@@ -172,6 +178,66 @@ fn shareable_with_window(
         }
         Err(error) => Err(error),
     }
+}
+
+/// Locked, asleep, or a caller-supplied empty display list. Does not look at windows.
+pub(crate) fn session_display_block() -> Option<ComputerError> {
+    let facts = DisplayFacts {
+        screen_locked: session_screen_locked(),
+        display_asleep: any_display_asleep(),
+        display_count: None,
+        shareable_window_count: None,
+    };
+    image_util::display_block_reason(facts)
+        .map(|reason| ComputerError::DisplayUnavailable(reason.into()))
+}
+
+fn probe_facts(display_count: usize, window_count: usize) -> DisplayFacts {
+    DisplayFacts {
+        screen_locked: session_screen_locked(),
+        display_asleep: any_display_asleep(),
+        display_count: Some(display_count),
+        shareable_window_count: Some(window_count),
+    }
+}
+
+fn session_screen_locked() -> bool {
+    let Some(dict) = CGSessionCopyCurrentDictionary() else {
+        return false;
+    };
+    let key = CFString::from_str("CGSSessionScreenIsLocked");
+    // SAFETY: key is retained for this call. value() borrows an unretained pointer from the dictionary.
+    let value = unsafe { CFDictionary::value(&dict, &*key as *const CFString as *const c_void) };
+    if value.is_null() {
+        return false;
+    }
+    // SAFETY: kCFBooleanTrue is a process-lifetime CoreFoundation constant.
+    // The pointer is compared with the dictionary value and is not freed.
+    let Some(truth) = (unsafe { kCFBooleanTrue }) else {
+        return false;
+    };
+    std::ptr::eq(value, truth as *const CFBoolean as *const c_void)
+}
+
+fn any_display_asleep() -> bool {
+    let mut ids = [0u32; 16];
+    let mut count = 0u32;
+    // SAFETY: ids has room for 16 display ids. count is a stack out-parameter.
+    let error = unsafe { CGGetActiveDisplayList(16, ids.as_mut_ptr(), &mut count) };
+    if error != CGError::Success {
+        return false;
+    }
+    let count = count as usize;
+    if count > ids.len() {
+        return false;
+    }
+    ids.iter().take(count).any(|id| CGDisplayIsAsleep(*id))
+}
+
+fn sc_display_count(content: &SCShareableContent) -> usize {
+    // SAFETY: content is a live SCShareableContent. displays() returns +1.
+    let displays = unsafe { content.displays() };
+    displays.count()
 }
 
 fn shareable(on_screen_only: bool) -> Result<Retained<SCShareableContent>, ComputerError> {
@@ -554,7 +620,9 @@ fn nserror_to_computer(error: &NSError) -> ComputerError {
 fn is_terminal(error: &ComputerError) -> bool {
     matches!(
         error,
-        ComputerError::PermissionRequired(_) | ComputerError::WindowNotFound(_)
+        ComputerError::PermissionRequired(_)
+            | ComputerError::WindowNotFound(_)
+            | ComputerError::DisplayUnavailable(_)
     )
 }
 

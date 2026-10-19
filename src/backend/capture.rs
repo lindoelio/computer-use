@@ -75,11 +75,20 @@ fn described_to_raw(
 }
 
 fn capture_described(region: Option<Region>) -> Result<Shot, ComputerError> {
+    #[cfg(target_os = "macos")]
+    if let Some(error) = super::macos::session_display_block() {
+        return Err(error);
+    }
     let monitors = monitors()?;
     if monitors.is_empty() {
-        return Err(ComputerError::ExecutionFailed(
-            "no display available on this system".into(),
-        ));
+        let reason = crate::image_util::display_block_reason(crate::image_util::DisplayFacts {
+            screen_locked: false,
+            display_asleep: false,
+            display_count: Some(0),
+            shareable_window_count: None,
+        })
+        .unwrap_or("no display available");
+        return Err(ComputerError::DisplayUnavailable(reason.into()));
     }
     match region {
         Some(region) => capture_region(&monitors, region),

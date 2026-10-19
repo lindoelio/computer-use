@@ -9,6 +9,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -45,15 +46,57 @@ pub struct Snapshot {
     pub observed_revision: Option<u64>,
 }
 
-/// Directory for one session.
-pub fn session_dir(session: Option<&str>) -> Result<PathBuf, ComputerError> {
+const OWNER_FILE: &str = "owner.json";
+/// Sessions older than this, whose owner process is not alive, are stale.
+pub const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Directory that holds every session. This does not create it.
+pub fn sessions_root() -> PathBuf {
+    cache_root().join("sessions")
+}
+
+fn session_path(session: Option<&str>) -> PathBuf {
     let name =
         sanitize_token(session.unwrap_or("")).unwrap_or_else(|| std::process::id().to_string());
-    let dir = cache_root().join("sessions").join(name);
+    sessions_root().join(name)
+}
+
+/// Directory for one session. Creates it, mode `0700`, and writes `owner.json` once.
+pub fn session_dir(session: Option<&str>) -> Result<PathBuf, ComputerError> {
+    let dir = session_path(session);
     fs::create_dir_all(&dir).map_err(ComputerError::Io)?;
     #[cfg(unix)]
     set_mode(&dir, 0o700);
+    ensure_owner(&dir)?;
     Ok(dir)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SessionOwner {
+    pid: u32,
+    created_unix_ms: u64,
+}
+
+fn ensure_owner(dir: &Path) -> Result<(), ComputerError> {
+    let path = dir.join(OWNER_FILE);
+    if path.exists() {
+        return Ok(());
+    }
+    let owner = SessionOwner {
+        pid: std::process::id(),
+        created_unix_ms: unix_ms(SystemTime::now()),
+    };
+    write_secret_json(&path, &owner)
+}
+
+fn unix_ms(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn time_from_unix_ms(ms: u64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_millis(ms)
 }
 
 /// Read the snapshot for one app window, if a previous call stored one.
@@ -91,7 +134,7 @@ pub fn store_screenshot_map(
 pub fn load_screenshot_map(
     session: Option<&str>,
 ) -> Result<Option<crate::image_util::ScreenshotMap>, ComputerError> {
-    let path = session_dir(session)?.join(SCREENSHOT_MAP_FILE);
+    let path = session_path(session).join(SCREENSHOT_MAP_FILE);
     if !path.exists() {
         return Ok(None);
     }
@@ -132,7 +175,7 @@ pub fn pending_restores(session: Option<&str>) -> Result<Vec<(i32, ElectronEdit)
         if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
             continue;
         }
-        if path.file_name().and_then(|name| name.to_str()) == Some(SCREENSHOT_MAP_FILE) {
+        if !is_snapshot_file(&path) {
             continue;
         }
         let Some(snapshot) = read_snapshot(&path)? else {
@@ -156,10 +199,7 @@ pub fn clear_restores(session: Option<&str>, pids: &[i32]) -> Result<(), Compute
     for entry in entries {
         let entry = entry.map_err(ComputerError::Io)?;
         let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-            continue;
-        }
-        if path.file_name().and_then(|name| name.to_str()) == Some(SCREENSHOT_MAP_FILE) {
+        if !is_snapshot_file(&path) {
             continue;
         }
         let Some(mut snapshot) = read_snapshot(&path)? else {
@@ -171,6 +211,203 @@ pub fn clear_restores(session: Option<&str>, pids: &[i32]) -> Result<(), Compute
         }
     }
     Ok(())
+}
+
+fn is_snapshot_file(path: &Path) -> bool {
+    if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    name != SCREENSHOT_MAP_FILE && name != OWNER_FILE
+}
+
+/// Options for [`prune_sessions`].
+#[derive(Clone, Debug)]
+pub struct PruneOptions {
+    /// Report matches without deleting them.
+    pub dry_run: bool,
+    /// Age after which a session with a dead or unknown owner is stale.
+    pub ttl: Duration,
+    /// Clock used for the age check.
+    pub now: SystemTime,
+}
+
+impl Default for PruneOptions {
+    fn default() -> Self {
+        Self {
+            dry_run: false,
+            ttl: DEFAULT_SESSION_TTL,
+            now: SystemTime::now(),
+        }
+    }
+}
+
+/// Directories [`prune_sessions`] removed or left in place.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PruneReport {
+    /// Session directory names that were removed, or would be in a dry run.
+    pub removed: Vec<String>,
+    /// Session directory names that stayed.
+    pub kept: Vec<String>,
+}
+
+/// Remove empty session directories and stale ones under `root`.
+///
+/// A directory with no snapshot or screenshot map is empty and is removed even
+/// when its owner pid is alive. A directory that still has content is kept
+/// while `alive` says the owner pid is running. Content whose owner is dead
+/// or unknown is removed once it is at least `ttl` old. `alive` is injected
+/// so tests do not depend on the process table.
+pub fn prune_sessions(
+    root: &Path,
+    options: &PruneOptions,
+    alive: &dyn Fn(u32) -> bool,
+) -> Result<PruneReport, ComputerError> {
+    let mut removed = Vec::new();
+    let mut kept = Vec::new();
+    if !root.exists() {
+        return Ok(PruneReport { removed, kept });
+    }
+    let mut names = Vec::new();
+    for entry in fs::read_dir(root).map_err(ComputerError::Io)? {
+        let entry = entry.map_err(ComputerError::Io)?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().into_string().ok() else {
+            continue;
+        };
+        names.push((name, path));
+    }
+    names.sort_by(|left, right| left.0.cmp(&right.0));
+    for (name, path) in names {
+        if should_prune(&path, &name, options, alive)? {
+            if !options.dry_run {
+                fs::remove_dir_all(&path).map_err(ComputerError::Io)?;
+            }
+            removed.push(name);
+        } else {
+            kept.push(name);
+        }
+    }
+    Ok(PruneReport { removed, kept })
+}
+
+/// Drop empty session directories under the real cache. Content is left alone.
+pub fn prune_empty_sessions() -> Result<Vec<String>, ComputerError> {
+    let root = sessions_root();
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut removed = Vec::new();
+    for entry in fs::read_dir(&root).map_err(ComputerError::Io)? {
+        let entry = entry.map_err(ComputerError::Io)?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        match session_has_content(&path) {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(_) => continue,
+        }
+        fs::remove_dir_all(&path).map_err(ComputerError::Io)?;
+        if let Ok(name) = entry.file_name().into_string() {
+            removed.push(name);
+        }
+    }
+    removed.sort();
+    Ok(removed)
+}
+
+/// True when `pid` is still running. Signal 0 does not deliver a signal.
+pub fn pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output();
+        match output {
+            Ok(output) => {
+                let text = String::from_utf8_lossy(&output.stdout);
+                text.split(',')
+                    .any(|field| field.trim().trim_matches('"') == pid.to_string())
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+fn should_prune(
+    path: &Path,
+    name: &str,
+    options: &PruneOptions,
+    alive: &dyn Fn(u32) -> bool,
+) -> Result<bool, ComputerError> {
+    if !session_has_content(path)? {
+        return Ok(true);
+    }
+    if let Some(pid) = owner_pid(path, name) {
+        if alive(pid) {
+            return Ok(false);
+        }
+    }
+    Ok(session_age(path, options.now) >= options.ttl)
+}
+
+fn session_has_content(dir: &Path) -> Result<bool, ComputerError> {
+    let entries = fs::read_dir(dir).map_err(ComputerError::Io)?;
+    for entry in entries {
+        let entry = entry.map_err(ComputerError::Io)?;
+        if entry.file_name() == std::ffi::OsStr::new(OWNER_FILE) {
+            continue;
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn owner_pid(dir: &Path, name: &str) -> Option<u32> {
+    if let Some(owner) = read_owner(dir) {
+        return Some(owner.pid);
+    }
+    name.parse::<u32>().ok()
+}
+
+fn read_owner(dir: &Path) -> Option<SessionOwner> {
+    let text = fs::read_to_string(dir.join(OWNER_FILE)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn session_age(dir: &Path, now: SystemTime) -> Duration {
+    let created = read_owner(dir)
+        .map(|owner| time_from_unix_ms(owner.created_unix_ms))
+        .or_else(|| dir.metadata().ok().and_then(|meta| meta.modified().ok()));
+    match created {
+        Some(created) => now.duration_since(created).unwrap_or(Duration::ZERO),
+        None => Duration::MAX,
+    }
 }
 
 fn snapshot_path(
@@ -221,8 +458,22 @@ fn write_secret_json(path: &Path, value: &impl Serialize) -> Result<(), Computer
 
 fn cache_root() -> PathBuf {
     if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
-        return PathBuf::from(xdg).join("computer-use");
+        if !xdg.is_empty() {
+            return PathBuf::from(xdg).join("computer-use");
+        }
     }
+    #[cfg(test)]
+    {
+        panic!("test used the session cache without XDG_CACHE_HOME");
+    }
+    #[cfg(not(test))]
+    {
+        cache_root_unchecked()
+    }
+}
+
+#[cfg(not(test))]
+fn cache_root_unchecked() -> PathBuf {
     #[cfg(windows)]
     {
         dirs::data_local_dir()
@@ -262,6 +513,62 @@ fn set_mode(path: &Path, mode: u32) {
 
 #[cfg(test)]
 pub(crate) static CACHE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+#[allow(unsafe_code)]
+pub(crate) struct CacheEnv {
+    dir: PathBuf,
+    previous: Option<std::ffi::OsString>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+#[allow(unsafe_code)]
+impl CacheEnv {
+    /// Point `XDG_CACHE_HOME` at a temp directory until this value drops.
+    pub(crate) fn acquire() -> Self {
+        let lock = CACHE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "computer-use-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("temp cache dir");
+        let previous = std::env::var_os("XDG_CACHE_HOME");
+        // SAFETY: CACHE_ENV_LOCK is held until drop, which restores the previous value.
+        unsafe { std::env::set_var("XDG_CACHE_HOME", &dir) };
+        Self {
+            dir,
+            previous,
+            _lock: lock,
+        }
+    }
+
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+}
+
+#[cfg(test)]
+#[allow(unsafe_code)]
+impl Drop for CacheEnv {
+    fn drop(&mut self) {
+        // SAFETY: the same lock taken in acquire is still held.
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var("XDG_CACHE_HOME", value),
+                None => std::env::remove_var("XDG_CACHE_HOME"),
+            }
+        }
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
 
 #[cfg(test)]
 #[allow(unsafe_code)]
@@ -374,5 +681,96 @@ mod tests {
         // SAFETY: same lock as set_var. The variable is removed before the guard drops.
         unsafe { std::env::remove_var("XDG_CACHE_HOME") };
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_removes_empty_and_stale_dirs_and_keeps_a_live_owner() {
+        let root = std::env::temp_dir().join(format!(
+            "computer-use-prune-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let now = SystemTime::now();
+        write_session(&root, "empty", 111, now, false);
+        write_session(
+            &root,
+            "live",
+            222,
+            now - Duration::from_secs(10 * 24 * 60 * 60),
+            true,
+        );
+        write_session(&root, "dead-fresh", 333, now, true);
+        write_session(
+            &root,
+            "dead-old",
+            444,
+            now - Duration::from_secs(48 * 60 * 60),
+            true,
+        );
+        let alive = |pid: u32| pid == 222;
+        let options = PruneOptions {
+            dry_run: true,
+            ttl: DEFAULT_SESSION_TTL,
+            now,
+        };
+        let dry = prune_sessions(&root, &options, &alive).unwrap();
+        assert_eq!(
+            dry.removed,
+            vec!["dead-old".to_string(), "empty".to_string()]
+        );
+        assert!(root.join("empty").exists(), "dry run must not delete");
+        assert!(root.join("live").exists());
+        assert!(root.join("dead-fresh").exists());
+
+        let removed = prune_sessions(
+            &root,
+            &PruneOptions {
+                dry_run: false,
+                ttl: DEFAULT_SESSION_TTL,
+                now,
+            },
+            &alive,
+        )
+        .unwrap();
+        assert_eq!(
+            removed.removed,
+            vec!["dead-old".to_string(), "empty".to_string()]
+        );
+        assert_eq!(
+            removed.kept,
+            vec!["dead-fresh".to_string(), "live".to_string()]
+        );
+        assert!(!root.join("empty").exists());
+        assert!(!root.join("dead-old").exists());
+        assert!(root.join("live").join("snapshot.json").exists());
+        assert!(root.join("dead-fresh").join("snapshot.json").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn write_session(root: &Path, name: &str, pid: u32, created: SystemTime, content: bool) {
+        let dir = root.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        let owner = serde_json::json!({
+            "pid": pid,
+            "created_unix_ms": created
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+        });
+        fs::write(dir.join("owner.json"), owner.to_string()).unwrap();
+        if content {
+            fs::write(dir.join("snapshot.json"), "{\"revision\":1}").unwrap();
+        }
+    }
+
+    #[test]
+    fn current_process_is_alive_and_a_huge_pid_is_not() {
+        assert!(pid_alive(std::process::id()));
+        assert!(!pid_alive(u32::MAX));
     }
 }

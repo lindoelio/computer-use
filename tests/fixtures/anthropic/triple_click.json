@@ -1,0 +1,11 @@
+{
+  "request": {
+    "action": "triple_click",
+    "coordinate": [
+      1,
+      2
+    ]
+  },
+  "error_code": "unsupported",
+  "error_contains": "P8"
+}

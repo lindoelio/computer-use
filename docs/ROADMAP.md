@@ -200,8 +200,9 @@ Keep the four existing codes. Add these. `ComputerError::code()` is the stable s
 | `blocked_url` | Browser URL matched the block list. |
 | `paused` | Local user input tripped the kill switch. |
 | `cdp_unavailable` | Feature off, or Chrome has no debugging port. |
+| `display_unavailable` | The screen is locked, the display is asleep, or no display or shareable window is available. Checked before `window_not_found`. |
 
-`execution_failed` remains the bucket for framework errors that are not in this list. `unsupported` remains the off-platform and feature-off bucket.
+`execution_failed` remains the bucket for framework errors that are not in this list. `unsupported` remains the off-platform and feature-off bucket. `display_unavailable` does not fall back to an xcap crop.
 
 ### Paths
 | Item | Path |
@@ -214,6 +215,8 @@ Keep the four existing codes. Add these. `ComputerError::code()` is the stable s
 | Overlay socket | `<cache>/overlay.sock`. |
 
 Cache files are JSON, mode `0600` on Unix. They hold the last revision, the rendered tree, the structural nodes, and the last screenshot map. They do not hold secure-field values.
+
+Each session directory has `owner.json` (`pid`, `created_unix_ms`). `screenshot-map.json` is the last screenshot map and is not a tree snapshot. `session prune` removes an empty session directory (nothing but `owner.json`) even when the owner pid is alive. A directory that still has content is kept while that pid is alive, including when it is older than the TTL. Content whose owner is dead or unknown is removed once it is at least 24 hours old (`--ttl` seconds, default 86400). A live pid's content is never deleted. `session end` also drops empty session directories. Tests set `XDG_CACHE_HOME` to a temp directory. A unit test that reaches the cache without that variable panics instead of writing `~/.cache/computer-use`.
 
 ### Tree text
 One node per line. Indent is two spaces per depth. The number in brackets is the element index.
@@ -264,7 +267,11 @@ When `return_state` is true the success object gains:
 }
 ```
 
-`include_screenshot` adds `state.screenshot` with the same fields as the `screenshot` action (`path`, `width`, `height`, `scale`, `origin`, `map`, optional `data`). Failures still include `state` when the tree could be read after the failure.
+`include_screenshot` adds `state.screenshot` with the same fields as the `screenshot` action (`path`, `width`, `height`, `scale`, `origin`, `map`, optional `data`). `tree` in this object is the full numbered text. `diff` is null when the snapshot created the baseline. The snapshot uses the same path as `tree`, so a returned state replaces the `tree --diff` baseline and advances the revision. Without `return_state`, element actions still update `observed` only and leave that baseline. Screenshot alone does not refresh it.
+
+`include_screenshot` does nothing unless `return_state` is set. The `screenshot` action is the exception: with both flags, `state.screenshot` is the capture it just made, not a second shot. A capture failure does not roll back the action. `ok` stays true, `state.screenshot` is null, and `warnings` explains. A tree failure on a successful action sets the tree fields to null and adds a warning. A failed action includes `state` only when the tree could be read afterward.
+
+Read-only actions ignore both flags: `tree`, `get_state`, `list_apps`, `list_windows`, `displays`, `doctor`, `wait`, `cursor_position`, `session_end`, and `session_prune`.
 
 ### Screenshot map
 Native CLI coordinates stay logical screen points. Adapters speak in pixels of the last image for that session.
@@ -318,7 +325,9 @@ Tier `activate` takes `foreground.lock`. A second process that asks for `activat
 }
 ```
 
-`stop_on_error` defaults to true. The response `results` array has one object per attempt. `ok` is false if any attempt failed. `stopped_at` is the index of the first failure when the rest were skipped.
+`stop_on_error` defaults to true. The response `results` array has one object per attempt. `ok` is false if any attempt failed. `stopped_at` is the index of the first failure when `stop_on_error` skips the rest. It is omitted when `stop_on_error` is false. `error.code` is that first failure's code.
+
+Each step may set `element`, `app`, `window`, and the other shared flags. Those overlay the outer request. `return_state` and `include_screenshot` on a step are ignored. The outer `return_state` runs once after the last attempt, or after the failure that stops the batch, and uses the outer target. A nested `batch` is `invalid_arguments`. The steps share one session and one cache revision sequence. Each step re-validates.
 
 ### Adapters
 `exec` and stdin consult `adapter` before `parse_request`. `native` is today's schema. Unknown adapter actions return `invalid_arguments` and name the field they did not understand. Fixture files live in `tests/fixtures/openai/` and `tests/fixtures/anthropic/`. Coordinates in both adapters are image pixels of the session's last screenshot and go through `image_to_screen`. A missing map returns `invalid_arguments` telling the caller to screenshot first.
@@ -352,8 +361,14 @@ Anthropic `computer_20251124`:
 | `scroll` | `scroll` using `scroll_direction` and `scroll_amount` |
 | `wait` | `wait` |
 | `zoom` | `screenshot` of `region: [x1, y1, x2, y2]` in image pixels |
+| `cursor_position` | read-only `cursor_position` |
+| `left_mouse_down`, `left_mouse_up` | `unsupported` until P8 |
 
 If a published patch renames a field, accept the alias in the adapter and add a fixture. Do not guess a second schema in the dispatcher.
+
+`drag`, `triple_click`, `left_click_drag`, `hold_key`, and the OpenAI buttons `back` and `forward` return `unsupported` and name P8. OpenAI `wheel` is `middle`. OpenAI `wait` with no duration sleeps 0 ms, because that schema has no duration. Anthropic `zoom` stays in image pixels on the translated action. Dispatch remaps it with the stored map. The far edge of a region may sit on the image width or height. A point may not.
+
+Adapters force `coord` to `image`, including when the request also sent `coord`. A missing `sessions/<session>/screenshot-map.json` is `invalid_arguments` with the message `take a screenshot first`. A coordinate outside the image is `invalid_arguments`. The response adds `adapter` for `openai` and `anthropic` and omits it for native. There is no detection without `--adapter` or the request field. An action with no coordinates does not need a map.
 
 ### Policy shape (P6)
 ```toml
@@ -642,7 +657,7 @@ computer-use screenshot --app Notes --canvas 1440x900 --base64
 The success object is the map object from [Screenshot map](#screenshot-map) plus `path`, `format`, `capture_source`.
 
 ### Failure modes
-`permission_required` when Screen Recording is off (`CGPreflightScreenCaptureAccess` is false or SCK returns the TCC error). `window_not_found` when the CG id is absent from `SCShareableContent`. Fallback to xcap on SCK errors other than TCC, with `capture_source: "xcap"`.
+`permission_required` when Screen Recording is off (`CGPreflightScreenCaptureAccess` is false or SCK returns the TCC error). `window_not_found` when the CG id is absent from `SCShareableContent` and a display is actually available. A locked session (`CGSSessionScreenIsLocked`), an asleep display (`CGDisplayIsAsleep`), ScreenCaptureKit returning no displays or no windows, or an empty xcap monitor list is `display_unavailable`. That check runs before `window_not_found` and before the xcap crop. A window-targeted screenshot asks the same question before it resolves the window, so a locked session is not reported as a missing window index. Fallback to xcap on other SCK errors, with `capture_source: "xcap"`.
 
 ### Tests
 - Remap tests in `image_util.rs` for scale 2, origin (120, 40), max-width 1440, and a 1440×900 canvas with padding.
@@ -655,7 +670,7 @@ The success object is the map object from [Screenshot map](#screenshot-map) plus
 
 `SCStreamConfiguration` has no `ignoreShadows` setter. Window capture sets `ignoreShadowsSingleWindow`. `captureImageWithFilter` takes `SCStreamConfiguration`, not `SCScreenshotConfiguration`. Pixel width and height are the window's point size times the backing scale of the screen that contains the window origin. Completion handlers wait at most 5 seconds and pump the main run loop so a main-queue callback cannot hang the CLI. A timeout leaks the block instead of freeing it under a late callback.
 
-The map file is `sessions/<session>/screenshot-map.json`, mode `0600`. It is separate from `<bundle>-<pid>-<window>.json`. Screenshot does not refresh the `tree --diff` baseline, and element actions still do not either.
+The map file is `sessions/<session>/screenshot-map.json`, mode `0600`. It is separate from `<bundle>-<pid>-<window>.json`. Screenshot does not refresh the `tree --diff` baseline. Element actions update `observed` and leave the baseline. P5 `return_state` calls the tree snapshot, and that call replaces the baseline.
 
 Full-desktop origin is the top-left of the stitched virtual desktop in screen points (the minimum monitor origin). That is `(0, 0)` when the primary display starts there. A region uses the region origin. A single monitor uses that monitor's origin. Mixed-scale monitors keep one primary scale on the stitched image; the map still divides logical size by content size.
 
@@ -680,9 +695,15 @@ Sheets are read from Accessibility and composited above the parent. Accessibilit
 computer-use press --element 1 --state --screenshot
 computer-use exec --adapter openai '{"type":"click","x":10,"y":20,"button":"left"}'
 computer-use exec --adapter anthropic '{"action":"left_click","coordinate":[10,20]}'
+computer-use session prune --dry-run
+computer-use session prune --ttl 86400
 ```
 
-Batch is JSON-only. A clap subcommand for batch is not worth a second syntax.
+`--adapter` applies to `exec`, `serve`, and `--json`. A desktop subcommand with `--adapter openai` or `--adapter anthropic` is `invalid_arguments`. Batch is JSON-only. A clap subcommand for batch is not worth a second syntax.
+
+```json
+{"action":"session_prune","dry_run":true,"ttl_secs":86400}
+```
 
 ### JSON
 See [Post-action state](#post-action-state) and [Batch](#batch). Adapter output is a normal `Response`. Extra field `adapter` echoes the name.
@@ -691,10 +712,16 @@ See [Post-action state](#post-action-state) and [Batch](#batch). Adapter output 
 Batch: first error sets `ok: false` and `stopped_at`. Adapter: missing screenshot map, unknown action name, coordinate outside the image. `include_screenshot` failure does not roll back the action. The action result stays, `state.screenshot` is null, and `warnings` explains the capture error.
 
 ### Tests
-- Each fixture in `tests/fixtures/openai/*.json` and `tests/fixtures/anthropic/*.json` translates to the expected `Action`.
-- Image coordinate (100, 50) on a stored map becomes the expected screen point.
-- Batch stops on the second action when the stub fails the first and `stop_on_error` is true. With `stop_on_error` false the stub records both attempts.
-- `return_state` on the stub includes `tree` from `inspect_accessibility`.
+- Each fixture in `tests/fixtures/openai/*.json` and `tests/fixtures/anthropic/*.json` translates to the expected `Action`. Unsupported actions expect `unsupported` and the name `P8`.
+- Image coordinate (100, 50) on a stored map becomes the expected screen point: origin `(120, 40)`, logical `800×500`, content `1440×900`, pad `0` rounds to `(176, 68)`.
+- Batch stops on the second action when the stub fails the first and `stop_on_error` is true (`stopped_at` is 0 and the second click is not attempted). With `stop_on_error` false the stub records both attempts.
+- `return_state` on the stub includes the numbered tree from `backend.tree` (the same accessibility query list `inspect_accessibility` records). That diff becomes the new `tree --diff` baseline. Without `return_state` the baseline stays put.
+- `include_screenshot` failure keeps the action result, sets `state.screenshot` to null, and adds a warning.
+- `display_unavailable` is a pure function of lock, sleep, and display counts. The unit test uses fake inputs and does not call Core Graphics.
+- `session prune` on a temp directory removes empty and stale sessions and keeps a live owner's content.
+
+### Implementation notes
+Post-action `tree` is `TreeReport.full_text`. The `tree` command's `tree` field is still the chosen full-or-diff text. `cursor_position` is a small read-only action because the backend already exposes the pointer. Drag, triple-click, mouse-button hold, and `hold_key` stay `unsupported` until P8 rather than pretending to work. OpenAI `wait` without a duration is 0 ms so a fixture does not sleep. Batch applies `return_state` once at the end. A step's own `return_state` is ignored so the batch does not snapshot between steps.
 
 ## P6 — Safety
 ### Design

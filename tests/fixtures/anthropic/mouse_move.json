@@ -1,0 +1,14 @@
+{
+  "request": {
+    "action": "mouse_move",
+    "coordinate": [
+      8,
+      9
+    ]
+  },
+  "expect": {
+    "action": "move",
+    "x": 8,
+    "y": 9
+  }
+}

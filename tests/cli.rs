@@ -1,7 +1,11 @@
 //! Binary tests that do not touch the desktop.
+//!
+//! Every command gets a temp `XDG_CACHE_HOME` so a test cannot write
+//! `~/.cache/computer-use`.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 use serde_json::Value;
 
@@ -9,11 +13,25 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_computer-use")
 }
 
+fn cache_home() -> &'static str {
+    static DIR: OnceLock<String> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir =
+            std::env::temp_dir().join(format!("computer-use-cli-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp cache dir");
+        dir.to_string_lossy().into_owned()
+    })
+    .as_str()
+}
+
+fn command(args: &[&str]) -> Command {
+    let mut command = Command::new(bin());
+    command.args(args).env("XDG_CACHE_HOME", cache_home());
+    command
+}
+
 fn run(args: &[&str]) -> std::process::Output {
-    Command::new(bin())
-        .args(args)
-        .output()
-        .expect("spawn computer-use")
+    command(args).output().expect("spawn computer-use")
 }
 
 #[test]
@@ -60,6 +78,10 @@ fn help_lists_commands() {
         "--require-visible",
         "--full",
         "--session",
+        "--state",
+        "--screenshot",
+        "--coord",
+        "--adapter",
     ] {
         assert!(stdout.contains(needle), "help missing {needle}:\n{stdout}");
     }
@@ -247,8 +269,7 @@ fn json_flag_wait_roundtrip() {
 }
 
 fn assert_json_wait(args: &[&str]) {
-    let mut child = Command::new(bin())
-        .args(args)
+    let mut child = command(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -290,6 +311,28 @@ fn doctor_returns_json_on_every_platform() {
     assert!(value["screen_capture"].is_boolean() || value["screen_capture"].is_null());
     assert!(value["input_monitor"].is_null());
     assert!(value["fixes"].is_array());
+}
+
+#[test]
+fn session_prune_dry_run_stays_in_the_temp_cache() {
+    let output = run(&["session", "prune", "--dry-run"]);
+    assert!(
+        output.status.success(),
+        "stderr: {} stdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let value: Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["action"], "session_prune");
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(value["ttl_secs"], 86400);
+    assert!(value["removed"].as_array().unwrap().is_empty());
+    assert!(
+        !cache_home().contains("/.cache/computer-use"),
+        "test cache escaped: {}",
+        cache_home()
+    );
 }
 
 #[test]

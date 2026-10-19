@@ -1,0 +1,9 @@
+{
+  "request": {
+    "action": "hold_key",
+    "text": "shift",
+    "duration": 1
+  },
+  "error_code": "unsupported",
+  "error_contains": "P8"
+}

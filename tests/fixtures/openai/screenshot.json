@@ -1,0 +1,8 @@
+{
+  "request": {
+    "type": "screenshot"
+  },
+  "expect": {
+    "action": "screenshot"
+  }
+}

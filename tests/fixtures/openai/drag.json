@@ -1,0 +1,17 @@
+{
+  "request": {
+    "type": "drag",
+    "path": [
+      {
+        "x": 0,
+        "y": 0
+      },
+      {
+        "x": 10,
+        "y": 10
+      }
+    ]
+  },
+  "error_code": "unsupported",
+  "error_contains": "P8"
+}

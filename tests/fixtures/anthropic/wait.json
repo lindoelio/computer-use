@@ -1,0 +1,10 @@
+{
+  "request": {
+    "action": "wait",
+    "duration": 1.5
+  },
+  "expect": {
+    "action": "wait",
+    "seconds": 1.5
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "request": {
+    "action": "scroll",
+    "coordinate": [
+      3,
+      4
+    ],
+    "scroll_direction": "down",
+    "scroll_amount": 2
+  },
+  "expect": {
+    "action": "scroll",
+    "x": 3,
+    "y": 4,
+    "direction": "down",
+    "amount": 2
+  }
+}

@@ -200,8 +200,14 @@ pub struct TreeReport {
     pub source: String,
     /// Whether the numbered text hit a cap.
     pub truncated: bool,
-    /// Numbered text, or empty when the legacy fallback ran.
+    /// Chosen text for the `tree` command: the diff once a baseline exists, otherwise the full text.
     pub tree: String,
+    /// Numbered text, even when [`Self::tree`] is a diff.
+    pub full_text: String,
+    /// Diff against the previous baseline. `None` when this observation created the baseline.
+    pub diff: Option<String>,
+    /// Bundle id when known, otherwise the application name.
+    pub app: Option<String>,
     /// Extra note. The osascript path sets `source=osascript`.
     pub note: Option<String>,
     /// JXA JSON when the native tree was not built.

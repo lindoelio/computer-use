@@ -670,11 +670,10 @@ fn finish_report(query: &TreeQuery, live: &LiveWindow) -> Result<TreeReport, Wal
     )
     .ok()
     .flatten();
-    let text = tree::choose_text(
-        previous.as_ref().map(|snapshot| &snapshot.root),
-        &rendered,
-        query.full,
-    );
+    let previous_root = previous.as_ref().map(|snapshot| &snapshot.root);
+    let diff = previous_root.map(|previous| tree::diff_trees(previous, &rendered.root));
+    let text = tree::choose_text(previous_root, &rendered, query.full);
+    let app_label = app.bundle_id.clone().or_else(|| Some(app.name.clone()));
     let mut snapshot = Snapshot {
         revision,
         tree: rendered.text.clone(),
@@ -710,6 +709,9 @@ fn finish_report(query: &TreeQuery, live: &LiveWindow) -> Result<TreeReport, Wal
         source: "ax".into(),
         truncated: rendered.truncated,
         tree: text,
+        full_text: rendered.text,
+        diff,
+        app: app_label,
         note,
         legacy: None,
     })
@@ -724,6 +726,9 @@ fn fallback_osascript(app: Option<&AppInfo>, window_id: u32) -> Result<TreeRepor
         source: "osascript".into(),
         truncated: false,
         tree: String::new(),
+        full_text: String::new(),
+        diff: None,
+        app: app.and_then(|app| app.bundle_id.clone().or_else(|| Some(app.name.clone()))),
         note: Some("source=osascript".into()),
         legacy: Some(text),
     })

@@ -18,6 +18,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod adapters;
 pub mod backend;
 pub mod cache;
 pub mod element;
@@ -42,8 +43,8 @@ pub use image_util::{
 };
 pub use keys::{parse_key_combo, KeyCombo};
 pub use protocol::{
-    dispatch, dispatch_context, dispatch_with, handle_request_line, parse_request, Action,
-    CallContext, Request, Response,
+    dispatch, dispatch_context, dispatch_with, handle_request_line, handle_request_line_with,
+    parse_request, Action, CallContext, Request, Response,
 };
 pub use types::{
     parse_region, DisplayInfo, Frame, FrontmostInfo, ImageFormat, Modifier, MouseButton, Region,
