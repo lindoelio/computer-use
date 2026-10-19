@@ -4940,17 +4940,17 @@ mod tests {
                 name: "Open URL".into(),
             },
         );
-        // The `shortcuts` binary is unlikely to exist on a CI runner; the
-        // dispatch path always reaches it, so the response is either ok
-        // (binary present) or `execution_failed` (binary absent). Either
+        // On macOS the dispatch path reaches the helper, so the response is
+        // either ok (binary present) or `execution_failed` (binary absent).
+        // Off macOS the dispatcher short-circuits to `unsupported`. Either
         // outcome is acceptable; the failure code must be the documented
         // one.
         if !response.ok {
-            assert_eq!(
-                response.to_value()["error"]["code"],
-                "execution_failed",
-                "{:?}",
-                response.to_value()
+            let value = response.to_value();
+            let code = value["error"]["code"].as_str().unwrap_or_default();
+            assert!(
+                matches!(code, "execution_failed" | "unsupported"),
+                "{value:?}"
             );
         }
     }
