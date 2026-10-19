@@ -25,6 +25,7 @@ use crate::target::{
     filter_windows_for_pid, parse_app_selector, parse_window_selector, resolve_app, resolve_window,
     WindowSelector,
 };
+use crate::tier::{InputJob, InputKind, TierName};
 use crate::tree::TreeQuery;
 use crate::types::{ImageFormat, Modifier, MouseButton, Region, ScrollDirection};
 
@@ -279,6 +280,12 @@ pub struct CallContext {
     pub policy: Option<String>,
     /// Confirm hook from `--confirm-cmd`. Wins over the environment and the policy file.
     pub confirm_cmd: Option<String>,
+    /// Skip `foreground.lock` for tier `activate`.
+    pub allow_foreground: bool,
+    /// Refuse tier `activate`, and treat cursor motion as failure.
+    pub require_background: bool,
+    /// Do not send the agent point to the overlay helper.
+    pub no_overlay: bool,
 }
 
 /// A JSON request: an optional `id`, shared flags, and an [`Action`].
@@ -330,6 +337,9 @@ fn take_context(object: &mut Map<String, Value>) -> Result<CallContext, Computer
         require_visible: take_bool(object, "require_visible")?,
         policy: None,
         confirm_cmd: None,
+        allow_foreground: take_bool(object, "allow_foreground")?,
+        require_background: take_bool(object, "require_background")?,
+        no_overlay: take_bool(object, "no_overlay")?,
     })
 }
 
@@ -395,6 +405,14 @@ pub struct LineOptions<'a> {
     pub policy: Option<&'a str>,
     /// Process `--confirm-cmd` program.
     pub confirm_cmd: Option<&'a str>,
+    /// Process `--tier`. A request field wins. `--synthetic-focus` arrives as `synthetic`.
+    pub tier: Option<&'a str>,
+    /// Process `--allow-foreground`. Combined with the request by or.
+    pub allow_foreground: bool,
+    /// Process `--require-background`. Combined with the request by or.
+    pub require_background: bool,
+    /// Process `--no-overlay`. Combined with the request by or.
+    pub no_overlay: bool,
 }
 
 /// Decode one JSON line. `cli_adapter` is the process `--adapter` flag.
@@ -432,6 +450,14 @@ pub fn handle_request_line_opts(line: &str, options: LineOptions<'_>) -> Respons
             if let Some(confirm) = options.confirm_cmd {
                 request.context.confirm_cmd = Some(confirm.to_string());
             }
+            if request.context.tier.is_none() {
+                if let Some(tier) = options.tier {
+                    request.context.tier = Some(tier.to_string());
+                }
+            }
+            request.context.allow_foreground |= options.allow_foreground;
+            request.context.require_background |= options.require_background;
+            request.context.no_overlay |= options.no_overlay;
             dispatch_context(request.action, &request.context).with_id(request.id)
         }
         Err(error) => {
@@ -550,6 +576,8 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
                 label,
                 &policy::Subject::default(),
                 None,
+                "allow",
+                "default",
                 Response::from_error(error),
             )
         }
@@ -561,6 +589,8 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
             label,
             &prepared.subject,
             prepared.warning.as_deref(),
+            prepared.decision,
+            prepared.source,
             response,
         );
     }
@@ -575,6 +605,8 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
                 label,
                 &prepared.subject,
                 prepared.warning.as_deref(),
+                prepared.decision,
+                prepared.source,
                 run_batch(backend, context, actions, stop_on_error),
             )
         }
@@ -616,9 +648,9 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
             element_command(backend, context, ElementOp::Perform { name })
         }
         Action::ScrollTo => element_command(backend, context, ElementOp::ScrollTo),
-        Action::Move { x, y } => result_response(move_mouse(backend, x, y)),
+        Action::Move { x, y } => move_mouse(backend, context, x, y),
         Action::Type { text } => type_command(backend, context, text),
-        Action::Key { keys } => result_response(press_key(backend, &keys)),
+        Action::Key { keys } => press_key(backend, context, &keys),
         Action::Scroll {
             x,
             y,
@@ -626,7 +658,7 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
             dy,
             direction,
             amount,
-        } => result_response(scroll(backend, x, y, dx, dy, direction, amount)),
+        } => scroll(backend, context, (x, y), (dx, dy), direction, amount),
         Action::GetState => result_response(Ok(collect_state_for(backend, &tree_query(context)))),
         Action::Tree => result_response(tree_action(backend, context)),
         Action::SessionEnd => result_response(session_end(backend, context)),
@@ -654,6 +686,8 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
                 label,
                 &subject,
                 prepared.warning.as_deref(),
+                prepared.decision,
+                prepared.source,
                 response,
             );
         }
@@ -666,6 +700,8 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
         label,
         &prepared.subject,
         prepared.warning.as_deref(),
+        prepared.decision,
+        prepared.source,
         response,
     )
 }
@@ -675,6 +711,8 @@ fn finish_action(
     label: &str,
     subject: &policy::Subject,
     warning: Option<&str>,
+    decision: &str,
+    source: &str,
     mut response: Response,
 ) -> Response {
     if let Some(warning) = warning {
@@ -689,6 +727,24 @@ fn finish_action(
             .map(|error| error.code.as_str())
             .unwrap_or("execution_failed")
     };
+    let mut decision = decision.to_string();
+    let mut source = source.to_string();
+    if label == "policy_check" {
+        if let Some(value) = response
+            .fields
+            .get("decision")
+            .and_then(|value| value.as_str())
+        {
+            decision = value.to_string();
+        }
+        if let Some(value) = response
+            .fields
+            .get("source")
+            .and_then(|value| value.as_str())
+        {
+            source = value.to_string();
+        }
+    }
     let tier = response
         .fields
         .get("tier")
@@ -706,6 +762,8 @@ fn finish_action(
         window_id: subject.window_id,
         element: context.element,
         code,
+        decision: &decision,
+        source: &source,
         tier: tier.as_deref(),
     }) {
         push_warning(
@@ -796,6 +854,18 @@ struct Prepared {
     stop: Option<Response>,
     warning: Option<String>,
     subject: policy::Subject,
+    decision: &'static str,
+    source: &'static str,
+}
+
+fn early_stop(warning: Option<String>, subject: policy::Subject, response: Response) -> Prepared {
+    Prepared {
+        stop: Some(response),
+        warning,
+        subject,
+        decision: "allow",
+        source: "default",
+    }
 }
 
 fn prepare_action(
@@ -810,11 +880,11 @@ fn prepare_action(
             if matches!(class, PolicyClass::Always) {
                 policy::LoadedPolicy::default()
             } else {
-                return Prepared {
-                    stop: Some(Response::from_error(error)),
-                    warning: None,
-                    subject: policy::Subject::default(),
-                };
+                return early_stop(
+                    None,
+                    policy::Subject::default(),
+                    Response::from_error(error),
+                );
             }
         }
     };
@@ -828,16 +898,18 @@ fn prepare_action(
             stop: None,
             warning,
             subject: policy::Subject::default(),
+            decision: "allow",
+            source: "default",
         };
     }
     let subject = match resolve_subject(backend, action, context) {
         Ok(subject) => subject,
         Err(error) => {
-            return Prepared {
-                stop: Some(Response::from_error(error)),
+            return early_stop(
                 warning,
-                subject: policy::Subject::default(),
-            }
+                policy::Subject::default(),
+                Response::from_error(error),
+            )
         }
     };
     let policy_action = match action {
@@ -860,18 +932,25 @@ fn prepare_action(
         },
     };
     let decision = policy::decide(&loaded, &subject, &policy_action);
-    if let policy::Decision::Deny { message, .. } = decision {
+    if let policy::Decision::Deny { message, source } = &decision {
         return Prepared {
-            stop: Some(Response::from_error(ComputerError::PolicyDenied(message))),
+            stop: Some(Response::from_error(ComputerError::PolicyDenied(
+                message.clone(),
+            ))),
             warning,
             subject,
+            decision: "deny",
+            source,
         };
     }
     if let Err(error) = refuse_blocked_url(backend, &loaded, &subject) {
+        let (decision_name, source) = decision_record(&decision);
         return Prepared {
             stop: Some(Response::from_error(error)),
             warning,
             subject,
+            decision: decision_name,
+            source,
         };
     }
     let mutating = matches!(
@@ -879,12 +958,15 @@ fn prepare_action(
         PolicyClass::Mutate | PolicyClass::Quit | PolicyClass::Key
     );
     if mutating && policy::is_paused() {
+        let (decision_name, source) = decision_record(&decision);
         return Prepared {
             stop: Some(Response::from_error(ComputerError::Paused(
                 "local input paused mutating actions; run computer-use resume".into(),
             ))),
             warning,
             subject,
+            decision: decision_name,
+            source,
         };
     }
     if let Action::Key { .. } = action {
@@ -902,26 +984,40 @@ fn prepare_action(
                         ))),
                         warning,
                         subject,
+                        decision: "deny",
+                        source: "builtin",
                     };
                 }
             }
         }
     }
-    if let policy::Decision::Confirm { reason } = decision {
-        if let Err(error) =
-            confirm_action(context, &loaded, &subject, action_label(action), &reason)
+    if let policy::Decision::Confirm { reason } = &decision {
+        if let Err(error) = confirm_action(context, &loaded, &subject, action_label(action), reason)
         {
             return Prepared {
                 stop: Some(Response::from_error(error)),
                 warning,
                 subject,
+                decision: "confirm",
+                source: "builtin",
             };
         }
     }
+    let (decision_name, source) = decision_record(&decision);
     Prepared {
         stop: None,
         warning,
         subject,
+        decision: decision_name,
+        source,
+    }
+}
+
+fn decision_record(decision: &policy::Decision) -> (&'static str, &'static str) {
+    match decision {
+        policy::Decision::Allow { source } => ("allow", *source),
+        policy::Decision::Deny { source, .. } => ("deny", *source),
+        policy::Decision::Confirm { .. } => ("confirm", "builtin"),
     }
 }
 
@@ -1520,6 +1616,15 @@ fn overlay_context(
     if object.contains_key("require_visible") {
         context.require_visible = take_bool(object, "require_visible")?;
     }
+    if object.contains_key("allow_foreground") {
+        context.allow_foreground = take_bool(object, "allow_foreground")?;
+    }
+    if object.contains_key("require_background") {
+        context.require_background = take_bool(object, "require_background")?;
+    }
+    if object.contains_key("no_overlay") {
+        context.no_overlay = take_bool(object, "no_overlay")?;
+    }
     Ok(())
 }
 
@@ -1842,6 +1947,16 @@ fn coordinate_click(
     button: MouseButton,
     double: bool,
 ) -> Response {
+    let kind = InputKind::Click {
+        x,
+        y,
+        button,
+        count: if double { 2 } else { 1 },
+    };
+    // Tier rejection, including synthetic without the feature, happens before hit-testing.
+    if let Err(error) = planned_tiers(backend, context) {
+        return Response::from_error(error);
+    }
     let mut warnings = Vec::new();
     let hit = match backend.hit_test(x, y) {
         Ok(hit) => hit,
@@ -1857,27 +1972,20 @@ fn coordinate_click(
             }
         }
     }
-    if let Err(error) = backend.simulate_click(x, y, button) {
-        return Response::from_error(error);
-    }
-    if double {
-        thread::sleep(Duration::from_millis(50));
-        if let Err(error) = backend.simulate_click(x, y, button) {
-            return Response::from_error(error);
+    match run_attempts(backend, context, kind) {
+        Ok(report) => {
+            let body = json!({
+                "action": if double { "double_click" } else { "click" },
+                "x": x,
+                "y": y,
+                "button": button.as_str(),
+                "double": double,
+                "hit": hit_value(hit),
+            });
+            Response::success(finish_input(body, report, warnings))
         }
+        Err(error) => Response::from_error(error),
     }
-    let mut body = json!({
-        "action": if double { "double_click" } else { "click" },
-        "x": x,
-        "y": y,
-        "button": button.as_str(),
-        "double": double,
-        "hit": hit_value(hit),
-    });
-    if !warnings.is_empty() {
-        body["warnings"] = json!(warnings);
-    }
-    Response::success(body)
 }
 
 fn hit_value(hit: Option<crate::element::HitInfo>) -> Value {
@@ -1891,8 +1999,26 @@ fn type_command(backend: &dyn DesktopBackend, context: &CallContext, text: Strin
     if context.element.is_some() {
         return element_command(backend, context, ElementOp::Type { text });
     }
-    match type_text(backend, &text) {
-        Ok(value) => Response::success(value),
+    if text.is_empty() {
+        return Response::from_error(ComputerError::InvalidArguments(
+            "text must not be empty".into(),
+        ));
+    }
+    if text.contains('\0') {
+        return Response::from_error(ComputerError::InvalidArguments(
+            "text must not contain a null byte".into(),
+        ));
+    }
+    let chars = text.chars().count();
+    match run_attempts(backend, context, InputKind::Type { text: text.clone() }) {
+        Ok(report) => {
+            let body = json!({
+                "action": "type",
+                "text": text,
+                "chars": chars,
+            });
+            Response::success(finish_input(body, report, Vec::new()))
+        }
         Err(error) => Response::from_error(error),
     }
 }
@@ -1988,7 +2114,11 @@ fn outcome_value(outcome: &ElementOutcome) -> Value {
         "element": outcome.element,
         "revision": outcome.revision,
         "tier": outcome.tier,
+        "cursor_moved": outcome.cursor_moved,
     });
+    if let Some(restored) = outcome.focus_restored {
+        body["focus_restored"] = json!(restored);
+    }
     if !outcome.warnings.is_empty() {
         body["warnings"] = json!(outcome.warnings);
     }
@@ -2012,74 +2142,211 @@ fn element_error_response(error: ElementError) -> Response {
     response
 }
 
-fn move_mouse(backend: &dyn DesktopBackend, x: i32, y: i32) -> Result<Value, ComputerError> {
-    backend.move_mouse(x, y)?;
-    Ok(json!({"action": "move", "x": x, "y": y}))
+fn move_mouse(backend: &dyn DesktopBackend, context: &CallContext, x: i32, y: i32) -> Response {
+    match run_attempts(backend, context, InputKind::Move { x, y }) {
+        Ok(report) => Response::success(finish_input(
+            json!({"action": "move", "x": x, "y": y}),
+            report,
+            Vec::new(),
+        )),
+        Err(error) => Response::from_error(error),
+    }
 }
 
-fn type_text(backend: &dyn DesktopBackend, text: &str) -> Result<Value, ComputerError> {
-    if text.is_empty() {
-        return Err(ComputerError::InvalidArguments(
-            "text must not be empty".into(),
-        ));
+fn press_key(backend: &dyn DesktopBackend, context: &CallContext, keys: &str) -> Response {
+    let combo = match parse_key_combo(keys) {
+        Ok(combo) => combo,
+        Err(error) => return Response::from_error(error),
+    };
+    if let Err(error) = validate_key(&combo.key) {
+        return Response::from_error(error);
     }
-    if text.contains('\0') {
-        return Err(ComputerError::InvalidArguments(
-            "text must not contain a null byte".into(),
-        ));
-    }
-    backend.simulate_type(text)?;
-    Ok(json!({
-        "action": "type",
-        "text": text,
-        "chars": text.chars().count(),
-    }))
-}
-
-fn press_key(backend: &dyn DesktopBackend, keys: &str) -> Result<Value, ComputerError> {
-    let combo = parse_key_combo(keys)?;
-    validate_key(&combo.key)?;
-    backend.simulate_key(&combo.modifiers, &combo.key)?;
     let modifiers: Vec<&str> = combo
         .modifiers
         .iter()
         .copied()
         .map(Modifier::as_str)
         .collect();
-    Ok(json!({
+    let body = json!({
         "action": "key",
         "keys": keys,
         "modifiers": modifiers,
         "key": combo.key,
-    }))
+    });
+    match run_attempts(
+        backend,
+        context,
+        InputKind::Key {
+            modifiers: combo.modifiers,
+            key: combo.key,
+        },
+    ) {
+        Ok(report) => Response::success(finish_input(body, report, Vec::new())),
+        Err(error) => Response::from_error(error),
+    }
 }
 
 fn scroll(
     backend: &dyn DesktopBackend,
-    x: Option<i32>,
-    y: Option<i32>,
-    dx: Option<i32>,
-    dy: Option<i32>,
+    context: &CallContext,
+    point: (Option<i32>, Option<i32>),
+    delta: (Option<i32>, Option<i32>),
     direction: Option<ScrollDirection>,
     amount: Option<i32>,
-) -> Result<Value, ComputerError> {
+) -> Response {
+    let (x, y) = point;
+    let (dx, dy) = delta;
     if x.is_some() != y.is_some() {
-        return Err(ComputerError::InvalidArguments(
+        return Response::from_error(ComputerError::InvalidArguments(
             "scroll x and y must be set together".into(),
         ));
     }
-    let (scroll_dx, scroll_dy) = resolve_scroll(dx, dy, direction, amount)?;
-    if let (Some(x), Some(y)) = (x, y) {
-        backend.move_mouse(x, y)?;
+    let (scroll_dx, scroll_dy) = match resolve_scroll(dx, dy, direction, amount) {
+        Ok(delta) => delta,
+        Err(error) => return Response::from_error(error),
+    };
+    match run_attempts(
+        backend,
+        context,
+        InputKind::Scroll {
+            x,
+            y,
+            dx: scroll_dx,
+            dy: scroll_dy,
+        },
+    ) {
+        Ok(report) => Response::success(finish_input(
+            json!({
+                "action": "scroll",
+                "x": x,
+                "y": y,
+                "dx": scroll_dx,
+                "dy": scroll_dy,
+            }),
+            report,
+            Vec::new(),
+        )),
+        Err(error) => Response::from_error(error),
     }
-    backend.simulate_scroll(scroll_dx, scroll_dy)?;
-    Ok(json!({
-        "action": "scroll",
-        "x": x,
-        "y": y,
-        "dx": scroll_dx,
-        "dy": scroll_dy,
-    }))
+}
+
+fn planned_tiers(
+    backend: &dyn DesktopBackend,
+    context: &CallContext,
+) -> Result<Vec<TierName>, ComputerError> {
+    let requested = crate::tier::parse_tier(context.tier.as_deref())?;
+    crate::tier::plan(
+        requested,
+        crate::tier::InputClass::Background,
+        backend.input_support(),
+        crate::tier::skylight_compiled(),
+    )
+}
+
+fn run_attempts(
+    backend: &dyn DesktopBackend,
+    context: &CallContext,
+    kind: InputKind,
+) -> Result<crate::tier::InputReport, ComputerError> {
+    let attempts = planned_tiers(backend, context)?;
+    let mut event_error: Option<ComputerError> = None;
+    for (index, tier) in attempts.iter().copied().enumerate() {
+        if tier == TierName::Activate {
+            match activate_block(context)? {
+                Some(blocked) if index > 0 => {
+                    return Err(event_error.unwrap_or(blocked));
+                }
+                Some(blocked) => return Err(blocked),
+                None => {}
+            }
+        }
+        let job = InputJob {
+            tier,
+            kind: kind.clone(),
+            app: context.app.clone(),
+            window: context.window.clone(),
+            allow_foreground: context.allow_foreground,
+            require_background: context.require_background,
+        };
+        match backend.perform_input(&job) {
+            Ok(mut report) => {
+                if !context.no_overlay {
+                    if let Some((x, y)) = crate::tier::input_point(&kind) {
+                        let session = context
+                            .session
+                            .clone()
+                            .unwrap_or_else(|| std::process::id().to_string());
+                        if let Some(warning) = crate::overlay::note_point(x, y, &session) {
+                            report.warnings.push(warning.to_string());
+                        }
+                    }
+                }
+                return Ok(report);
+            }
+            Err(error) => {
+                let next_is_activate = attempts.get(index + 1) == Some(&TierName::Activate);
+                if tier == TierName::Event && error.code() == "execution_failed" && next_is_activate
+                {
+                    let blocked = activate_block(context)?;
+                    let lock_held = blocked.as_ref().is_some_and(is_lock_error);
+                    if crate::tier::fallback_to_activate(lock_held, context.require_background)
+                        && blocked.is_none()
+                    {
+                        event_error = Some(error);
+                        continue;
+                    }
+                }
+                return Err(error);
+            }
+        }
+    }
+    Err(ComputerError::ExecutionFailed("no input tier ran".into()))
+}
+
+fn activate_block(context: &CallContext) -> Result<Option<ComputerError>, ComputerError> {
+    if context.require_background {
+        return Ok(Some(ComputerError::ExecutionFailed(
+            "--require-background refuses tier activate because it uses the foreground cursor"
+                .into(),
+        )));
+    }
+    if context.allow_foreground {
+        return Ok(None);
+    }
+    let Some(path) = crate::foreground::lock_path() else {
+        return Ok(None);
+    };
+    match crate::foreground::holder_if_taken(&path) {
+        Ok(None) => Ok(None),
+        Ok(Some(pid)) if pid > 0 => Ok(Some(ComputerError::ExecutionFailed(format!(
+            "foreground.lock is held by pid {pid}"
+        )))),
+        Ok(Some(_)) => Ok(Some(ComputerError::ExecutionFailed(
+            "foreground.lock is held by another session".into(),
+        ))),
+        Err(error) => Err(error.into_computer()),
+    }
+}
+
+fn is_lock_error(error: &ComputerError) -> bool {
+    error.to_string().contains("foreground.lock")
+}
+
+fn finish_input(
+    mut body: Value,
+    report: crate::tier::InputReport,
+    mut warnings: Vec<String>,
+) -> Value {
+    warnings.extend(report.warnings);
+    body["tier"] = json!(report.tier);
+    body["cursor_moved"] = json!(report.cursor_moved);
+    if let Some(restored) = report.focus_restored {
+        body["focus_restored"] = json!(restored);
+    }
+    if !warnings.is_empty() {
+        body["warnings"] = json!(warnings);
+    }
+    body
 }
 
 pub(crate) fn resolve_scroll(
@@ -2633,7 +2900,9 @@ mod tests {
         );
         assert!(response.ok);
         assert_eq!(backend.scrolls.lock().unwrap().as_slice(), [(0, 3)]);
-        assert_eq!(backend.moves.load(Ordering::SeqCst), 2);
+        assert_eq!(backend.moves.load(Ordering::SeqCst), 1);
+        assert_eq!(response.to_value()["tier"], "event");
+        assert_eq!(response.to_value()["cursor_moved"], false);
 
         let response = dispatch_with(&backend, Action::Displays);
         assert_eq!(response.to_value()["displays"][0]["name"], "Stub");
@@ -3525,7 +3794,7 @@ mod tests {
         assert_eq!(value["stopped_at"], 0);
         assert_eq!(value["results"].as_array().unwrap().len(), 1);
         assert!(!value["results"][0]["ok"].as_bool().unwrap());
-        assert_eq!(stopped.click_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(stopped.click_attempts.load(Ordering::SeqCst), 2);
         assert!(value["error"]["message"]
             .as_str()
             .unwrap()
@@ -3542,7 +3811,7 @@ mod tests {
         assert!(value.get("stopped_at").is_none(), "{value}");
         assert_eq!(value["results"].as_array().unwrap().len(), 2);
         assert!(!value["results"][1]["ok"].as_bool().unwrap());
-        assert_eq!(both.click_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(both.click_attempts.load(Ordering::SeqCst), 4);
 
         let nested = parse_request(json!({
             "action": "batch",
@@ -3745,6 +4014,252 @@ mod tests {
         );
         assert!(allowed.ok, "{allowed:?}");
         assert_eq!(backend.clicks.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "computer-use-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn click_at(x: i32, y: i32) -> Action {
+        Action::Click {
+            x: Some(x),
+            y: Some(y),
+            button: MouseButton::Left,
+            double: false,
+        }
+    }
+
+    fn last_audit(dir: &std::path::Path) -> Value {
+        let text = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
+        serde_json::from_str(text.lines().last().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn auto_event_falls_back_to_activate_unless_blocked() {
+        let backend = StubBackend {
+            fail_tiers: std::sync::Mutex::new(vec!["event".into()]),
+            ..StubBackend::default()
+        };
+        let response = dispatch_with(&backend, click_at(3, 4));
+        assert!(response.ok, "{response:?}");
+        let value = response.to_value();
+        assert_eq!(value["tier"], "activate");
+        assert_eq!(value["cursor_moved"], true);
+        assert_eq!(value["focus_restored"], true);
+        assert_eq!(
+            backend.tiers_run.lock().unwrap().as_slice(),
+            ["event", "activate"]
+        );
+        assert_eq!(backend.clicks.load(Ordering::SeqCst), 1);
+
+        let held = StubBackend {
+            fail_tiers: std::sync::Mutex::new(vec!["event".into()]),
+            ..StubBackend::default()
+        };
+        let dir = temp_dir("lock-fallback");
+        let path = dir.join("foreground.lock");
+        let _slot = crate::foreground::push_lock_path(&path);
+        let _lock = crate::foreground::try_lock(&path).unwrap();
+        let response = dispatch_with(&held, click_at(3, 4));
+        assert_eq!(response.to_value()["error"]["code"], "execution_failed");
+        assert!(response.to_value()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("stub tier event failed"));
+        assert_eq!(held.tiers_run.lock().unwrap().as_slice(), ["event"]);
+        assert_eq!(held.clicks.load(Ordering::SeqCst), 0);
+        drop(_lock);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let background = StubBackend {
+            fail_tiers: std::sync::Mutex::new(vec!["event".into()]),
+            ..StubBackend::default()
+        };
+        let response = dispatch_with_context(
+            &background,
+            click_at(1, 2),
+            &CallContext {
+                require_background: true,
+                ..CallContext::default()
+            },
+        );
+        assert_eq!(response.to_value()["error"]["code"], "execution_failed");
+        assert_eq!(background.tiers_run.lock().unwrap().as_slice(), ["event"]);
+        assert_eq!(background.clicks.load(Ordering::SeqCst), 0);
+
+        let refused = StubBackend::default();
+        let response = dispatch_with_context(
+            &refused,
+            click_at(1, 2),
+            &CallContext {
+                tier: Some("activate".into()),
+                require_background: true,
+                ..CallContext::default()
+            },
+        );
+        assert!(response.to_value()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--require-background"));
+        assert!(refused.tiers_run.lock().unwrap().is_empty());
+        assert_eq!(refused.clicks.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn activate_names_the_lock_holder_before_it_clicks() {
+        let backend = StubBackend::default();
+        let dir = temp_dir("lock-held");
+        let path = dir.join("foreground.lock");
+        let _slot = crate::foreground::push_lock_path(&path);
+        let _lock = crate::foreground::try_lock(&path).unwrap();
+        let response = dispatch_with_context(
+            &backend,
+            click_at(9, 8),
+            &CallContext {
+                tier: Some("activate".into()),
+                ..CallContext::default()
+            },
+        );
+        assert_eq!(response.to_value()["error"]["code"], "execution_failed");
+        let message = response.to_value()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            message.contains(&format!(
+                "foreground.lock is held by pid {}",
+                std::process::id()
+            )),
+            "{message}"
+        );
+        assert_eq!(backend.clicks.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.hit_calls.load(Ordering::SeqCst), 1);
+        assert!(backend.tiers_run.lock().unwrap().is_empty());
+        drop(_lock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn synthetic_without_the_feature_does_not_hit_test_or_click() {
+        let backend = StubBackend::default();
+        let response = dispatch_with_context(
+            &backend,
+            click_at(1, 1),
+            &CallContext {
+                tier: Some("synthetic".into()),
+                ..CallContext::default()
+            },
+        );
+        if crate::tier::skylight_compiled() {
+            assert!(response.ok, "{response:?}");
+            assert_eq!(response.to_value()["tier"], "synthetic");
+            assert_eq!(backend.clicks.load(Ordering::SeqCst), 1);
+            assert_eq!(backend.tiers_run.lock().unwrap().as_slice(), ["synthetic"]);
+        } else {
+            assert_eq!(response.to_value()["error"]["code"], "unsupported");
+            assert!(response.to_value()["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("built without skylight feature"));
+            assert_eq!(backend.hit_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(backend.clicks.load(Ordering::SeqCst), 0);
+            assert!(backend.tiers_run.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn missing_overlay_helper_warns_and_no_overlay_skips_it() {
+        let dir = temp_dir("overlay-warn");
+        let _slot = crate::overlay::push_socket_path(dir.join("missing.sock"));
+        let backend = StubBackend::default();
+        let response = dispatch_with_context(
+            &backend,
+            click_at(4, 5),
+            &CallContext {
+                session: Some("agent".into()),
+                ..CallContext::default()
+            },
+        );
+        assert!(response.ok, "{response:?}");
+        assert_eq!(response.to_value()["tier"], "event");
+        assert_eq!(response.to_value()["cursor_moved"], false);
+        assert!(response.to_value().get("focus_restored").is_none());
+        let warnings = response.to_value()["warnings"].as_array().unwrap().clone();
+        assert!(warnings
+            .iter()
+            .any(|item| item == "overlay helper not running"));
+
+        let quiet = dispatch_with_context(
+            &backend,
+            click_at(4, 5),
+            &CallContext {
+                no_overlay: true,
+                ..CallContext::default()
+            },
+        );
+        assert!(quiet.ok, "{quiet:?}");
+        assert!(quiet.to_value().get("warnings").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn audit_records_decision_source_and_the_real_code() {
+        let dir = temp_dir("audit");
+        let _state = crate::audit::push_state_dir(&dir);
+        let backend = StubBackend::default();
+        let response = dispatch_with(&backend, click_at(2, 3));
+        assert!(response.ok, "{response:?}");
+        let line = last_audit(&dir);
+        assert_eq!(line["action"], "click");
+        assert_eq!(line["code"], "ok");
+        assert_eq!(line["decision"], "allow");
+        assert_eq!(line["source"], "default");
+        assert_eq!(line["tier"], "event");
+        assert!(line.get("text").is_none());
+
+        let denied = dispatch_with_context(&backend, Action::Launch, &ctx("com.apple.Terminal"));
+        assert_eq!(denied.to_value()["error"]["code"], "policy_denied");
+        let line = last_audit(&dir);
+        assert_eq!(line["action"], "launch");
+        assert_eq!(line["code"], "policy_denied");
+        assert_eq!(line["decision"], "deny");
+        assert_eq!(line["source"], "builtin");
+
+        let checked =
+            dispatch_with_context(&backend, Action::PolicyCheck, &ctx("com.apple.Terminal"));
+        assert!(checked.ok, "{checked:?}");
+        assert_eq!(checked.to_value()["decision"], "deny");
+        let line = last_audit(&dir);
+        assert_eq!(line["action"], "policy_check");
+        assert_eq!(line["code"], "ok");
+        assert_eq!(line["decision"], "deny");
+        assert_eq!(line["source"], "builtin");
+
+        let bad = dispatch_with(
+            &backend,
+            Action::Click {
+                x: None,
+                y: None,
+                button: MouseButton::Left,
+                double: false,
+            },
+        );
+        assert_eq!(bad.to_value()["error"]["code"], "invalid_arguments");
+        let line = last_audit(&dir);
+        assert_eq!(line["code"], "invalid_arguments");
+        assert_eq!(line["decision"], "allow");
+        assert_eq!(line["source"], "default");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

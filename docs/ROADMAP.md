@@ -163,7 +163,7 @@ src/
 
 ## Shared contracts
 ### Global flags
-Added as clap global args, and as sibling fields of `action` in JSON. `parse_request` already removes `id` before `Action` is decoded. Extend that strip list so these keys never reach the action enum: `app`, `window`, `element`, `diff`, `full`, `return_state`, `include_screenshot`, `coord`, `session`, `tier`, `adapter`, `display`, `require_visible`.
+Added as clap global args, and as sibling fields of `action` in JSON. `parse_request` already removes `id` before `Action` is decoded. Extend that strip list so these keys never reach the action enum: `app`, `window`, `element`, `diff`, `full`, `return_state`, `include_screenshot`, `coord`, `session`, `tier`, `adapter`, `display`, `require_visible`, `allow_foreground`, `require_background`, `no_overlay`.
 
 | Flag | JSON | Default | Meaning |
 | --- | --- | --- | --- |
@@ -176,6 +176,10 @@ Added as clap global args, and as sibling fields of `action` in JSON. `parse_req
 | `--coord screen\|image` | `coord` | `screen` on the CLI, `image` inside adapters | How to read `x`/`y`. |
 | `--session <id>` | `session` | process id | Cache namespace. |
 | `--tier ax\|event\|synthetic\|activate` | `tier` | auto | Input tier. `synthetic` needs the `skylight` feature and `--synthetic-focus` is accepted as an alias of `--tier synthetic`. |
+| `--synthetic-focus` | sets `tier` to `synthetic` | off | Alias of `--tier synthetic`. Conflicts with `--tier`. |
+| `--allow-foreground` | `allow_foreground` | false | Skip `foreground.lock` for tier `activate`. |
+| `--require-background` | `require_background` | false | Do not fall back to `activate`. Cursor motion is `execution_failed`. |
+| `--no-overlay` | `no_overlay` | false | Do not send the agent point to the overlay helper. |
 | `--adapter native\|openai\|anthropic` | `adapter` | `native` | Schema translator for `exec` and stdin. |
 | `--display <id\|virtual>` | `display` | all | P14. |
 | `--require-visible` | `require_visible` | false | Fail when the element is outside the window and scroll-into-view fails or is missing. |
@@ -300,7 +304,13 @@ Native CLI coordinates stay logical screen points. Adapters speak in pixels of t
 `image_util::image_to_screen` and `screen_to_image` are pure functions with tests for a 2x Retina window, a non-zero origin, a width cap, and a letterboxed `--canvas 1440x900`. Default fit is width 1440, aspect preserved. The image is not scaled up. `--canvas 1440x900` letterboxes and records `pad`. When both `--canvas` and `--max-width` are set, the canvas wins. `scale` stays the capture backing scale, not the downscale ratio.
 
 ### Input tiers
-Auto order is `ax`, then `event`, then `activate`. `synthetic` runs only when requested.
+Accessibility actions (`press`, `set_value`, `focus`, `perform`, `select_text`, `scroll_to`, and `type --element` when the value is settable) stay on `ax` and do not fall back.
+
+Coordinate click, move, scroll, `type` without an element, `type --element` when the value is not settable, and `key` use `event`, then `activate` when `event` returns `execution_failed`, the caller did not set `--require-background`, and another session does not hold `foreground.lock`. `synthetic` runs only when requested. Drag as its own command stays P8. The event poster already maps mouse-dragged types so P8 can reuse them.
+
+On Linux and Windows the auto plan is `activate` only (the existing enigo path). Explicit `--tier event` and `--tier synthetic` return `unsupported` and name the OS. Explicit `--tier activate` is enigo there. macOS `activate` also takes the lock and restores the previous frontmost app.
+
+`CGEventPostToPid` returns void, so a posted event is treated as sent. Failure is `permission_required` when posting is not allowed, `execution_failed` when no target window can be resolved, or `execution_failed` when the cursor moved by more than one point and `--require-background` is set.
 
 | Tier | Flag | Cursor and focus | Mechanism |
 | --- | --- | --- | --- |
@@ -418,10 +428,10 @@ The hook is `--confirm-cmd`, or `COMPUTER_USE_CONFIRM_CMD`, or `confirm.command`
 One JSON object per line, append-only:
 
 ```json
-{"ts":"2026-10-18T12:00:00Z","session":"9","action":"press","bundle_id":"com.apple.Notes","pid":412,"window_id":88,"element":12,"code":"ok","tier":"ax"}
+{"ts":"2026-10-18T12:00:00Z","session":"9","action":"press","bundle_id":"com.apple.Notes","pid":412,"window_id":88,"element":12,"code":"ok","decision":"allow","source":"default","tier":"ax"}
 ```
 
-Never write `text`, `value`, clipboard bytes, or URLs that were blocked. A refusal is audited with the error code.
+Never write `text`, `value`, clipboard bytes, or URLs that were blocked. `code` is the outcome (`ok` or the error code), not a constant. `decision` is `allow`, `deny`, or `confirm`. `source` is `builtin`, `admin`, `user`, `default`, or another policy source. `policy check` can return `ok: true` with `decision: "deny"`; that audit line keeps `code: "ok"` and records `decision: "deny"`.
 
 ### Kill switch
 On the first action of a process, if `pause_on_user_input` is true, install a listen-only `CGEventTap` (`kCGSessionEventTap`, `kCGHeadInsertEventTap`, `kCGEventTapOptionListenOnly`) for key and mouse events. The tap lives in `src/backend/macos/input.rs`. P7 stamps synthetic events with `CGEventSource::set_user_data` and `CGEvent::set_integer_value_field` on `CGEventField::EventSourceUserData` (field 42, constant `0x00C0_5EC0_0DE1`, `policy::SYNTHETIC_EVENT_USER_DATA`). Field 43 is `kCGEventSourceUserID` and is not the marker. The tap ignores events carrying that marker. Any other real user event sets `paused`. The `paused` file next to the audit log is the cross-process source of truth. `computer-use pause` and `resume`, and the JSON actions, set and clear that file. While paused, mutating actions return `paused` after deny, so a denied tree or screenshot stays `policy_denied`. Read-only actions are not pause-blocked. If the tap cannot be created, `doctor` reports `input_monitor: false` and actions still run. The warning `user-input pause unavailable` is added only when `pause_on_user_input` is true and the tap is unavailable. Other platforms use that same warning until P12 and P13. Tests never create a real event tap.
@@ -592,7 +602,7 @@ Actions go through the bound element from P2. Each one re-validates, then tries 
 
 `click --element N` is an alias of `press`. Success then uses `action: "press"`. `--double` with `--element` is press count 2. `click --x --y` stays the coordinate path and, on macOS after this phase, hit-tests first. The result includes `hit` (`role` and `title`, or null). A hit-test error is a warning and the click still runs. Passing both an element and coordinates is `invalid_arguments`.
 
-`type` prefers `set_value` when `--element` is set and `AXValue` is settable (`AXUIElementIsAttributeSettable`). That success uses `tier: "ax"` and `via: "set_value"`. Otherwise it focuses the element and types with enigo, and the success uses `tier: "enigo"` and `via: "enigo"`. Without `--element`, `type` still uses enigo on the focused control and does not report a tier. That split is temporary. P7 routes the enigo path through tiers.
+`type` prefers `set_value` when `--element` is set and `AXValue` is settable (`AXUIElementIsAttributeSettable`). That success uses `tier: "ax"` and `via: "set_value"`. Otherwise it focuses the element and posts the text to that process (`tier: "event"`, `via: "event"`) and does not activate the app. Without `--element`, `type` uses the P7 tier plan. P3 used enigo for those two paths. P7 replaced that so the event tier does not move the cursor. The window id on a non-settable element post is 0: the event still carries the pid and the synthetic marker.
 
 Frame revalidation allows 2 points on each edge. Past that, or when the role or identifier changed, the result is `stale_element` and the action is not performed. The fresh tree is a sibling `tree` field. Element actions update `observed` in the session cache and do not replace the `tree --diff` baseline. `scroll-to-visible` is an alias of `scroll_to`. Secure fields (`AXSecureTextField`, or a subrole containing `Secure`) refuse `set_value`, `select_text`, and `type --element` with `policy_denied`. The value is never read. The built-in deny list runs before any accessibility call on the target. Linux and Windows return `unsupported`.
 
@@ -829,7 +839,7 @@ computer-use click --app Notes --element 3 --tier synthetic
 Result adds `tier`, `cursor_moved`, and `focus_restored`.
 
 ### Failure modes
-`unsupported` for `synthetic` without the feature. `execution_failed` when `CGEventPostToPid` returns an error or when `cursor_moved` is true and `--require-background` is set (the flag treats cursor motion as failure). Lock conflict on `activate`.
+`unsupported` for `synthetic` without the feature, before any hit-test. `CGEventPostToPid` returns void, so it is not itself an error. `permission_required` when event posting is not allowed. `execution_failed` when no target window can be resolved, when the cursor moved by more than one point and `--require-background` is set, or when `foreground.lock` is held on an explicit `activate`. An `execution_failed` from `event` does not fall back to `activate` when the lock is held or `--require-background` is set; the event error is returned. `--no-overlay` skips the helper. A missing helper adds the warning `overlay helper not running` and the action still succeeds.
 
 ### Tests
 - Tier selection table with a stub that fails `ax` and records which tier ran.

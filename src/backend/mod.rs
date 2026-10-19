@@ -231,6 +231,111 @@ pub trait DesktopBackend: Send + Sync {
             Ok(None)
         }
     }
+
+    /// Whether background event posting exists. The stub overrides this.
+    fn input_support(&self) -> crate::tier::Capabilities {
+        #[cfg(target_os = "macos")]
+        {
+            crate::tier::Capabilities { event: true }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            crate::tier::Capabilities { event: false }
+        }
+    }
+
+    /// Run one input tier. The default posts nothing.
+    ///
+    /// `event` and `synthetic` are `unsupported` off macOS. `activate` uses the
+    /// existing foreground enigo path and does not restore focus.
+    fn perform_input(
+        &self,
+        job: &crate::tier::InputJob,
+    ) -> Result<crate::tier::InputReport, ComputerError> {
+        #[cfg(target_os = "macos")]
+        {
+            macos::perform_input(job)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            off_platform_input(self, job)
+        }
+    }
+}
+
+/// Foreground enigo path used when event posting is not available.
+#[cfg(not(target_os = "macos"))]
+fn off_platform_input(
+    backend: &dyn DesktopBackend,
+    job: &crate::tier::InputJob,
+) -> Result<crate::tier::InputReport, ComputerError> {
+    use crate::tier::{InputKind, InputReport, TierName};
+    match job.tier {
+        TierName::Event => {
+            return Err(unsupported("tier event"));
+        }
+        TierName::Synthetic => {
+            return Err(unsupported("tier synthetic"));
+        }
+        TierName::Ax => {
+            return Err(unsupported("tier ax for coordinate and keyboard input"));
+        }
+        TierName::Activate => {}
+    }
+    if job.require_background {
+        return Err(ComputerError::ExecutionFailed(
+            "--require-background refuses tier activate because it uses the foreground cursor"
+                .into(),
+        ));
+    }
+    match &job.kind {
+        InputKind::Click {
+            x,
+            y,
+            button,
+            count,
+        } => {
+            for index in 0..*count {
+                if index > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                backend.simulate_click(*x, *y, *button)?;
+            }
+        }
+        InputKind::Move { x, y } => backend.move_mouse(*x, *y)?,
+        InputKind::Scroll { x, y, dx, dy } => {
+            if let (Some(x), Some(y)) = (x, y) {
+                backend.move_mouse(*x, *y)?;
+            }
+            backend.simulate_scroll(*dx, *dy)?;
+        }
+        InputKind::Type { text } => backend.simulate_type(text)?,
+        InputKind::Key { modifiers, key } => backend.simulate_key(modifiers, key)?,
+    }
+    Ok(InputReport {
+        tier: "activate",
+        cursor_moved: true,
+        focus_restored: None,
+        warnings: Vec::new(),
+    })
+}
+
+/// Overlay helper. macOS opens the click-through window. Other platforms return `unsupported`.
+pub(crate) fn serve_overlay() -> Result<(), ComputerError> {
+    #[cfg(all(target_os = "macos", not(test)))]
+    {
+        macos::overlay::serve()
+    }
+    #[cfg(all(target_os = "macos", test))]
+    {
+        Err(ComputerError::Unsupported(
+            "overlay serve does not open a window in tests".into(),
+        ))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(unsupported("overlay serve"))
+    }
 }
 
 /// Restore Electron flags and stop observers. No-op off macOS.

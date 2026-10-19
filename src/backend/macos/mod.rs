@@ -9,7 +9,11 @@ mod apps;
 mod ax;
 mod capture;
 mod doctor;
+#[cfg(all(feature = "skylight", not(test)))]
+mod focus;
 pub(crate) mod input;
+#[cfg(not(test))]
+pub(crate) mod overlay;
 
 pub(crate) use apps::{activate, launch, list_apps, list_windows, quit};
 pub(crate) use ax::{browser_url, peek_element};
@@ -33,6 +37,13 @@ pub(crate) fn element_action(
 /// Role and title of the element at a screen point.
 pub(crate) fn hit_test(x: i32, y: i32) -> Result<Option<crate::element::HitInfo>, ComputerError> {
     ax::hit_test(x, y)
+}
+
+/// Run one input tier. Unit tests never post events.
+pub(crate) fn perform_input(
+    job: &crate::tier::InputJob,
+) -> Result<crate::tier::InputReport, ComputerError> {
+    input::perform_input(job)
 }
 
 /// Restore Electron flags for `session` and stop its observers.

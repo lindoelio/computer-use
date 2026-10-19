@@ -50,6 +50,13 @@ const OWNER_FILE: &str = "owner.json";
 /// Sessions older than this, whose owner process is not alive, are stale.
 pub const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// Cache root: `foreground.lock` and `overlay.sock` live here, next to `sessions/`.
+///
+/// This does not create the directory. Tests panic unless `XDG_CACHE_HOME` is set.
+pub fn cache_dir() -> PathBuf {
+    cache_root()
+}
+
 /// Directory that holds every session. This does not create it.
 pub fn sessions_root() -> PathBuf {
     cache_root().join("sessions")

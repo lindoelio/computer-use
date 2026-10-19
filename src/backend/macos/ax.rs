@@ -327,7 +327,7 @@ fn element_action_inner(request: &ElementRequest) -> Result<ElementOutcome, Elem
             )),
         }
     }
-    let via = run_steps(element, &planned, &gate)?;
+    let via = run_steps(element, &planned, &gate, live.app.pid)?;
     // A failed re-read must not turn a completed action into an error.
     let mut revision = cached_revision;
     match read_live(&query, false) {
@@ -353,6 +353,7 @@ fn run_steps(
     element: &AXUIElement,
     planned: &[Step],
     gate: &Gate,
+    pid: i32,
 ) -> Result<Option<String>, ElementInterrupt> {
     let mut via = None;
     for step in planned {
@@ -381,8 +382,8 @@ fn run_steps(
             }
             Step::TypeEnigo { text } => {
                 set_focused(element)?;
-                crate::backend::input::type_text(text)?;
-                via = Some("enigo".into());
+                super::input::post_text_to_pid(pid, text)?;
+                via = Some("event".into());
             }
         }
     }

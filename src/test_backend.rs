@@ -63,6 +63,8 @@ pub struct StubBackend {
     pub fail_hit: bool,
     /// Click attempts, including ones [`Self::fail_click`] rejects.
     pub click_attempts: AtomicU32,
+    /// Times [`DesktopBackend::hit_test`] ran.
+    pub hit_calls: AtomicU32,
     /// Role and title returned by [`DesktopBackend::hit_test`].
     pub hit: Mutex<Option<HitInfo>>,
     /// Actions the stub performed, as `(name, element index)`.
@@ -79,6 +81,12 @@ pub struct StubBackend {
     pub block_display: bool,
     /// Page URL returned by [`DesktopBackend::browser_url`], keyed by pid.
     pub browser_urls: Mutex<HashMap<i32, String>>,
+    /// Tier names that [`DesktopBackend::perform_input`] rejects before acting.
+    pub fail_tiers: Mutex<Vec<String>>,
+    /// Tiers [`DesktopBackend::perform_input`] was asked to run, in order.
+    pub tiers_run: Mutex<Vec<String>>,
+    /// Event and synthetic tiers report cursor motion. With `--require-background` they fail first.
+    pub event_moves_cursor: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -119,6 +127,7 @@ impl Default for StubBackend {
             fail_scroll: false,
             fail_hit: false,
             click_attempts: AtomicU32::new(0),
+            hit_calls: AtomicU32::new(0),
             hit: Mutex::new(None),
             performs: Mutex::new(Vec::new()),
             element_fixtures: Mutex::new(HashMap::new()),
@@ -127,6 +136,9 @@ impl Default for StubBackend {
             capture_fault: StubCaptureFault::None,
             block_display: false,
             browser_urls: Mutex::new(HashMap::new()),
+            fail_tiers: Mutex::new(Vec::new()),
+            tiers_run: Mutex::new(Vec::new()),
+            event_moves_cursor: false,
         }
     }
 }
@@ -553,8 +565,8 @@ impl DesktopBackend for StubBackend {
             if let element::Step::TypeEnigo { text } = step {
                 self.record(request.index, "AXFocused");
                 self.typed.lock().expect("typed").push(text.clone());
-                self.record(request.index, "enigo");
-                via = Some("enigo".into());
+                self.record(request.index, "event");
+                via = Some("event".into());
                 continue;
             }
             if matches!(step, element::Step::TypeSetValue { .. }) {
@@ -631,6 +643,7 @@ impl DesktopBackend for StubBackend {
     }
 
     fn hit_test(&self, _x: i32, _y: i32) -> Result<Option<HitInfo>, ComputerError> {
+        self.hit_calls.fetch_add(1, Ordering::SeqCst);
         if self.fail_hit {
             return Err(ComputerError::ExecutionFailed("hit test failed".into()));
         }
@@ -647,6 +660,84 @@ impl DesktopBackend for StubBackend {
             });
         }
         Ok(report)
+    }
+
+    fn input_support(&self) -> crate::tier::Capabilities {
+        crate::tier::Capabilities { event: true }
+    }
+
+    fn perform_input(
+        &self,
+        job: &crate::tier::InputJob,
+    ) -> Result<crate::tier::InputReport, ComputerError> {
+        use crate::tier::{InputKind, InputReport, TierName};
+        self.tiers_run
+            .lock()
+            .expect("tiers")
+            .push(job.tier.as_str().to_string());
+        if self
+            .fail_tiers
+            .lock()
+            .expect("fail tiers")
+            .iter()
+            .any(|name| name == job.tier.as_str())
+        {
+            return Err(ComputerError::ExecutionFailed(format!(
+                "stub tier {} failed",
+                job.tier.as_str()
+            )));
+        }
+        if job.tier == TierName::Synthetic && !crate::tier::skylight_compiled() {
+            return Err(ComputerError::Unsupported(
+                "built without skylight feature".into(),
+            ));
+        }
+        if job.tier == TierName::Ax {
+            return Err(ComputerError::Unsupported(
+                "tier ax does not post coordinate or keyboard events".into(),
+            ));
+        }
+        if job.tier == TierName::Activate && job.require_background {
+            return Err(ComputerError::ExecutionFailed(
+                "--require-background refuses tier activate because it uses the foreground cursor"
+                    .into(),
+            ));
+        }
+        let background = matches!(job.tier, TierName::Event | TierName::Synthetic);
+        if background && self.event_moves_cursor && job.require_background {
+            return Err(ComputerError::ExecutionFailed(
+                "cursor moved and --require-background is set".into(),
+            ));
+        }
+        match &job.kind {
+            InputKind::Click {
+                x,
+                y,
+                button,
+                count,
+            } => {
+                for _ in 0..*count {
+                    self.simulate_click(*x, *y, *button)?;
+                }
+            }
+            InputKind::Move { x, y } => self.move_mouse(*x, *y)?,
+            InputKind::Scroll { x, y, dx, dy } => {
+                if job.tier == TierName::Activate {
+                    if let (Some(x), Some(y)) = (x, y) {
+                        self.move_mouse(*x, *y)?;
+                    }
+                }
+                self.simulate_scroll(*dx, *dy)?;
+            }
+            InputKind::Type { text } => self.simulate_type(text)?,
+            InputKind::Key { modifiers, key } => self.simulate_key(modifiers, key)?,
+        }
+        Ok(InputReport {
+            tier: job.tier.as_str(),
+            cursor_moved: job.tier == TierName::Activate || (background && self.event_moves_cursor),
+            focus_restored: (job.tier == TierName::Activate).then_some(true),
+            warnings: Vec::new(),
+        })
     }
 }
 
@@ -1080,11 +1171,13 @@ mod tests {
         let outcome = backend
             .element_action(&request(ElementOp::Type { text: "hi".into() }, 1))
             .unwrap();
-        assert_eq!(outcome.tier, "enigo");
-        assert_eq!(outcome.via.as_deref(), Some("enigo"));
+        assert_eq!(outcome.tier, "event");
+        assert!(!outcome.cursor_moved);
+        assert!(outcome.focus_restored.is_none());
+        assert_eq!(outcome.via.as_deref(), Some("event"));
         assert_eq!(
             performs(&backend),
-            vec![("AXFocused".into(), 1), ("enigo".into(), 1)]
+            vec![("AXFocused".into(), 1), ("event".into(), 1)]
         );
         assert_eq!(backend.typed.lock().unwrap().as_slice(), ["hi"]);
     }

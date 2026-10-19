@@ -96,8 +96,12 @@ pub struct AuditRecord<'a> {
     pub window_id: Option<u32>,
     /// Element index when the action named one.
     pub element: Option<u32>,
-    /// `ok` or the error code.
+    /// `ok` or the error code. This is the action outcome, not a constant.
     pub code: &'a str,
+    /// `allow`, `deny`, or `confirm`.
+    pub decision: &'a str,
+    /// `builtin`, `admin`, `user`, `default`, or another policy source.
+    pub source: &'a str,
     /// Input tier when the action reported one.
     pub tier: Option<&'a str>,
 }
@@ -116,6 +120,8 @@ struct AuditLine<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     element: Option<u32>,
     code: &'a str,
+    decision: &'a str,
+    source: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     tier: Option<&'a str>,
 }
@@ -134,6 +140,8 @@ pub fn record(entry: &AuditRecord<'_>) -> Result<(), ComputerError> {
         window_id: entry.window_id,
         element: entry.element,
         code: entry.code,
+        decision: entry.decision,
+        source: entry.source,
         tier: entry.tier,
     };
     let text = serde_json::to_string(&line)
@@ -234,13 +242,17 @@ mod tests {
             pid: Some(412),
             window_id: Some(88),
             element: Some(12),
-            code: "ok",
+            code: "policy_denied",
+            decision: "deny",
+            source: "builtin",
             tier: Some("ax"),
         })
         .unwrap();
         let text = fs::read_to_string(dir.join("audit.jsonl")).unwrap();
         assert!(text.contains("\"action\":\"set_value\""));
-        assert!(text.contains("\"code\":\"ok\""));
+        assert!(text.contains("\"code\":\"policy_denied\""));
+        assert!(text.contains("\"decision\":\"deny\""));
+        assert!(text.contains("\"source\":\"builtin\""));
         assert!(!text.contains("\"value\""));
         assert!(!text.contains("super-secret-token"));
         let _ = fs::remove_dir_all(&dir);

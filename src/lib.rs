@@ -24,12 +24,15 @@ pub mod backend;
 pub mod cache;
 pub mod element;
 pub mod error;
+mod foreground;
 mod image_util;
 pub mod keys;
+pub mod overlay;
 pub mod policy;
 pub mod protocol;
 pub mod state;
 pub mod target;
+mod tier;
 pub mod tree;
 pub mod types;
 

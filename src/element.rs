@@ -141,7 +141,7 @@ pub enum Step {
         /// Text to write.
         text: String,
     },
-    /// Focus the element, then type with the foreground keyboard path.
+    /// Focus the element, then post the text to its process. Does not activate the app.
     TypeEnigo {
         /// Text to type.
         text: String,
@@ -179,8 +179,12 @@ pub struct ElementOutcome {
     pub element: u32,
     /// Structural hash after the action.
     pub revision: u64,
-    /// `ax` when the action used Accessibility. `enigo` is the type fallback.
+    /// `ax` for an accessibility action. `event` posts to the pid. `activate` uses the foreground path.
     pub tier: String,
+    /// True when this action moved the system cursor.
+    pub cursor_moved: bool,
+    /// Set when the action tried to restore the previous frontmost app.
+    pub focus_restored: Option<bool>,
     /// Non-fatal notes. Scroll failure lands here unless `--require-visible` is set.
     pub warnings: Vec<String>,
     /// `set_value` or `enigo` for `type`. Empty for other commands.
@@ -198,16 +202,21 @@ pub fn outcome(
     warnings: Vec<String>,
     via: Option<String>,
 ) -> ElementOutcome {
-    let tier = if via.as_deref() == Some("enigo") {
-        "enigo"
-    } else {
-        "ax"
+    let tier = match via.as_deref() {
+        Some("event") => "event",
+        Some("activate") => "activate",
+        Some("enigo") => "enigo",
+        _ => "ax",
     };
+    let cursor_moved = matches!(via.as_deref(), Some("activate") | Some("enigo"));
+    let focus_restored = (via.as_deref() == Some("activate")).then_some(true);
     ElementOutcome {
         action: request.op.action_name().to_string(),
         element: request.index,
         revision,
         tier: tier.to_string(),
+        cursor_moved,
+        focus_restored,
         warnings,
         via,
         name: match &request.op {

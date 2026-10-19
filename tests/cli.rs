@@ -121,6 +121,12 @@ fn help_lists_commands() {
         "--screenshot",
         "--coord",
         "--adapter",
+        "--tier",
+        "--synthetic-focus",
+        "--allow-foreground",
+        "--require-background",
+        "--no-overlay",
+        "overlay",
     ] {
         assert!(stdout.contains(needle), "help missing {needle}:\n{stdout}");
     }

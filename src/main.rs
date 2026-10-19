@@ -89,6 +89,26 @@ struct Cli {
     #[arg(long, global = true, value_name = "COMMAND")]
     confirm_cmd: Option<String>,
 
+    /// Input tier. Absent is auto: accessibility for presses, event then activate for coordinates.
+    #[arg(long, global = true, value_enum, value_name = "TIER")]
+    tier: Option<CliTier>,
+
+    /// Alias of `--tier synthetic`. Requires a binary built with `--features skylight`.
+    #[arg(long, global = true, conflicts_with = "tier")]
+    synthetic_focus: bool,
+
+    /// Skip `foreground.lock` when the tier is `activate`.
+    #[arg(long, global = true)]
+    allow_foreground: bool,
+
+    /// Stay in the background. Do not fall back to `activate`, and fail if the cursor moves.
+    #[arg(long, global = true)]
+    require_background: bool,
+
+    /// Do not send the agent point to the overlay helper.
+    #[arg(long, global = true)]
+    no_overlay: bool,
+
     #[command(subcommand)]
     command: Option<CliCommand>,
 }
@@ -424,6 +444,45 @@ enum CliCommand {
         /// JSON object with an `action` field and optional `id`.
         json: String,
     },
+
+    /// Local agent-cursor helper. This is not a network service.
+    Overlay {
+        #[command(subcommand)]
+        command: OverlayCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum OverlayCommand {
+    /// Draw a click-through ring at points read from the overlay socket.
+    Serve,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliTier {
+    /// Accessibility action or value. Does not activate the app.
+    #[value(name = "ax")]
+    Ax,
+    /// Post events to the target process. Does not move the system cursor.
+    #[value(name = "event")]
+    Event,
+    /// Private SkyLight front-process call, then post events. Feature `skylight`.
+    #[value(name = "synthetic")]
+    Synthetic,
+    /// Activate the target, run foreground input, then restore the previous app.
+    #[value(name = "activate")]
+    Activate,
+}
+
+impl CliTier {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ax => "ax",
+            Self::Event => "event",
+            Self::Synthetic => "synthetic",
+            Self::Activate => "activate",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -533,6 +592,18 @@ fn run() -> u8 {
             println!();
             2
         }
+        (
+            Some(CliCommand::Overlay {
+                command: OverlayCommand::Serve,
+            }),
+            false,
+        ) => match computer_use::overlay::serve() {
+            Ok(()) => 0,
+            Err(error) => {
+                emit(&Response::from_error(error), cli.pretty);
+                1
+            }
+        },
         (Some(command), false) => {
             if let Some(response) = reject_non_native_adapter(cli.adapter.as_deref()) {
                 emit(&response, cli.pretty);
@@ -551,6 +622,10 @@ fn run() -> u8 {
                 coord: cli.coord.clone(),
                 policy: cli.policy.as_ref().map(|path| path.display().to_string()),
                 confirm_cmd: cli.confirm_cmd.clone(),
+                tier: tier_name(&cli).map(str::to_string),
+                allow_foreground: cli.allow_foreground,
+                require_background: cli.require_background,
+                no_overlay: cli.no_overlay,
                 ..CallContext::default()
             };
             match command_action(command, context) {
@@ -715,10 +790,10 @@ fn command_action(
                 ttl_secs: Some(*ttl),
             },
         },
-        CliCommand::Serve | CliCommand::Exec { .. } => {
+        CliCommand::Serve | CliCommand::Exec { .. } | CliCommand::Overlay { .. } => {
             return Err(Response::failure(
                 "invalid_arguments",
-                "internal error: serve and exec are not desktop actions",
+                "internal error: serve, exec, and overlay are not desktop actions",
             ))
         }
     };
@@ -746,11 +821,23 @@ fn reject_non_native_adapter(adapter: Option<&str>) -> Option<Response> {
     }
 }
 
+fn tier_name(cli: &Cli) -> Option<&'static str> {
+    if cli.synthetic_focus {
+        Some("synthetic")
+    } else {
+        cli.tier.map(CliTier::as_str)
+    }
+}
+
 fn line_options(cli: &Cli) -> LineOptions<'_> {
     LineOptions {
         adapter: cli.adapter.as_deref(),
         policy: cli.policy.as_ref().and_then(|path| path.to_str()),
         confirm_cmd: cli.confirm_cmd.as_deref(),
+        tier: tier_name(cli),
+        allow_foreground: cli.allow_foreground,
+        require_background: cli.require_background,
+        no_overlay: cli.no_overlay,
     }
 }
 
