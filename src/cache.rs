@@ -324,8 +324,11 @@ pub fn prune_empty_sessions() -> Result<Vec<String>, ComputerError> {
 }
 
 /// True when `pid` is still running. Signal 0 does not deliver a signal.
+///
+/// `0` is the current process group. A value above `i32::MAX` becomes `-1`
+/// in `kill`, and `-1` means every process the caller may signal.
 pub fn pid_alive(pid: u32) -> bool {
-    if pid == 0 {
+    if pid == 0 || pid > i32::MAX as u32 {
         return false;
     }
     #[cfg(unix)]
