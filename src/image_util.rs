@@ -93,6 +93,9 @@ pub(crate) fn display_block_reason(facts: DisplayFacts) -> Option<&'static str> 
 }
 
 /// `display_unavailable` when the screen cannot be captured, otherwise `window_not_found`.
+///
+/// Production callers are macOS ScreenCaptureKit. Tests on every OS pass fake facts.
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) fn error_for_missing_window(facts: DisplayFacts, window_id: u32) -> ComputerError {
     if let Some(reason) = display_block_reason(facts) {
         return ComputerError::DisplayUnavailable(reason.into());
