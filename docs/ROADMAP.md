@@ -1091,23 +1091,23 @@ The full CI matrix, plus `bash -n scripts/package-macos-app.sh`, plus a dry-run 
 
 | Codex CU feature | Codex | Ours (target) | Status | Notes |
 | --- | --- | --- | --- | --- |
-| Key-window AX tree as compact numbered text on each observation | Yes | Yes, `tree` and `get-state` | PARTIAL | 0.1.0 returns a JXA JSON tree of the front window, depth 6, 30 children. P2 emits numbered text. |
+| Key-window AX tree as compact numbered text on each observation | Yes | Yes, `tree` and `get-state` | DONE | P2. Numbered text from the native AX tree. osascript remains the fallback and sets `source=osascript`. Linux and Windows `tree` returns `unsupported`. |
 | Window screenshot with the tree | Yes | Yes, target window only | PARTIAL | 0.1.0 screenshots the desktop or a region via xcap. P4 captures the window. |
 | `element_index` targeting | Yes | `--element` / `element` | TODO | P3. |
 | `x`/`y` fallback when no index | Yes | Hit-test, then event tier | PARTIAL | Coordinate click and move work through enigo and move the cursor. P3 adds hit-test. P7 adds the event tier. |
-| Ids bound to pid + window + revision | Yes | `BoundElement` in the session cache | TODO | P2. |
-| Re-fetch and validate before acting | Yes | Yes, mismatch is `stale_element` | TODO | P2 cache, P3 enforcement. |
+| Ids bound to pid + window + revision | Yes | `BoundElement` in the session cache | DONE | P2 stores `BoundElement` and the structural revision. P3 is what acts on the index. |
+| Re-fetch and validate before acting | Yes | Yes, mismatch is `stale_element` | PARTIAL | P2 re-fetches on every `tree` and `get-state` and keeps role, identifier, and frame for revalidation. `stale_element` enforcement is P3. |
 | Scroll into view before the action | Yes | `AXScrollToVisible` or platform equivalent | TODO | P3, P12, P13. |
-| `AXManualAccessibility` and `AXEnhancedUserInterface` for Electron | Yes | Set on attach, restore on teardown | TODO | P2. 0.1.0 does not set them. |
-| Content hosted in another process | Yes | Walk child pids, cap 3 helpers | TODO | P2. |
+| `AXManualAccessibility` and `AXEnhancedUserInterface` for Electron | Yes | Set on attach, restore on teardown | DONE | P2 sets both on first attach and restores them from `session end` and process exit. A crash, or a caller that never calls `shutdown_sessions`, can leave the flag set until the target app quits. A later `session end` restores from the cache and does not write an attribute this process did not change. |
+| Content hosted in another process | Yes | Walk child pids, cap 3 helpers | DONE | P2. Foreign child pids are walked once, then a parent-pid scan. Cap is 3. |
 | Set text through the value, not keystrokes | Yes | `set_value` via `AXValue` | TODO | P3. `type` today is enigo. |
 | `set_value` | Yes | `set_value` | TODO | P3. |
 | `select_text` via selected range | Yes | `AXSelectedTextRange` / UIA Text / AT-SPI Text | TODO | P3, P12, P13. |
 | Secondary actions (`AXShowMenu`, increment, confirm) | Yes | `perform_action` allowlist | TODO | P3. |
-| Tree diff between turns | Yes | `--diff` and cache baseline | TODO | P2. |
-| Force-full flag | Yes | `--full` | TODO | P2. |
-| Truncation of long child lists | Yes | 40 children, depth 12, 400 lines | PARTIAL | JXA caps at 30 children and depth 6. P2 moves the caps into `tree.rs`. |
-| URL shortening | Yes | Scheme, host, path. Query stripped. | TODO | P2. |
+| Tree diff between turns | Yes | `--diff` and cache baseline | DONE | P2. `--diff` is the default once a baseline exists. The signature is role, identifier-or-title, and child count, with an LCS inside each parent. |
+| Force-full flag | Yes | `--full` | DONE | P2. `--full` prints the whole tree and replaces the baseline. |
+| Truncation of long child lists | Yes | 40 children, depth 12, 400 lines | DONE | P2 caps live in `tree.rs`: 40 children (`… +N`), depth 12, 400 lines, then `truncated=true`. Secure values and URL queries are not stored. |
+| URL shortening | Yes | Scheme, host, path. Query stripped. | DONE | P2. `http` and `https` values keep scheme, host, and at most 60 characters of the path. The query is dropped. |
 | Capture only the target window | Yes | SCK desktop-independent window, HWND, portal | PARTIAL | Region crop can imitate a window. It is not window capture. P4. |
 | Every action can return the new state | Yes | `--state` plus optional screenshot | TODO | P5. 0.1.0 returns only the action result. |
 | Events posted to the target pid | Yes | `CGEventPostToPid` | TODO | P7. |
@@ -1117,13 +1117,13 @@ The full CI matrix, plus `bash -n scripts/package-macos-app.sh`, plus a dry-run 
 | Parallel agents | Yes | Per-session cache, no shared cursor on ax/event tiers | TODO | P7 lock. 0.1.0 has no session and always moves the one cursor. |
 | Does not steal the cursor or the focus | Yes on the background path | Tiers `ax` and `event` | TODO | 0.1.0 steals both, via enigo. |
 | `list_apps` | Yes | `list-apps` with bundle id, pid, path | DONE | P1 on macOS via NSWorkspace. Linux and Windows return `unsupported` until P13 and P12. |
-| Window inventory | Yes | `list-windows` joined to CG z-order | PARTIAL | P1 lists on-screen CG windows with z-order, bounds, layer, and window number. `ax_matched` stays false until P2 joins them to AX windows. |
+| Window inventory | Yes | `list-windows` joined to CG z-order | DONE | P1 lists on-screen CG windows with z-order, bounds, layer, and window number. P2 sets `ax_matched` when an AX window shares those bounds within 2 points. The flag stays false, with a note, when Accessibility is off. |
 | Launch apps | Yes | `launch` via `NSWorkspace` | DONE | P1 on macOS, with `activate` and `quit`. `quit` calls `terminate()` only. Off macOS those three commands return `unsupported`. |
 | z-order | Yes | CGWindow list order, index 0 in front | DONE | P1. An `--app` filter renumbers so 0 is that app's front window. A window id uses the `id:` prefix. |
 | Per-app approval / allowlist | Yes | `policy.toml` allow and deny | TODO | P6. The built-in deny list landed in P1. |
 | Admin policy | Yes | `/etc/computer-use/policy.toml`, deny wins | TODO | P6. |
 | Sensitive-action confirmation | Yes | Confirm hook, secure fields always refused | TODO | P6. |
-| Refuses terminals | Yes | Built-in deny list | PARTIAL | P1 matches bundle id, executable file name, and an `.app` path component. `policy.toml` is P6. |
+| Refuses terminals | Yes | Built-in deny list | PARTIAL | P1 matches bundle id, executable file name, and an `.app` path component. P2 adds Terax (`app.crynta.terax`). `policy.toml` is P6. |
 | Blocked-URL error | Yes | `blocked_url` for browsers and for CDP | TODO | P6, used again by P10. |
 | Path-resolved app identity | Yes | Canonical executable path | PARTIAL | P1 deny checks the canonical executable path. `allow.path` enforcement is P6. |
 | Relock / pause on local input | Yes | Listen-only `CGEventTap`, ignore our marker | TODO | P6. |
@@ -1150,7 +1150,7 @@ Update this table at the end of a phase. `commit` is the full hash on `main` of 
 | --- | --- | --- | --- |
 | P0 Planning | DONE | this commit | No code changes. Hash is `git rev-parse HEAD` after this commit lands. |
 | P1 Targeting, inventory, doctor | DONE | `921e942947a1ce841b3026c0d33fdd2caecc701e` | `rust-version` 1.91. Built-in deny. macOS list-apps, list-windows, launch, activate, quit, and doctor. Feature commit `4266448035c78352c79b9025db01c445d8d0ff39`; this hash is the Windows clippy fix CI accepted. `ax_matched` stays false until P2. `activate` does not raise one AX window. `quit` is `terminate()` only. Linux and Windows inventory returns `unsupported`. Their doctor probes stay null (P13 / P12) and `--request` does not prompt there. `dirs` is deferred to P2. Live doctor on this machine saw Accessibility denied for Grok Bot and Screen Recording granted. |
-| P2 macOS AX tree, diff, cache | TODO | | osascript becomes the fallback. |
+| P2 macOS AX tree, diff, cache | DONE | `605069185333dd9a018d2e58a66c9bd7564ff6c9` | Native AX tree, numbered text, diff, and session cache. Feature commit `514f94783b8ef92ee8c2e8ab01a1af04dd7ff284`; this hash is the Windows clippy fix CI accepted. Linux and Windows `tree` returns `unsupported`. osascript is the fallback only when creating the application element fails for a reason other than permission or a messaging timeout (`source=osascript`). The observer only marks a pid dirty; every observation still re-fetches. A crash, or a caller that never calls `shutdown_sessions`, can leave Electron flags set until the target app quits. A later `session end` restores from the cache and does not write an attribute this process did not change. Revalidation data is stored; `stale_element` is P3. Helper walks are capped at 3. `ax_matched` stays false when Accessibility is off. `--app` name ties prefer Regular activation policy. Terax (`app.crynta.terax`) is on the built-in deny list. Live `tree --app Finder` returned `permission_required` for Grok Bot. |
 | P3 Element actions | TODO | | Revalidate, scroll-to-visible, secure refuse. |
 | P4 Window capture and remap | TODO | | Default max-width 1440. |
 | P5 State, batch, adapters | TODO | | OpenAI and Anthropic fixtures. |
