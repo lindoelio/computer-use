@@ -178,10 +178,10 @@ fn cache_root() -> PathBuf {
     }
     #[cfg(windows)]
     {
-        return dirs::data_local_dir()
+        dirs::data_local_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("computer-use")
-            .join("cache");
+            .join("cache")
     }
     #[cfg(not(windows))]
     {
@@ -266,10 +266,10 @@ mod tests {
             .unwrap()
             .expect("stored snapshot");
         assert_eq!(loaded, snapshot);
-        let path = snapshot_path(session, Some("com.apple.Notes"), 12, 34).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            let path = snapshot_path(session, Some("com.apple.Notes"), 12, 34).unwrap();
             let mode = fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "mode {mode:o}");
         }
