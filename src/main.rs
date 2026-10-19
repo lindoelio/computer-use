@@ -45,6 +45,14 @@ struct Cli {
     #[arg(long, global = true, value_name = "TITLE|INDEX|ID")]
     window: Option<String>,
 
+    /// Element index from the latest `tree` for this app and window.
+    #[arg(long, global = true, value_name = "N")]
+    element: Option<u32>,
+
+    /// Fail when the element is outside the window and scroll-into-view cannot run.
+    #[arg(long, global = true)]
+    require_visible: bool,
+
     /// Print a diff against the cached tree. This is the default once a baseline exists.
     #[arg(long, global = true, conflicts_with = "full")]
     diff: bool,
@@ -94,23 +102,83 @@ enum CliCommand {
         base64: bool,
     },
 
-    /// Move the pointer to a logical point and click.
+    /// Move the pointer to a logical point and click, or press an element.
+    ///
+    /// `--element N` is an alias of `press`. `--x` and `--y` click that point.
+    /// Pass one of those forms, not both.
     ///
     /// Example: computer-use click --x 120 --y 240 --button right --double
     Click {
-        /// Logical x coordinate.
+        /// Logical x coordinate. Required with `--y` when `--element` is omitted.
         #[arg(long)]
-        x: i32,
-        /// Logical y coordinate.
+        x: Option<i32>,
+        /// Logical y coordinate. Required with `--x` when `--element` is omitted.
         #[arg(long)]
-        y: i32,
+        y: Option<i32>,
         /// Mouse button. Default: left.
         #[arg(long, value_enum, default_value = "left")]
         button: CliButton,
-        /// Click twice.
+        /// Click twice. With `--element`, this presses twice.
         #[arg(long)]
         double: bool,
     },
+
+    /// Press an element from the current tree. `--count` may be 1, 2, or 3.
+    ///
+    /// Example: computer-use press --app Notes --element 12 --count 2
+    Press {
+        /// How many times to press. Default: 1.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=3))]
+        count: u8,
+    },
+
+    /// Set an element's value. Secure fields are refused.
+    ///
+    /// Example: computer-use set-value --element 4 --value "hello"
+    #[command(name = "set-value", visible_alias = "set_value")]
+    SetValue {
+        /// New value.
+        #[arg(long)]
+        value: String,
+    },
+
+    /// Select a character range. Secure fields are refused.
+    ///
+    /// Example: computer-use select-text --element 4 --start 0 --end 5
+    #[command(name = "select-text", visible_alias = "select_text")]
+    SelectText {
+        /// First selected character.
+        #[arg(long)]
+        start: i64,
+        /// Character after the selection.
+        #[arg(long)]
+        end: i64,
+    },
+
+    /// Perform an allowlisted accessibility action.
+    ///
+    /// Example: computer-use perform-action --element 9 --name AXShowMenu
+    #[command(name = "perform-action", visible_alias = "perform_action")]
+    PerformAction {
+        /// Action name, such as `AXShowMenu` or `AXPress`.
+        #[arg(long)]
+        name: String,
+    },
+
+    /// Scroll an element into view.
+    ///
+    /// Example: computer-use scroll-to --element 9
+    #[command(
+        name = "scroll-to",
+        visible_alias = "scroll-to-visible",
+        aliases = ["scroll_to", "scroll_to_visible"]
+    )]
+    ScrollTo,
+
+    /// Focus an element.
+    ///
+    /// Example: computer-use focus --element 4
+    Focus,
 
     /// Move the pointer without clicking.
     ///
@@ -397,9 +465,11 @@ fn run() -> u8 {
             let context = CallContext {
                 app: cli.app.clone(),
                 window: cli.window.clone(),
+                element: cli.element,
                 diff: cli.diff,
                 full: cli.full,
                 session: cli.session.clone(),
+                require_visible: cli.require_visible,
                 ..CallContext::default()
             };
             match command_action(command, context) {
@@ -454,6 +524,17 @@ fn command_action(
             button: MouseButton::from(*button),
             double: *double,
         },
+        CliCommand::Press { count } => Action::Press { count: *count },
+        CliCommand::SetValue { value } => Action::SetValue {
+            value: value.clone(),
+        },
+        CliCommand::SelectText { start, end } => Action::SelectText {
+            start: *start,
+            end: *end,
+        },
+        CliCommand::PerformAction { name } => Action::PerformAction { name: name.clone() },
+        CliCommand::ScrollTo => Action::ScrollTo,
+        CliCommand::Focus => Action::Focus,
         CliCommand::Move { x, y } => Action::Move { x: *x, y: *y },
         CliCommand::Type { text } => Action::Type { text: text.clone() },
         CliCommand::Key { keys } => Action::Key { keys: keys.clone() },

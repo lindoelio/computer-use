@@ -34,7 +34,7 @@ pub enum ComputerError {
     #[error("element not found: {0}")]
     ElementNotFound(String),
 
-    /// The element index exists, but its role or identifier changed.
+    /// The element index exists, but its role, identifier, or frame changed.
     #[error("stale element: {0}")]
     StaleElement(String),
 

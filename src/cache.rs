@@ -34,6 +34,15 @@ pub struct Snapshot {
     pub bundle_id: Option<String>,
     /// Electron flags to restore. Absent when this process did not change them.
     pub electron: Option<ElectronEdit>,
+    /// Latest tree used to revalidate element indices.
+    ///
+    /// `tree --diff` keeps comparing against [`Self::root`]. An element action
+    /// updates this field and leaves the diff baseline in place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed: Option<SigNode>,
+    /// [`revision_of`](crate::tree::revision_of) of [`Self::observed`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_revision: Option<u64>,
 }
 
 /// Directory for one session.
@@ -233,6 +242,7 @@ mod tests {
                 child_count: 0,
                 value: String::new(),
                 frame: None,
+                secure: false,
                 children: Vec::new(),
             },
             truncated: false,
@@ -240,6 +250,8 @@ mod tests {
             window_id: window,
             bundle_id: Some("com.apple.Notes".into()),
             electron: None,
+            observed: None,
+            observed_revision: None,
         }
     }
 

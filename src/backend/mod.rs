@@ -14,6 +14,7 @@ mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 
+use crate::element::{ElementError, ElementOutcome, ElementRequest, HitInfo};
 use crate::error::ComputerError;
 use crate::target::{AppInfo, DoctorReport, LaunchResult, QuitResult, WindowList};
 use crate::tree::{TreeQuery, TreeReport};
@@ -106,6 +107,33 @@ pub trait DesktopBackend: Send + Sync {
     /// An empty list means there was nothing to restore.
     fn end_session(&self, _session: Option<&str>) -> Result<Vec<i32>, ComputerError> {
         Ok(Vec::new())
+    }
+
+    /// Press, focus, set a value, select text, perform an action, scroll, or type
+    /// into one cached element. The element is revalidated before the action.
+    fn element_action(&self, request: &ElementRequest) -> Result<ElementOutcome, ElementError> {
+        #[cfg(target_os = "macos")]
+        {
+            macos::element_action(request)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(ElementError::new(unsupported(&request.op.action_name())))
+        }
+    }
+
+    /// Hit-test a screen point. macOS reports the element under the point.
+    /// Other platforms return `Ok(None)` and the coordinate click still runs.
+    fn hit_test(&self, x: i32, y: i32) -> Result<Option<HitInfo>, ComputerError> {
+        #[cfg(target_os = "macos")]
+        {
+            macos::hit_test(x, y)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (x, y);
+            Ok(None)
+        }
     }
 }
 

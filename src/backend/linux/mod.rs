@@ -134,4 +134,22 @@ mod tests {
         assert_eq!(error.code(), "unsupported");
         assert!(error.to_string().contains("linux"));
     }
+
+    #[test]
+    fn element_action_is_unsupported() {
+        use crate::backend::DesktopBackend;
+        use crate::element::{ElementOp, ElementRequest};
+        let error = LinuxDesktopBackend
+            .element_action(&ElementRequest {
+                op: ElementOp::Focus,
+                index: 0,
+                require_visible: false,
+                app: None,
+                window: None,
+                session: None,
+            })
+            .unwrap_err();
+        assert_eq!(error.error.code(), "unsupported");
+        assert!(error.error.to_string().contains("linux"));
+    }
 }

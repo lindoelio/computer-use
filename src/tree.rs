@@ -132,6 +132,9 @@ pub struct SigNode {
     /// Rounded frame. A shift here does not change [`revision_of`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame: Option<SavedFrame>,
+    /// Secure text field. The raw characters are never stored.
+    #[serde(default, skip_serializing_if = "is_false_bool")]
+    pub secure: bool,
     /// Children that were numbered. Capped children are omitted.
     pub children: Vec<SigNode>,
 }
@@ -438,8 +441,23 @@ fn walk(
         child_count: total,
         value,
         frame: node.frame.map(SavedFrame::from),
+        secure: node.secure || is_secure(node),
         children,
     }
+}
+
+/// Identifier, otherwise title, otherwise description. Empty when all are missing.
+pub fn identity_text(node: &UiNode) -> String {
+    identity_of(node)
+}
+
+/// `AXSecureTextField`, or a subrole containing `Secure`.
+pub fn node_is_secure(node: &UiNode) -> bool {
+    node.secure || is_secure(node)
+}
+
+fn is_false_bool(value: &bool) -> bool {
+    !*value
 }
 
 fn format_line(node: &UiNode, index: u32, depth: usize, value: &str) -> String {

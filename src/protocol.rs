@@ -14,6 +14,7 @@ use serde_json::{json, Map, Value};
 
 use crate::backend::create_desktop_backend;
 use crate::backend::{validate_key, DesktopBackend};
+use crate::element::{self, ElementError, ElementOp, ElementOutcome, ElementRequest};
 use crate::error::{ComputerError, ErrorBody};
 use crate::image_util::{encode_base64, encode_image};
 use crate::keys::parse_key_combo;
@@ -50,30 +51,69 @@ pub enum Action {
         #[serde(default, skip_serializing_if = "is_false")]
         base64: bool,
     },
-    /// Move to a point and click.
+    /// Move to a point and click, or press an element when `element` is set.
     Click {
-        /// Logical x.
-        x: i32,
-        /// Logical y.
-        y: i32,
+        /// Logical x. Omit it when `element` is set.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        x: Option<i32>,
+        /// Logical y. Omit it when `element` is set.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        y: Option<i32>,
         /// Button. Defaults to left.
         #[serde(default)]
         button: MouseButton,
-        /// Click twice when true.
+        /// Click twice when true. With `element`, this is `press` count 2.
         #[serde(default, skip_serializing_if = "is_false")]
         double: bool,
     },
     /// Click twice. Equivalent to `click` with `double: true`.
     #[serde(rename = "double_click")]
     DoubleClick {
-        /// Logical x.
-        x: i32,
-        /// Logical y.
-        y: i32,
+        /// Logical x. Omit it when `element` is set.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        x: Option<i32>,
+        /// Logical y. Omit it when `element` is set.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        y: Option<i32>,
         /// Button. Defaults to left.
         #[serde(default)]
         button: MouseButton,
     },
+    /// Press an element. `count` is 1, 2, or 3.
+    Press {
+        /// Repeat count. Defaults to 1.
+        #[serde(default = "default_press_count")]
+        count: u8,
+    },
+    /// Set `AXFocused` on an element.
+    Focus,
+    /// Set an element's value. Refused for secure fields.
+    #[serde(alias = "set-value")]
+    SetValue {
+        /// New value.
+        value: String,
+    },
+    /// Set the selected character range. Refused for secure fields.
+    #[serde(alias = "select-text")]
+    SelectText {
+        /// First selected character.
+        start: i64,
+        /// Character after the selection.
+        end: i64,
+    },
+    /// Perform an allowlisted accessibility action.
+    #[serde(alias = "perform-action")]
+    PerformAction {
+        /// Action name such as `AXShowMenu`.
+        name: String,
+    },
+    /// Scroll an element into view.
+    #[serde(
+        alias = "scroll-to",
+        alias = "scroll_to_visible",
+        alias = "scroll-to-visible"
+    )]
+    ScrollTo,
     /// Move the pointer without clicking.
     #[serde(alias = "move_mouse")]
     Move {
@@ -157,6 +197,10 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn default_press_count() -> u8 {
+    1
+}
+
 /// Flags shared by every action. JSON keys are removed before the action is decoded.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct CallContext {
@@ -184,6 +228,8 @@ pub struct CallContext {
     pub adapter: Option<String>,
     /// Display filter. Used from P14.
     pub display: Option<String>,
+    /// Fail when the element is outside the window and scroll-into-view cannot run.
+    pub require_visible: bool,
 }
 
 /// A JSON request: an optional `id`, shared flags, and an [`Action`].
@@ -232,6 +278,7 @@ fn take_context(object: &mut Map<String, Value>) -> Result<CallContext, Computer
         tier: take_stringish(object, "tier")?,
         adapter: take_stringish(object, "adapter")?,
         display: take_stringish(object, "display")?,
+        require_visible: take_bool(object, "require_visible")?,
     })
 }
 
@@ -341,10 +388,24 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
             y,
             button,
             double,
-        } => click(backend, x, y, button, double),
-        Action::DoubleClick { x, y, button } => click(backend, x, y, button, true),
+        } => return click(backend, context, x, y, button, double),
+        Action::DoubleClick { x, y, button } => return click(backend, context, x, y, button, true),
+        Action::Press { count } => {
+            return element_command(backend, context, ElementOp::Press { count })
+        }
+        Action::Focus => return element_command(backend, context, ElementOp::Focus),
+        Action::SetValue { value } => {
+            return element_command(backend, context, ElementOp::SetValue { value })
+        }
+        Action::SelectText { start, end } => {
+            return element_command(backend, context, ElementOp::SelectText { start, end })
+        }
+        Action::PerformAction { name } => {
+            return element_command(backend, context, ElementOp::Perform { name })
+        }
+        Action::ScrollTo => return element_command(backend, context, ElementOp::ScrollTo),
         Action::Move { x, y } => move_mouse(backend, x, y),
-        Action::Type { text } => type_text(backend, &text),
+        Action::Type { text } => return type_command(backend, context, text),
         Action::Key { keys } => press_key(backend, &keys),
         Action::Scroll {
             x,
@@ -427,23 +488,151 @@ fn path_string(path: &Path) -> String {
 
 fn click(
     backend: &dyn DesktopBackend,
+    context: &CallContext,
+    x: Option<i32>,
+    y: Option<i32>,
+    button: MouseButton,
+    double: bool,
+) -> Response {
+    match (context.element, x, y) {
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+            Response::failure("invalid_arguments", "pass element or x and y, not both")
+        }
+        (None, None, None) => Response::failure(
+            "invalid_arguments",
+            "click requires element, or both x and y",
+        ),
+        (None, Some(_), None) | (None, None, Some(_)) => {
+            Response::failure("invalid_arguments", "x and y must be passed together")
+        }
+        (Some(_index), None, None) => {
+            let count: u8 = if double { 2 } else { 1 };
+            element_command(backend, context, ElementOp::Press { count })
+        }
+        (None, Some(x), Some(y)) => coordinate_click(backend, x, y, button, double),
+    }
+}
+
+fn coordinate_click(
+    backend: &dyn DesktopBackend,
     x: i32,
     y: i32,
     button: MouseButton,
     double: bool,
-) -> Result<Value, ComputerError> {
-    backend.simulate_click(x, y, button)?;
+) -> Response {
+    let mut warnings = Vec::new();
+    let hit = match backend.hit_test(x, y) {
+        Ok(hit) => hit,
+        Err(error) => {
+            warnings.push(format!("hit test failed: {error}"));
+            None
+        }
+    };
+    if let Err(error) = backend.simulate_click(x, y, button) {
+        return Response::from_error(error);
+    }
     if double {
         thread::sleep(Duration::from_millis(50));
-        backend.simulate_click(x, y, button)?;
+        if let Err(error) = backend.simulate_click(x, y, button) {
+            return Response::from_error(error);
+        }
     }
-    Ok(json!({
+    let mut body = json!({
         "action": if double { "double_click" } else { "click" },
         "x": x,
         "y": y,
         "button": button.as_str(),
         "double": double,
-    }))
+        "hit": hit_value(hit),
+    });
+    if !warnings.is_empty() {
+        body["warnings"] = json!(warnings);
+    }
+    Response::success(body)
+}
+
+fn hit_value(hit: Option<crate::element::HitInfo>) -> Value {
+    match hit {
+        Some(hit) => json!({"role": hit.role, "title": hit.title}),
+        None => Value::Null,
+    }
+}
+
+fn type_command(backend: &dyn DesktopBackend, context: &CallContext, text: String) -> Response {
+    if context.element.is_some() {
+        return element_command(backend, context, ElementOp::Type { text });
+    }
+    match type_text(backend, &text) {
+        Ok(value) => Response::success(value),
+        Err(error) => Response::from_error(error),
+    }
+}
+
+fn element_command(backend: &dyn DesktopBackend, context: &CallContext, op: ElementOp) -> Response {
+    if let Err(error) = precheck(&op) {
+        return Response::from_error(error);
+    }
+    let index = match context.element {
+        Some(index) => index,
+        None => {
+            return Response::from_error(ComputerError::InvalidArguments(
+                "element is required".into(),
+            ))
+        }
+    };
+    let request = ElementRequest {
+        op,
+        index,
+        require_visible: context.require_visible,
+        app: context.app.clone(),
+        window: context.window.clone(),
+        session: context.session.clone(),
+    };
+    match backend.element_action(&request) {
+        Ok(outcome) => Response::success(outcome_value(&outcome)),
+        Err(error) => element_error_response(error),
+    }
+}
+
+fn precheck(op: &ElementOp) -> Result<(), ComputerError> {
+    match op {
+        ElementOp::Press { count } => element::validate_count(*count),
+        ElementOp::SetValue { value } => element::validate_text(value, true),
+        ElementOp::Type { text } => element::validate_text(text, false),
+        ElementOp::SelectText { start, end } => element::validate_range(*start, *end, None),
+        ElementOp::Perform { name } => element::validate_perform_name(name),
+        ElementOp::Focus | ElementOp::ScrollTo => Ok(()),
+    }
+}
+
+fn outcome_value(outcome: &ElementOutcome) -> Value {
+    let mut body = json!({
+        "action": outcome.action,
+        "element": outcome.element,
+        "revision": outcome.revision,
+        "tier": outcome.tier,
+    });
+    if !outcome.warnings.is_empty() {
+        body["warnings"] = json!(outcome.warnings);
+    }
+    if let Some(via) = &outcome.via {
+        body["via"] = json!(via);
+    }
+    if let Some(name) = &outcome.name {
+        body["name"] = json!(name);
+    }
+    if let Some(count) = outcome.count {
+        body["count"] = json!(count);
+    }
+    body
+}
+
+fn element_error_response(error: ElementError) -> Response {
+    let mut response = Response::from_error(error.error);
+    if let Some(tree) = error.tree {
+        response.fields.insert("tree".into(), json!(tree));
+    }
+    response
 }
 
 fn move_mouse(backend: &dyn DesktopBackend, x: i32, y: i32) -> Result<Value, ComputerError> {
@@ -860,7 +1049,7 @@ mod tests {
             } => {
                 assert_eq!(
                     (*x, *y, *button, *double),
-                    (10, 20, MouseButton::Right, true)
+                    (Some(10), Some(20), MouseButton::Right, true)
                 );
             }
             other => panic!("unexpected {other:?}"),
@@ -908,7 +1097,22 @@ mod tests {
         }
 
         assert!(serde_json::from_str::<Action>(r#"{"action":"fly"}"#).is_err());
-        assert!(serde_json::from_str::<Action>(r#"{"action":"click"}"#).is_err());
+        let bare: Action = serde_json::from_str(r#"{"action":"click"}"#).unwrap();
+        assert!(matches!(
+            bare,
+            Action::Click {
+                x: None,
+                y: None,
+                ..
+            }
+        ));
+        let press: Action = serde_json::from_str(r#"{"action":"press"}"#).unwrap();
+        assert!(matches!(press, Action::Press { count: 1 }));
+        let renamed: Action =
+            serde_json::from_str(r#"{"action":"set-value","value":"hi"}"#).unwrap();
+        assert!(matches!(renamed, Action::SetValue { .. }));
+        let scrolled: Action = serde_json::from_str(r#"{"action":"scroll-to-visible"}"#).unwrap();
+        assert!(matches!(scrolled, Action::ScrollTo));
     }
 
     #[test]
@@ -991,8 +1195,8 @@ mod tests {
         let response = dispatch_with(
             &backend,
             Action::Click {
-                x: 3,
-                y: 4,
+                x: Some(3),
+                y: Some(4),
                 button: MouseButton::Left,
                 double: true,
             },
@@ -1084,8 +1288,8 @@ mod tests {
         let response = dispatch_with(
             &failed,
             Action::Click {
-                x: 0,
-                y: 0,
+                x: Some(0),
+                y: Some(0),
                 button: MouseButton::Left,
                 double: false,
             },
@@ -1114,7 +1318,8 @@ mod tests {
             "element": "3",
             "diff": true,
             "full": false,
-            "return_state": true
+            "return_state": true,
+            "require_visible": true
         }))
         .unwrap();
         assert_eq!(request.id, Some(json!(4)));
@@ -1125,6 +1330,7 @@ mod tests {
         assert!(request.context.diff);
         assert!(!request.context.full);
         assert!(request.context.return_state);
+        assert!(request.context.require_visible);
     }
 
     fn ctx(app: &str) -> CallContext {
@@ -1311,5 +1517,202 @@ mod tests {
         });
         let response = dispatch_with_context(&backend, Action::Quit, &ctx(&self_pid.to_string()));
         assert_eq!(response.to_value()["error"]["code"], "policy_denied");
+    }
+
+    fn notes_button() -> crate::tree::UiNode {
+        let mut button = crate::tree::UiNode::bare("AXButton");
+        button.title = Some("Save".into());
+        button.actions = vec!["AXPress".into(), "AXShowMenu".into()];
+        button.frame = Some(crate::tree::NodeFrame {
+            x: 12.0,
+            y: 10.0,
+            width: 80.0,
+            height: 24.0,
+        });
+        let mut root = crate::tree::UiNode::bare("AXWindow");
+        root.title = Some("Notes".into());
+        root.frame = Some(crate::tree::NodeFrame {
+            x: 0.0,
+            y: 0.0,
+            width: 800.0,
+            height: 600.0,
+        });
+        root.children = vec![button];
+        root
+    }
+
+    fn element_context(action_element: u32) -> CallContext {
+        CallContext {
+            app: Some("Notes".into()),
+            element: Some(action_element),
+            ..CallContext::default()
+        }
+    }
+
+    #[test]
+    fn element_json_shape_revalidation_and_hit_test() {
+        let backend = StubBackend::default();
+        backend.seed_element(notes_button());
+        let request = parse_request(json!({
+            "action": "press",
+            "app": "Notes",
+            "element": 1,
+            "count": 1
+        }))
+        .unwrap();
+        let response = dispatch_with_context(&backend, request.action, &request.context);
+        assert!(response.ok, "{response:?}");
+        let value = response.to_value();
+        assert_eq!(value["action"], "press");
+        assert_eq!(value["element"], 1);
+        assert_eq!(value["tier"], "ax");
+        assert_eq!(value["count"], 1);
+        assert!(value["revision"].is_number());
+        assert!(value.get("warnings").is_none());
+
+        let request = parse_request(json!({
+            "action": "perform-action",
+            "app": "Notes",
+            "element": 1,
+            "name": "AXShowMenu"
+        }))
+        .unwrap();
+        let response = dispatch_with_context(&backend, request.action, &request.context);
+        assert!(response.ok, "{response:?}");
+        assert_eq!(response.to_value()["action"], "perform_action");
+        assert_eq!(response.to_value()["name"], "AXShowMenu");
+        assert_eq!(response.to_value()["tier"], "ax");
+
+        let before = backend.performs.lock().unwrap().len();
+        let request = parse_request(json!({
+            "action": "perform_action",
+            "app": "Notes",
+            "element": 1,
+            "name": "AXDelete"
+        }))
+        .unwrap();
+        let response = dispatch_with_context(&backend, request.action, &request.context);
+        assert_eq!(response.to_value()["error"]["code"], "invalid_arguments");
+        assert_eq!(backend.performs.lock().unwrap().len(), before);
+
+        let request = parse_request(json!({
+            "action": "set_value",
+            "app": "Notes",
+            "element": 1,
+            "value": "hello"
+        }))
+        .unwrap();
+        let response = dispatch_with_context(&backend, request.action, &request.context);
+        assert!(response.ok, "{response:?}");
+        assert_eq!(response.to_value()["action"], "set_value");
+
+        let request = parse_request(json!({
+            "action": "select_text",
+            "app": "Notes",
+            "element": 1,
+            "start": 0,
+            "end": 5
+        }))
+        .unwrap();
+        let response = dispatch_with_context(&backend, request.action, &request.context);
+        assert!(response.ok, "{response:?}");
+        assert_eq!(response.to_value()["action"], "select_text");
+
+        let request = parse_request(json!({
+            "action": "scroll_to_visible",
+            "app": "Notes",
+            "element": 1
+        }))
+        .unwrap();
+        assert!(matches!(request.action, Action::ScrollTo));
+        let response = dispatch_with_context(&backend, request.action, &request.context);
+        assert_eq!(response.to_value()["error"]["code"], "execution_failed");
+        assert!(response.to_value()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("AXScrollToVisible"));
+
+        let clicks = backend.clicks.load(Ordering::SeqCst);
+        let request = parse_request(json!({
+            "action": "click",
+            "app": "Notes",
+            "element": 1,
+            "double": true
+        }))
+        .unwrap();
+        let response = dispatch_with_context(&backend, request.action, &request.context);
+        assert!(response.ok, "{response:?}");
+        assert_eq!(response.to_value()["action"], "press");
+        assert_eq!(response.to_value()["count"], 2);
+        assert_eq!(backend.clicks.load(Ordering::SeqCst), clicks);
+
+        *backend.hit.lock().unwrap() = Some(crate::element::HitInfo {
+            role: "AXButton".into(),
+            title: Some("Save".into()),
+        });
+        let response = dispatch_with(
+            &backend,
+            Action::Click {
+                x: Some(12),
+                y: Some(10),
+                button: MouseButton::Left,
+                double: false,
+            },
+        );
+        assert!(response.ok, "{response:?}");
+        assert_eq!(response.to_value()["hit"]["role"], "AXButton");
+        assert_eq!(response.to_value()["hit"]["title"], "Save");
+        assert_eq!(backend.clicks.load(Ordering::SeqCst), clicks + 1);
+
+        let mut changed = notes_button();
+        changed.children[0].role = "AXTextArea".into();
+        backend.set_live(changed);
+        let response = dispatch_with_context(&backend, Action::Focus, &element_context(1));
+        assert_eq!(response.to_value()["error"]["code"], "stale_element");
+        assert!(response.to_value()["tree"]
+            .as_str()
+            .unwrap()
+            .contains("AXTextArea"));
+
+        let empty = StubBackend::default();
+        let response = dispatch_with_context(&empty, Action::Focus, &element_context(0));
+        assert_eq!(response.to_value()["error"]["code"], "element_not_found");
+        assert!(response.to_value()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("refresh indices"));
+
+        let bare = dispatch_with(
+            &empty,
+            Action::Click {
+                x: None,
+                y: None,
+                button: MouseButton::Left,
+                double: false,
+            },
+        );
+        assert_eq!(bare.to_value()["error"]["code"], "invalid_arguments");
+    }
+
+    #[test]
+    fn element_action_does_not_replace_the_tree_diff_baseline() {
+        let backend = StubBackend::default();
+        let first = dispatch_with_context(&backend, Action::Tree, &ctx("Notes"));
+        assert!(first.ok, "{first:?}");
+        let key = (String::new(), 10, 100);
+        let baseline = backend.baselines.lock().unwrap().get(&key).cloned();
+        let response = dispatch_with_context(&backend, Action::Focus, &element_context(0));
+        assert!(response.ok, "{response:?}");
+        assert_eq!(
+            backend.baselines.lock().unwrap().get(&key),
+            baseline.as_ref()
+        );
+        *backend.stub_value.lock().unwrap() = "ab".into();
+        let diff = dispatch_with_context(&backend, Action::Tree, &ctx("Notes"));
+        let text = diff.to_value()["tree"].as_str().unwrap().to_string();
+        assert!(
+            text.contains("~ [1] AXTextArea value: \"a\" -> \"ab\""),
+            "{text}"
+        );
     }
 }

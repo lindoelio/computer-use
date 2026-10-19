@@ -97,7 +97,7 @@ Platform crates that are not features go in `[target.'cfg(target_os = "...")'.de
 
 - Change both crate attributes to `#![deny(unsafe_code)]`.
 - Put `#![allow(unsafe_code)]` only on the files that call Apple or Win32 directly: `src/backend/macos/ax.rs`, `apps.rs`, `capture.rs`, `input.rs`, `overlay.rs`, `focus.rs`, `doctor.rs`, `src/vision/macos.rs`, `src/vision/windows.rs`. P1 allows it only in `apps.rs` and `doctor.rs`. The other files are created in the phase that calls those APIs.
-- `main.rs` stays without unsafe. `policy.rs`, `audit.rs`, `tree.rs`, `cache.rs`, and the adapters stay safe.
+- `main.rs` stays without unsafe. `policy.rs`, `audit.rs`, `tree.rs`, `cache.rs`, `element.rs`, and the adapters stay safe.
 - Each `unsafe` block gets a one-line `SAFETY` comment naming the pointer lifetime and the framework precondition.
 - `uiautomation`, `atspi`, `ashpd`, `x11rb`, `arboard`, and `chromiumoxide` are called through their safe APIs.
 
@@ -116,6 +116,7 @@ src/
   image_util.rs               Encode, max-width, canvas fit, remap math.
   target.rs                   AppTarget and WindowTarget resolution.
   tree.rs                     Numbered text, diff, truncation, redaction. Pure.
+  element.rs                  Revalidation, allowlist, secure refusal. Pure. P3.
   cache.rs                    Per-session revision files.
   policy.rs                   Built-in deny in P1. TOML, admin, URLs in P6.
   audit.rs                    JSONL writer. P6.
@@ -162,7 +163,7 @@ src/
 
 ## Shared contracts
 ### Global flags
-Added as clap global args, and as sibling fields of `action` in JSON. `parse_request` already removes `id` before `Action` is decoded. Extend that strip list so these keys never reach the action enum: `app`, `window`, `element`, `diff`, `full`, `return_state`, `include_screenshot`, `coord`, `session`, `tier`, `adapter`, `display`.
+Added as clap global args, and as sibling fields of `action` in JSON. `parse_request` already removes `id` before `Action` is decoded. Extend that strip list so these keys never reach the action enum: `app`, `window`, `element`, `diff`, `full`, `return_state`, `include_screenshot`, `coord`, `session`, `tier`, `adapter`, `display`, `require_visible`.
 
 | Flag | JSON | Default | Meaning |
 | --- | --- | --- | --- |
@@ -177,6 +178,7 @@ Added as clap global args, and as sibling fields of `action` in JSON. `parse_req
 | `--tier ax\|event\|synthetic\|activate` | `tier` | auto | Input tier. `synthetic` needs the `skylight` feature and `--synthetic-focus` is accepted as an alias of `--tier synthetic`. |
 | `--adapter native\|openai\|anthropic` | `adapter` | `native` | Schema translator for `exec` and stdin. |
 | `--display <id\|virtual>` | `display` | all | P14. |
+| `--require-visible` | `require_visible` | false | Fail when the element is outside the window and scroll-into-view fails or is missing. |
 | `--policy <path>` | none | `~/.config/computer-use/policy.toml` | P6. |
 | `--max-width <n>` | `max_width` | 1440 after P4 | Today the default is "no resize". 0.2.0 changes that for screenshots. |
 
@@ -189,8 +191,8 @@ Keep the four existing codes. Add these. `ComputerError::code()` is the stable s
 | --- | --- |
 | `app_not_found` | Name, bundle id, or pid matched nothing running, and launch was not requested. |
 | `window_not_found` | App resolved, window did not. |
-| `element_not_found` | Index missing in the fresh tree. |
-| `stale_element` | Index exists but role or identifier changed. Action not performed. Body includes the new tree. |
+| `element_not_found` | Index missing in the cached or fresh tree, or there is no session cache. |
+| `stale_element` | The path's role, identifier, or frame (beyond 2 points) changed, or the cached pid, window, or revision header does not match. Action not performed. Body includes the new tree. |
 | `permission_required` | Accessibility or Screen Recording is off. Message names the Settings pane. |
 | `policy_denied` | Built-in or configured deny. |
 | `confirm_required` | Sensitive action and no confirm hook is configured. |
@@ -243,7 +245,7 @@ struct BoundElement {
 }
 ```
 
-`revision` is a hash of the structural signatures, stored in the session cache under `<bundle>-<pid>-<window>.json`. Before any element action the backend copies the tree again. The action runs only when the index still has the same role and the same `AXIdentifier` or title. A frame shift with the same role and title is accepted and the cache updates. A role change returns `stale_element` and the new tree, and does not click. `x`/`y` without `--element` hit-tests (`AXUIElementCopyElementAtPosition`) and then uses the same action path. If hit-testing finds nothing, the coordinate tiers in P7 run.
+`revision` is a hash of the structural signatures, stored in the session cache under `<bundle>-<pid>-<window>.json`. Before any element action the backend copies the tree again and walks the cached child-index path. The action runs only when that node still has the same role, the same `AXIdentifier` or title, and a frame within 2 points on each edge. Two points is the tolerance P2 uses to join an AX window to a CG window. A larger frame shift is `stale_element`. A role or identifier change is `stale_element` too: the body includes the fresh tree and nothing is performed. A cached revision header, pid, or window id that does not match the stored signature is the same error. A structural change in some other node does not by itself stale this element. Element actions write the fresh signature to `observed` and leave `root` for `tree --diff`. `x`/`y` without `--element` hit-tests (`AXUIElementCopyElementAtPosition`) and then uses the coordinate click path. A hit-test failure is a warning and the click still runs. If hit-testing finds nothing, `hit` is null and the coordinate tiers in P7 run.
 
 ### Post-action state
 When `return_state` is true the success object gains:
@@ -569,9 +571,11 @@ Actions go through the bound element from P2. Each one re-validates, then tries 
 | `perform_action` | `PerformAction` with an explicit name. Allowlist: `AXPress`, `AXShowMenu`, `AXIncrement`, `AXDecrement`, `AXConfirm`, `AXCancel`, `AXRaise`, `AXScrollToVisible`, `AXScrollUpByPage`, `AXScrollDownByPage`, `AXScrollLeftByPage`, `AXScrollRightByPage`. Other names are `invalid_arguments`. |
 | `scroll_to` | `AXScrollToVisible` only. |
 
-`click --element N` is an alias of `press`. `click --x --y` stays the coordinate path and, on macOS after this phase, hit-tests first.
+`click --element N` is an alias of `press`. Success then uses `action: "press"`. `--double` with `--element` is press count 2. `click --x --y` stays the coordinate path and, on macOS after this phase, hit-tests first. The result includes `hit` (`role` and `title`, or null). A hit-test error is a warning and the click still runs. Passing both an element and coordinates is `invalid_arguments`.
 
-`type` prefers `set_value` when `--element` is set and the element is settable. Without `--element`, `type` still uses enigo on the focused control. That split is temporary. P7 routes the enigo path through tiers.
+`type` prefers `set_value` when `--element` is set and `AXValue` is settable (`AXUIElementIsAttributeSettable`). That success uses `tier: "ax"` and `via: "set_value"`. Otherwise it focuses the element and types with enigo, and the success uses `tier: "enigo"` and `via: "enigo"`. Without `--element`, `type` still uses enigo on the focused control and does not report a tier. That split is temporary. P7 routes the enigo path through tiers.
+
+Frame revalidation allows 2 points on each edge. Past that, or when the role or identifier changed, the result is `stale_element` and the action is not performed. The fresh tree is a sibling `tree` field. Element actions update `observed` in the session cache and do not replace the `tree --diff` baseline. `scroll-to-visible` is an alias of `scroll_to`. Secure fields (`AXSecureTextField`, or a subrole containing `Secure`) refuse `set_value`, `select_text`, and `type --element` with `policy_denied`. The value is never read. The built-in deny list runs before any accessibility call on the target. Linux and Windows return `unsupported`.
 
 ### CLI
 ```
@@ -599,11 +603,13 @@ Success includes `tier: "ax"`, the `element` index, and `revision` after the act
 `stale_element`, `element_not_found`, `policy_denied` on secure `set_value`, `invalid_arguments` on a name outside the allowlist, `execution_failed` when the element has no such action (`AXUIElementCopyActionNames` is checked first so the message lists the actions the element does have).
 
 ### Tests
-- Revalidation table: same role allows, changed role returns `stale_element` and records zero performs on the stub.
-- Secure node refuses `set_value`.
+- Revalidation table: same role allows, changed role, identifier, or frame returns `stale_element` and records zero performs on the stub.
+- Secure node refuses `set_value`, `select_text`, and `type`.
 - Action allowlist rejects `AXDelete`.
-- `scroll_to` is attempted when the fixture frame is outside the window.
+- `scroll_to` is attempted when the fixture frame is outside the window. `perform_action AXScrollToVisible` does not scroll twice.
 - Stub records the action name and the index.
+- A deny-listed app returns `policy_denied` and records zero performs.
+- CLI parsing covers each new command. JSON `exec` covers the action names, including hyphen aliases. Off macOS the commands return `unsupported`. No live AX call in `cargo test`.
 
 ## P4 — Per-window capture and coordinate remap
 ### Design

@@ -19,6 +19,18 @@ pub(crate) fn tree(query: &TreeQuery) -> Result<TreeReport, ComputerError> {
     ax::tree(query)
 }
 
+/// Revalidate one cached element and perform the action through Accessibility.
+pub(crate) fn element_action(
+    request: &crate::element::ElementRequest,
+) -> Result<crate::element::ElementOutcome, crate::element::ElementError> {
+    ax::element_action(request)
+}
+
+/// Role and title of the element at a screen point.
+pub(crate) fn hit_test(x: i32, y: i32) -> Result<Option<crate::element::HitInfo>, ComputerError> {
+    ax::hit_test(x, y)
+}
+
 /// Restore Electron flags for `session` and stop its observers.
 pub(crate) fn end_session(session: Option<&str>) -> Result<Vec<i32>, ComputerError> {
     ax::end_session(session)

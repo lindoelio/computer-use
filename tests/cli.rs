@@ -46,15 +46,112 @@ fn help_lists_commands() {
         "session",
         "serve",
         "exec",
+        "press",
+        "set-value",
+        "select-text",
+        "perform-action",
+        "scroll-to",
+        "focus",
         "--pretty",
         "--json",
         "--app",
         "--window",
+        "--element",
+        "--require-visible",
         "--full",
         "--session",
     ] {
         assert!(stdout.contains(needle), "help missing {needle}:\n{stdout}");
     }
+}
+
+#[test]
+fn element_commands_reject_bad_arguments_without_acting() {
+    let missing = run(&["press", "--count", "1"]);
+    let missing_value: Value = serde_json::from_slice(&missing.stdout).unwrap();
+    assert_eq!(missing_value["ok"], false);
+    assert_eq!(missing_value["error"]["code"], "invalid_arguments");
+    assert!(missing_value["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("element"));
+
+    let count = run(&["press", "--element", "1", "--count", "4"]);
+    let count_value: Value = serde_json::from_slice(&count.stdout).unwrap();
+    assert_eq!(count_value["error"]["code"], "invalid_arguments");
+
+    let deleted = run(&["perform-action", "--element", "1", "--name", "AXDelete"]);
+    let deleted_value: Value = serde_json::from_slice(&deleted.stdout).unwrap();
+    assert_eq!(deleted_value["error"]["code"], "invalid_arguments");
+    assert!(deleted_value["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("AXDelete"));
+
+    let range = run(&[
+        "select-text",
+        "--element",
+        "1",
+        "--start",
+        "5",
+        "--end",
+        "1",
+    ]);
+    let range_value: Value = serde_json::from_slice(&range.stdout).unwrap();
+    assert_eq!(range_value["error"]["code"], "invalid_arguments");
+    assert!(range_value["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("start"));
+
+    let both = run(&["click", "--element", "1", "--x", "2", "--y", "3"]);
+    let both_value: Value = serde_json::from_slice(&both.stdout).unwrap();
+    assert_eq!(both_value["error"]["code"], "invalid_arguments");
+
+    let alias = run(&["scroll-to-visible", "--help"]);
+    assert!(alias.status.success());
+    let help = String::from_utf8_lossy(&alias.stdout);
+    assert!(
+        help.contains("scroll") || help.contains("element"),
+        "{help}"
+    );
+
+    let exec = run(&[
+        "exec",
+        r#"{"action":"perform_action","element":1,"name":"AXDelete"}"#,
+    ]);
+    let exec_value: Value = serde_json::from_slice(&exec.stdout).unwrap();
+    assert_eq!(exec_value["error"]["code"], "invalid_arguments");
+
+    let bare = run(&["exec", r#"{"action":"click"}"#]);
+    let bare_value: Value = serde_json::from_slice(&bare.stdout).unwrap();
+    assert_eq!(bare_value["error"]["code"], "invalid_arguments");
+
+    let hyphen = run(&[
+        "exec",
+        r#"{"action":"select-text","element":1,"start":2,"end":1}"#,
+    ]);
+    let hyphen_value: Value = serde_json::from_slice(&hyphen.stdout).unwrap();
+    assert_eq!(hyphen_value["error"]["code"], "invalid_arguments");
+}
+
+#[test]
+fn element_commands_are_unsupported_off_macos() {
+    if cfg!(target_os = "macos") {
+        return;
+    }
+    let output = run(&["focus", "--element", "0"]);
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
+        panic!(
+            "stdout was not JSON: {} stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["code"], "unsupported");
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(message.contains(std::env::consts::OS), "{message}");
 }
 
 #[test]

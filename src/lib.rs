@@ -20,6 +20,7 @@
 
 pub mod backend;
 pub mod cache;
+pub mod element;
 pub mod error;
 mod image_util;
 pub mod keys;

@@ -11,6 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
+use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -22,12 +23,14 @@ use objc2_application_services::{
     AXError, AXIsProcessTrusted, AXObserver, AXUIElement, AXValue, AXValueType,
 };
 use objc2_core_foundation::{
-    kCFRunLoopDefaultMode, CFArray, CFBoolean, CFNumber, CFRetained, CFRunLoop, CFString, CFType,
-    CGPoint, CGSize, CFURL,
+    kCFRunLoopDefaultMode, CFArray, CFBoolean, CFIndex, CFNumber, CFRange, CFRetained, CFRunLoop,
+    CFString, CFType, CGPoint, CGSize, CFURL,
 };
 
 use crate::cache::{self, Snapshot};
+use crate::element::{self, ElementError, ElementOutcome, ElementRequest, Gate, HitInfo, Step};
 use crate::error::ComputerError;
+use crate::policy;
 use crate::target::{
     bounds_match_frame, filter_windows_for_pid, parse_app_selector, parse_window_selector,
     resolve_app, resolve_window, ActivationPolicy, AppInfo, WindowInfo,
@@ -94,6 +97,7 @@ enum WalkError {
         app: Option<AppInfo>,
         window_id: u32,
     },
+    Message(String),
 }
 
 impl WalkError {
@@ -151,6 +155,339 @@ pub(crate) fn tree(query: &TreeQuery) -> Result<TreeReport, ComputerError> {
         Ok(report) => Ok(report),
         Err(WalkError::Failed { app, window_id }) => fallback_osascript(app.as_ref(), window_id),
         Err(error) => Err(error.into_computer()),
+    }
+}
+
+/// Revalidate `request` against the session cache and perform it.
+///
+/// The built-in deny list runs before any accessibility call on the target.
+/// A role, identifier, or frame mismatch returns `stale_element` and does not act.
+pub(crate) fn element_action(request: &ElementRequest) -> Result<ElementOutcome, ElementError> {
+    match element_action_inner(request) {
+        Ok(outcome) => Ok(outcome),
+        Err(ElementInterrupt::Error(error)) => Err(error),
+        Err(ElementInterrupt::Walk(error)) => Err(ElementError::new(error.into_computer())),
+    }
+}
+
+/// Role and title at a screen point. Does not click and does not read values.
+pub(crate) fn hit_test(x: i32, y: i32) -> Result<Option<HitInfo>, ComputerError> {
+    if !trusted() {
+        return Err(ComputerError::PermissionRequired(permission_subject()));
+    }
+    let system = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: the system-wide element is process-global. The wrapper returns +1 or panics on null.
+        unsafe { AXUIElement::new_system_wide() }
+    })) {
+        Ok(element) => element,
+        Err(_) => {
+            return Err(ComputerError::ExecutionFailed(
+                "system-wide accessibility element was not created".into(),
+            ))
+        }
+    };
+    ignore_timeout(&system);
+    let mut slot: *const AXUIElement = std::ptr::null();
+    // SAFETY: slot is a stack out-parameter. On success it holds a +1 AXUIElement, which from_raw owns.
+    let error = unsafe {
+        system.copy_element_at_position(
+            x as core::ffi::c_float,
+            y as core::ffi::c_float,
+            NonNull::new(&mut slot).expect("slot"),
+        )
+    };
+    match classify(error) {
+        CopyClass::Missing => Ok(None),
+        CopyClass::Permission => Err(ComputerError::PermissionRequired(permission_subject())),
+        CopyClass::Timeout => Err(ComputerError::ExecutionFailed("messaging timeout".into())),
+        CopyClass::Failed => Err(ComputerError::ExecutionFailed(format!(
+            "hit test failed ({error:?})"
+        ))),
+        CopyClass::Ok => {
+            let Some(ptr) = NonNull::new(slot.cast_mut()) else {
+                return Ok(None);
+            };
+            // SAFETY: Success returned a +1 element. from_raw takes that ownership.
+            let element = unsafe { CFRetained::<AXUIElement>::from_raw(ptr) };
+            ignore_timeout(&element);
+            let role = copy_string(&element, "AXRole")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "unknown".into());
+            let title = copy_string(&element, "AXTitle").ok().flatten();
+            Ok(Some(HitInfo { role, title }))
+        }
+    }
+}
+
+enum ElementInterrupt {
+    Error(ElementError),
+    Walk(WalkError),
+}
+
+impl From<WalkError> for ElementInterrupt {
+    fn from(error: WalkError) -> Self {
+        Self::Walk(error)
+    }
+}
+
+impl From<ElementError> for ElementInterrupt {
+    fn from(error: ElementError) -> Self {
+        Self::Error(error)
+    }
+}
+
+impl From<ComputerError> for ElementInterrupt {
+    fn from(error: ComputerError) -> Self {
+        Self::Error(ElementError::new(error))
+    }
+}
+
+fn element_action_inner(request: &ElementRequest) -> Result<ElementOutcome, ElementInterrupt> {
+    let query = tree::TreeQuery {
+        app: request.app.clone(),
+        window: request.window.clone(),
+        full: false,
+        session: request.session.clone(),
+    };
+    if let Some(app) = query.app.as_deref() {
+        let selector = parse_app_selector(app)?;
+        policy::deny_or_allow(policy::selector_denial(&selector))?;
+    }
+    let app = resolve_target(&query)?;
+    let title = policy_window_title(&query, app.pid)?;
+    policy::deny_or_allow(policy::identity_denial(
+        app.bundle_id.as_deref(),
+        app.path.as_deref().map(Path::new),
+        title.as_deref(),
+        None,
+    ))?;
+    ensure_trusted()?;
+    let live = read_live(&query, true)?;
+    let snapshot = cache::load(
+        query.session.as_deref(),
+        app.bundle_id.as_deref(),
+        live.app.pid,
+        live.window_id,
+    )?;
+    let Some(snapshot) = snapshot else {
+        let label = request.app.as_deref().unwrap_or(app.name.as_str());
+        return Err(ComputerError::ElementNotFound(format!(
+            "element {} is not in the session cache; {}",
+            request.index,
+            element::refresh_hint(label)
+        ))
+        .into());
+    };
+    let identity = snapshot.observed.as_ref().unwrap_or(&snapshot.root);
+    let cached_revision = snapshot.observed_revision.unwrap_or(snapshot.revision);
+    let label = request.app.as_deref().unwrap_or(app.name.as_str());
+    let gate = element::gate(&element::GateInput {
+        op: &request.op,
+        index: request.index,
+        require_visible: request.require_visible,
+        app_label: label,
+        cached: identity,
+        cached_revision,
+        cached_pid: snapshot.pid,
+        cached_window: snapshot.window_id,
+        resolved_pid: live.app.pid,
+        resolved_window: live.window_id,
+        live: &live.root,
+        live_pid: live.app.pid,
+        live_window: live.window_id,
+    })?;
+    let element = live.nodes.get(&gate.path).ok_or_else(|| {
+        ComputerError::ExecutionFailed(
+            "element path did not resolve to an accessibility element".into(),
+        )
+    })?;
+    let settable = if gate.needs_settable {
+        value_is_settable(element)?
+    } else {
+        false
+    };
+    let char_count = if gate.needs_chars {
+        character_count(element)?
+    } else {
+        None
+    };
+    let planned = element::steps(&request.op, &gate, settable, char_count)?;
+    let mut warnings = Vec::new();
+    if let Some(warning) = gate.outside_warning.clone() {
+        warnings.push(warning);
+    }
+    if gate.scroll_first {
+        match perform_named(element, "AXScrollToVisible") {
+            Ok(()) => {}
+            Err(error) if request.require_visible => return Err(error.into()),
+            Err(error) => warnings.push(format!(
+                "AXScrollToVisible failed: {}",
+                error.into_computer()
+            )),
+        }
+    }
+    let via = run_steps(element, &planned, &gate)?;
+    // A failed re-read must not turn a completed action into an error.
+    let mut revision = cached_revision;
+    match read_live(&query, false) {
+        Ok(refreshed) => {
+            let rendered = tree::render(&refreshed.root);
+            revision = tree::revision_of(&rendered.root);
+            let mut updated = snapshot;
+            updated.observed = Some(rendered.root);
+            updated.observed_revision = Some(revision);
+            if let Err(error) = cache::store(query.session.as_deref(), &updated) {
+                warnings.push(format!("session cache was not updated: {error}"));
+            }
+        }
+        Err(error) => warnings.push(format!(
+            "tree was not re-read after the action: {}",
+            error.into_computer()
+        )),
+    }
+    Ok(element::outcome(request, revision, warnings, via))
+}
+
+fn run_steps(
+    element: &AXUIElement,
+    planned: &[Step],
+    gate: &Gate,
+) -> Result<Option<String>, ElementInterrupt> {
+    let mut via = None;
+    for step in planned {
+        match step {
+            Step::Press { count } => {
+                element::require_action(&gate.actions, "AXPress")?;
+                for _ in 0..*count {
+                    perform_named(element, "AXPress")?;
+                }
+            }
+            Step::Focus => set_focused(element)?,
+            Step::SetValue { value } | Step::TypeSetValue { text: value } => {
+                set_string(element, "AXValue", value)?;
+                if matches!(step, Step::TypeSetValue { .. }) {
+                    via = Some("set_value".into());
+                }
+            }
+            Step::SelectText { start, end } => set_range(element, *start, *end)?,
+            Step::Perform { name } => {
+                element::require_action(&gate.actions, name)?;
+                perform_named(element, name)?;
+            }
+            Step::ScrollTo => {
+                element::require_action(&gate.actions, "AXScrollToVisible")?;
+                perform_named(element, "AXScrollToVisible")?;
+            }
+            Step::TypeEnigo { text } => {
+                set_focused(element)?;
+                crate::backend::input::type_text(text)?;
+                via = Some("enigo".into());
+            }
+        }
+    }
+    Ok(via)
+}
+
+fn policy_window_title(query: &tree::TreeQuery, pid: i32) -> Result<Option<String>, WalkError> {
+    let windows = match apps::on_screen_windows() {
+        Ok(windows) => windows,
+        Err(_) => return Ok(None),
+    };
+    if let Some(selector) = query.window.as_deref() {
+        return Ok(Some(window_hint(&windows, pid, selector)?.title));
+    }
+    Ok(crate::target::filter_windows_for_pid(&windows, pid)
+        .first()
+        .map(|window| window.title.clone()))
+}
+
+fn value_is_settable(element: &AXUIElement) -> Result<bool, WalkError> {
+    let attribute = CFString::from_str("AXValue");
+    let mut settable: u8 = 0;
+    // SAFETY: settable is a stack Boolean out-parameter. element and the attribute name are live.
+    let error = unsafe {
+        element.is_attribute_settable(&attribute, NonNull::new(&mut settable).expect("settable"))
+    };
+    match classify(error) {
+        CopyClass::Ok => Ok(settable != 0),
+        CopyClass::Missing => Ok(false),
+        CopyClass::Permission => Err(WalkError::Permission(permission_subject())),
+        CopyClass::Timeout => Err(WalkError::Timeout),
+        CopyClass::Failed => Err(WalkError::Message(
+            "AXUIElementIsAttributeSettable failed for AXValue".into(),
+        )),
+    }
+}
+
+fn character_count(element: &AXUIElement) -> Result<Option<i64>, WalkError> {
+    match copy_cf(element, "AXNumberOfCharacters") {
+        Ok(Some(value)) => Ok(value.downcast_ref::<CFNumber>().and_then(CFNumber::as_i64)),
+        Ok(None) => Ok(None),
+        Err(AttrError::Permission) => Err(WalkError::Permission(permission_subject())),
+        Err(AttrError::Timeout) => Err(WalkError::Timeout),
+        Err(AttrError::Failed | AttrError::Missing) => Ok(None),
+    }
+}
+
+fn set_string(element: &AXUIElement, name: &str, value: &str) -> Result<(), WalkError> {
+    let text = CFRetained::<CFType>::from(CFString::from_str(value));
+    set_cf(element, name, &text)
+}
+
+fn set_focused(element: &AXUIElement) -> Result<(), WalkError> {
+    let boolean = CFBoolean::new(true);
+    // SAFETY: CFBoolean is a CFType. The static lives for the process. element is live.
+    let value = unsafe { &*(boolean as *const CFBoolean).cast::<CFType>() };
+    set_cf(element, "AXFocused", value)
+}
+
+fn set_cf(element: &AXUIElement, name: &str, value: &CFType) -> Result<(), WalkError> {
+    let attribute = CFString::from_str(name);
+    // SAFETY: element is live. attribute is owned for this call. value stays retained until the call returns.
+    let error = unsafe { element.set_attribute_value(&attribute, value) };
+    classify_set(error)
+}
+
+fn set_range(element: &AXUIElement, start: i64, end: i64) -> Result<(), WalkError> {
+    let mut range = CFRange {
+        location: CFIndex::try_from(start).unwrap_or(CFIndex::MAX),
+        length: CFIndex::try_from(end.saturating_sub(start)).unwrap_or(0),
+    };
+    let Some(value_ptr) = NonNull::new((&mut range as *mut CFRange).cast::<c_void>()) else {
+        return Err(WalkError::Message(
+            "AXSelectedTextRange could not be encoded".into(),
+        ));
+    };
+    // SAFETY: range is a stack CFRange that outlives AXValueCreate. The wrapper returns +1 or None.
+    let ax_value = unsafe { AXValue::new(AXValueType::CFRange, value_ptr) }
+        .ok_or_else(|| WalkError::Message("AXValueCreate failed for AXSelectedTextRange".into()))?;
+    let typed = CFRetained::<CFType>::from(ax_value);
+    set_cf(element, "AXSelectedTextRange", &typed)
+}
+
+fn classify_set(error: AXError) -> Result<(), WalkError> {
+    match classify(error) {
+        CopyClass::Ok => Ok(()),
+        CopyClass::Permission => Err(WalkError::Permission(permission_subject())),
+        CopyClass::Timeout => Err(WalkError::Timeout),
+        CopyClass::Missing | CopyClass::Failed => Err(WalkError::Message(format!(
+            "set attribute failed ({error:?})"
+        ))),
+    }
+}
+
+fn perform_named(element: &AXUIElement, name: &str) -> Result<(), WalkError> {
+    let action = CFString::from_str(name);
+    // SAFETY: element is live. action is a CFString we own for this call. PerformAction does not free it.
+    let error = unsafe { element.perform_action(&action) };
+    match classify(error) {
+        CopyClass::Ok => Ok(()),
+        CopyClass::Permission => Err(WalkError::Permission(permission_subject())),
+        CopyClass::Timeout => Err(WalkError::Timeout),
+        CopyClass::Missing | CopyClass::Failed => Err(WalkError::Message(format!(
+            "AXUIElementPerformAction {name} failed ({error:?})"
+        ))),
     }
 }
 
@@ -228,6 +565,11 @@ pub(crate) fn annotate_matches(windows: &mut [WindowInfo]) -> Option<String> {
 }
 
 fn build_tree(query: &TreeQuery) -> Result<TreeReport, WalkError> {
+    let live = read_live(query, false)?;
+    finish_report(query, &live)
+}
+
+fn read_live(query: &TreeQuery, retain_nodes: bool) -> Result<LiveWindow, WalkError> {
     ensure_trusted()?;
     let app = resolve_target(query)?;
     let deadline = Instant::now() + TREE_BUDGET;
@@ -281,14 +623,18 @@ fn build_tree(query: &TreeQuery) -> Result<TreeReport, WalkError> {
         foreign: Vec::new(),
         visited: HashSet::from([app.pid, window_pid]),
         remaining: LINE_CAP,
+        retain_nodes,
+        nodes: HashMap::new(),
     };
-    let mut root = walk_element(&chosen.element, &mut ctx, 0)?;
+    let mut path = Vec::new();
+    let mut root = walk_element(&chosen.element, &mut ctx, 0, &mut path)?;
     graft_hosted(
         &mut root,
         &app,
         query.session.as_deref(),
         &mut ctx,
         &mut edits,
+        &mut path,
     )?;
     if root.role == "unavailable" && root.children.is_empty() {
         if Instant::now() >= deadline {
@@ -302,17 +648,19 @@ fn build_tree(query: &TreeQuery) -> Result<TreeReport, WalkError> {
     } else {
         match_cg_window(&cg, window_pid, root.frame).unwrap_or(0)
     };
-    finish_report(query, &app, window_id, root, edits)
+    Ok(LiveWindow {
+        app,
+        window_id,
+        root,
+        edits,
+        nodes: ctx.nodes,
+    })
 }
 
-fn finish_report(
-    query: &TreeQuery,
-    app: &AppInfo,
-    window_id: u32,
-    root: UiNode,
-    edits: Vec<(i32, ElectronEdit)>,
-) -> Result<TreeReport, WalkError> {
-    let rendered = tree::render(&root);
+fn finish_report(query: &TreeQuery, live: &LiveWindow) -> Result<TreeReport, WalkError> {
+    let app = &live.app;
+    let window_id = live.window_id;
+    let rendered = tree::render(&live.root);
     let revision = tree::revision_of(&rendered.root);
     let previous = cache::load(
         query.session.as_deref(),
@@ -330,21 +678,24 @@ fn finish_report(
     let mut snapshot = Snapshot {
         revision,
         tree: rendered.text.clone(),
-        root: rendered.root,
+        root: rendered.root.clone(),
         truncated: rendered.truncated,
         pid: app.pid,
         window_id,
         bundle_id: app.bundle_id.clone(),
-        electron: edits
+        electron: live
+            .edits
             .iter()
             .find(|(pid, _)| *pid == app.pid)
             .map(|(_, edit)| edit.clone()),
+        observed: Some(rendered.root),
+        observed_revision: Some(revision),
     };
     let mut note = None;
     if let Err(error) = cache::store(query.session.as_deref(), &snapshot) {
         note = Some(format!("session cache was not written: {error}"));
     }
-    for (pid, edit) in &edits {
+    for (pid, edit) in &live.edits {
         if *pid == app.pid {
             continue;
         }
@@ -493,6 +844,17 @@ struct WalkCtx {
     foreign: Vec<i32>,
     visited: HashSet<i32>,
     remaining: usize,
+    /// Keep an element for every numbered path. Element actions set this.
+    retain_nodes: bool,
+    nodes: HashMap<Vec<usize>, CFRetained<AXUIElement>>,
+}
+
+struct LiveWindow {
+    app: AppInfo,
+    window_id: u32,
+    root: UiNode,
+    edits: Vec<(i32, ElectronEdit)>,
+    nodes: HashMap<Vec<usize>, CFRetained<AXUIElement>>,
 }
 
 struct AxWin {
@@ -506,6 +868,7 @@ fn walk_element(
     element: &AXUIElement,
     ctx: &mut WalkCtx,
     depth: usize,
+    path: &mut Vec<usize>,
 ) -> Result<UiNode, WalkError> {
     if Instant::now() >= ctx.deadline {
         if depth == 0 {
@@ -547,8 +910,11 @@ fn walk_element(
         let count = child_total(element).unwrap_or(0);
         (Vec::new(), count)
     } else {
-        take_children(element, ctx, depth)?
+        take_children(element, ctx, depth, path)?
     };
+    if ctx.retain_nodes {
+        ctx.nodes.insert(path.clone(), retain_ax(element));
+    }
     Ok(UiNode {
         role,
         subrole,
@@ -568,6 +934,7 @@ fn take_children(
     element: &AXUIElement,
     ctx: &mut WalkCtx,
     depth: usize,
+    path: &mut Vec<usize>,
 ) -> Result<(Vec<UiNode>, usize), WalkError> {
     let (elements, total) = match copy_child_elements(element, CHILD_CAP, ctx.deadline) {
         Ok(value) => value,
@@ -593,7 +960,11 @@ fn take_children(
             }
             continue;
         }
-        match walk_element(&child, ctx, depth + 1) {
+        let child_index = children.len();
+        path.push(child_index);
+        let walked = walk_element(&child, ctx, depth + 1, path);
+        path.pop();
+        match walked {
             Ok(node) => children.push(node),
             Err(WalkError::Permission(message)) => return Err(WalkError::Permission(message)),
             Err(_) => children.push(unavailable()),
@@ -617,6 +988,7 @@ fn graft_hosted(
     session: Option<&str>,
     ctx: &mut WalkCtx,
     edits: &mut Vec<(i32, ElectronEdit)>,
+    path: &mut Vec<usize>,
 ) -> Result<(), WalkError> {
     let needs = root.children.is_empty() || !ctx.foreign.is_empty();
     if !needs {
@@ -643,7 +1015,11 @@ fn graft_hosted(
                 edits.push((pid, edit));
             }
         }
-        match helper_root(pid, ctx) {
+        let child_index = root.children.len();
+        path.push(child_index);
+        let walked = helper_root(pid, ctx, path);
+        path.pop();
+        match walked {
             Ok(node) => root.children.push(node),
             Err(WalkError::Permission(message)) => return Err(WalkError::Permission(message)),
             Err(WalkError::Timeout) => return Err(WalkError::Timeout),
@@ -657,7 +1033,7 @@ fn graft_hosted(
     Ok(())
 }
 
-fn helper_root(pid: i32, ctx: &mut WalkCtx) -> Result<UiNode, WalkError> {
+fn helper_root(pid: i32, ctx: &mut WalkCtx, path: &mut Vec<usize>) -> Result<UiNode, WalkError> {
     let element = application(pid)?;
     ignore_timeout(&element);
     let windows = copy_windows(&element, ctx.deadline).map_err(|error| match error {
@@ -668,7 +1044,12 @@ fn helper_root(pid: i32, ctx: &mut WalkCtx) -> Result<UiNode, WalkError> {
     let Some(chosen) = select_window(windows, None).ok() else {
         return Ok(unavailable());
     };
-    walk_element(&chosen.element, ctx, 1)
+    walk_element(&chosen.element, ctx, 1, path)
+}
+
+fn retain_ax(element: &AXUIElement) -> CFRetained<AXUIElement> {
+    // SAFETY: element is a live AXUIElement for this call. retain() adds +1, which CFRetained owns.
+    unsafe { CFRetained::retain(NonNull::from(element)) }
 }
 
 fn scanned_helper_pids(app: &AppInfo) -> Vec<i32> {
@@ -1330,7 +1711,8 @@ impl WalkError {
             ComputerError::AppNotFound(message) => Self::AppNotFound(message),
             ComputerError::WindowNotFound(message) => Self::WindowNotFound(message),
             ComputerError::InvalidArguments(message) => Self::Invalid(message),
-            _ => Self::failed(None, 0),
+            ComputerError::ExecutionFailed(message) => Self::Message(message),
+            other => Self::Message(other.to_string()),
         }
     }
 
@@ -1341,6 +1723,7 @@ impl WalkError {
             Self::WindowNotFound(message) => ComputerError::WindowNotFound(message),
             Self::AppNotFound(message) => ComputerError::AppNotFound(message),
             Self::Invalid(message) => ComputerError::InvalidArguments(message),
+            Self::Message(message) => ComputerError::ExecutionFailed(message),
             Self::Failed { .. } => {
                 ComputerError::ExecutionFailed("accessibility tree could not be read".into())
             }

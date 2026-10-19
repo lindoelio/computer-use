@@ -146,6 +146,24 @@ mod tests {
     }
 
     #[test]
+    fn element_action_is_unsupported() {
+        use crate::backend::DesktopBackend;
+        use crate::element::{ElementOp, ElementRequest};
+        let error = WindowsDesktopBackend
+            .element_action(&ElementRequest {
+                op: ElementOp::Focus,
+                index: 0,
+                require_visible: false,
+                app: None,
+                window: None,
+                session: None,
+            })
+            .unwrap_err();
+        assert_eq!(error.error.code(), "unsupported");
+        assert!(error.error.to_string().contains("windows"));
+    }
+
+    #[test]
     fn frontmost_parser_reads_two_lines() {
         let info = split_frontmost(b"notepad\nUntitled - Notepad\n");
         assert_eq!(info.app.as_deref(), Some("notepad"));
