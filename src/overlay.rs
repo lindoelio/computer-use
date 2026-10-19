@@ -216,6 +216,7 @@ fn connect_timeout(path: &Path, timeout: Duration) -> Result<std::os::unix::net:
 
 /// Remove a stale socket, bind, and set mode `0600`.
 #[cfg(unix)]
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
 pub(crate) fn bind_socket(path: &Path) -> io::Result<std::os::unix::net::UnixListener> {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
@@ -232,11 +233,13 @@ pub(crate) fn bind_socket(path: &Path) -> io::Result<std::os::unix::net::UnixLis
 }
 
 #[cfg(unix)]
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
 fn fs_create(path: &Path) -> io::Result<()> {
     std::fs::create_dir_all(path)
 }
 
 #[cfg(unix)]
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
 fn fs_set_mode(path: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));

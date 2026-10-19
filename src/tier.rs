@@ -10,16 +10,22 @@ use crate::policy::SYNTHETIC_EVENT_USER_DATA;
 use crate::types::{Modifier, MouseButton};
 
 /// `kCGEventTargetUnixProcessID`.
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
 pub const FIELD_TARGET_UNIX_PROCESS_ID: u32 = 40;
 /// `kCGEventSourceUserData`. The listen-only tap reads this field.
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
 pub const FIELD_EVENT_SOURCE_USER_DATA: u32 = 42;
 /// `kCGMouseEventWindowUnderMousePointer`.
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
 pub const FIELD_MOUSE_WINDOW_UNDER_POINTER: u32 = 91;
 /// `kCGMouseEventWindowUnderMousePointerThatCanHandleThisEvent`.
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
 pub const FIELD_MOUSE_WINDOW_THAT_CAN_HANDLE: u32 = 92;
 
 /// SkyLight front-process symbols, in the order this crate tries them.
-#[cfg_attr(not(feature = "skylight"), allow(dead_code))]
+///
+/// Live code reads this only on macOS with the `skylight` feature. Tests read it everywhere.
+#[cfg_attr(not(all(feature = "skylight", target_os = "macos")), allow(dead_code))]
 pub const SKYLIGHT_FRONT_SYMBOLS: [&str; 3] = [
     "SLPSSetFrontProcessWithOptions",
     "SLSSetFrontProcessWithOptions",
@@ -134,6 +140,7 @@ pub fn fallback_to_activate(lock_held: bool, require_background: bool) -> bool {
 }
 
 /// Screen point minus the window origin. Both are top-left logical points.
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
 pub fn window_local_point(
     screen_x: i32,
     screen_y: i32,
@@ -149,6 +156,7 @@ pub fn window_local_point(
 /// Integer fields stamped on a synthetic mouse or scroll event.
 ///
 /// Field 42 carries [`SYNTHETIC_EVENT_USER_DATA`] so the P6 tap ignores the event.
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
 pub fn event_integer_fields(window_id: u32, pid: i32) -> [(u32, i64); 4] {
     [
         (FIELD_EVENT_SOURCE_USER_DATA, SYNTHETIC_EVENT_USER_DATA),
@@ -159,6 +167,7 @@ pub fn event_integer_fields(window_id: u32, pid: i32) -> [(u32, i64); 4] {
 }
 
 /// True when the cursor moved by more than one logical point.
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
 pub fn cursor_moved(before_x: f64, before_y: f64, after_x: f64, after_y: f64) -> bool {
     (after_x - before_x).abs() > 1.0 || (after_y - before_y).abs() > 1.0
 }
