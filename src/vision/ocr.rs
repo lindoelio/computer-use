@@ -290,7 +290,6 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn linux_ocr_returns_unsupported() {
-        use crate::image_util::ScreenshotMap;
         use image::RgbaImage;
         let image = RgbaImage::from_pixel(8, 8, image::Rgba([255, 255, 255, 255]));
         let map = make_stub_map();
@@ -309,7 +308,6 @@ mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     fn windows_ocr_returns_unsupported() {
-        use crate::image_util::ScreenshotMap;
         use image::RgbaImage;
         let image = RgbaImage::from_pixel(8, 8, image::Rgba([255, 255, 255, 255]));
         let map = make_stub_map();
@@ -344,9 +342,10 @@ mod tests {
         assert_eq!(image_rect.height, 80);
     }
 
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    fn make_stub_map() -> ScreenshotMap {
-        ScreenshotMap {
+    #[cfg(any(test, target_os = "linux", target_os = "windows"))]
+    #[allow(dead_code)]
+    fn make_stub_map() -> crate::image_util::ScreenshotMap {
+        crate::image_util::ScreenshotMap {
             width: 8,
             height: 8,
             scale: 1.0,
