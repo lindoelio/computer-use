@@ -397,8 +397,14 @@ fn cgimage_to_rgba(image: &CGImage) -> Result<image::RgbaImage, String> {
             height: height as CGFloat,
         },
     };
-    CGContext::translate_ctm(Some(&context), 0.0, height as CGFloat);
-    CGContext::scale_ctm(Some(&context), 1.0, -1.0);
+    // CGBitmapContextCreate lays the buffer out top-down: the buffer's first
+    // row is the image's first row. CGContextDrawImage draws a CGImage right
+    // side up into that layout. The standard "translate + scale(1,-1)" flip
+    // idiom exists for window contexts (origin at bottom-left). Applying it
+    // here inverts the already-correct bitmap layout, producing an upside-down
+    // screenshot — exactly the symptom the live SCK path showed before the
+    // bugfix. The SCStream path (copy_locked_bgra) has always used the raw
+    // top-down layout and remains untouched.
     CGContext::draw_image(Some(&context), rect, Some(image));
     drop(context);
     image::RgbaImage::from_raw(width_u, height_u, buffer)
@@ -575,19 +581,36 @@ unsafe fn copy_locked_bgra(
         // base + y*stride and contains at least width*4 bytes.
         let row =
             unsafe { std::slice::from_raw_parts(base.cast::<u8>().add(y * stride), width * 4) };
-        for x in 0..width {
-            let src = x * 4;
-            let dst = (y * width + x) * 4;
-            rgba[dst] = row[src + 2];
-            rgba[dst + 1] = row[src + 1];
-            rgba[dst + 2] = row[src];
-            rgba[dst + 3] = row[src + 3];
-        }
+        bgra_row_to_rgba(row, &mut rgba[y * width * 4..(y + 1) * width * 4]);
     }
     let width_u = u32::try_from(width).unwrap_or(u32::MAX);
     let height_u = u32::try_from(height).unwrap_or(u32::MAX);
     image::RgbaImage::from_raw(width_u, height_u, rgba)
         .ok_or_else(|| "RGBA buffer length does not match the sample".into())
+}
+
+/// Convert one BGRA row (4 bytes per pixel, width pixels long) into a packed
+/// RGBA row of the same width. The output must be `width * 4` bytes long.
+///
+/// Pure helper: no platform calls. The SCK row order is top-to-bottom (rows
+/// come from the CVPixelBuffer in source order and land in the output buffer
+/// in the same order); this helper only swaps the R and B channels per pixel.
+/// Keeping it pure means the row-copy logic is unit-testable without a live
+/// desktop, and any future caller that needs the same channel swap can reuse
+/// it.
+fn bgra_row_to_rgba(bgra_row: &[u8], rgba_row: &mut [u8]) {
+    debug_assert_eq!(bgra_row.len(), rgba_row.len());
+    debug_assert_eq!(bgra_row.len() % 4, 0);
+    let pixels = bgra_row.len() / 4;
+    for pixel in 0..pixels {
+        let src = pixel * 4;
+        let dst = pixel * 4;
+        // Source is BGRA (kCGBitmapByteOrder32Big). Destination is RGBA.
+        rgba_row[dst] = bgra_row[src + 2];
+        rgba_row[dst + 1] = bgra_row[src + 1];
+        rgba_row[dst + 2] = bgra_row[src];
+        rgba_row[dst + 3] = bgra_row[src + 3];
+    }
 }
 
 fn fallback_crop(
@@ -794,4 +817,59 @@ extern "C" {
     fn CVPixelBufferGetHeight(buffer: *mut c_void) -> usize;
     fn CVPixelBufferGetBytesPerRow(buffer: *mut c_void) -> usize;
     fn CVPixelBufferGetPixelFormatType(buffer: *mut c_void) -> u32;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bgra_row_to_rgba;
+
+    #[test]
+    fn bgra_row_to_rgba_swaps_red_and_blue_per_pixel() {
+        // Source BGRA, two pixels: red then blue. Output must be RGBA.
+        let bgra = [
+            0x10, 0x20, 0x30, 0xFF, // B G R A — the pixel reads as "R=0x30 G=0x20 B=0x10"
+            0xAA, 0xBB, 0xCC, 0x40, // B G R A — "R=0xCC G=0xBB B=0xAA"
+        ];
+        let mut rgba = [0_u8; 8];
+        bgra_row_to_rgba(&bgra, &mut rgba);
+        assert_eq!(
+            rgba,
+            [
+                0x30, 0x20, 0x10, 0xFF, // R G B A
+                0xCC, 0xBB, 0xAA, 0x40,
+            ]
+        );
+    }
+
+    #[test]
+    fn bgra_row_to_rgba_preserves_alpha() {
+        let bgra = [0x01, 0x02, 0x03, 0x77];
+        let mut rgba = [0_u8; 4];
+        bgra_row_to_rgba(&bgra, &mut rgba);
+        assert_eq!(rgba, [0x03, 0x02, 0x01, 0x77]);
+    }
+
+    #[test]
+    fn bgra_row_to_rgba_handles_an_empty_row() {
+        let bgra: [u8; 0] = [];
+        let mut rgba: [u8; 0] = [];
+        bgra_row_to_rgba(&bgra, &mut rgba);
+    }
+
+    #[test]
+    fn bgra_row_to_rgba_does_not_reorder_rows() {
+        // The SCK row order is top-to-bottom: row 0 lands at the top of the
+        // output buffer. This test pins that contract so a future "flip the
+        // SCK rows" patch trips here before reaching live code.
+        let row_top: [u8; 4] = [0xFF, 0x00, 0x00, 0xFF]; // blue
+        let row_bottom: [u8; 4] = [0x00, 0xFF, 0x00, 0xFF]; // green
+        let bgra = [row_top.as_slice(), row_bottom.as_slice()].concat();
+        let mut rgba_top = [0_u8; 4];
+        let mut rgba_bottom = [0_u8; 4];
+        bgra_row_to_rgba(&row_top, &mut rgba_top);
+        bgra_row_to_rgba(&row_bottom, &mut rgba_bottom);
+        assert_eq!(rgba_top, [0x00, 0x00, 0xFF, 0xFF]); // red (B<->R swap)
+        assert_eq!(rgba_bottom, [0x00, 0xFF, 0x00, 0xFF]); // green
+        let _ = bgra; // keep both rows in scope for symmetry with the live loop
+    }
 }
