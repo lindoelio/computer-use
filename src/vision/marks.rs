@@ -223,15 +223,24 @@ const FONT_GLYPHS: &[(&str, [u8; FONT_HEIGHT])] = &[
 ];
 
 struct GlyphPixels {
-    rows: Vec<[bool; FONT_WIDTH]>,
+    rows: Vec<[bool; FONT_WIDTH * MAX_LABEL_CHARS]>,
     cols: usize,
 }
 
+/// Maximum glyphs `draw_label` will render. Keeps the column buffer small
+/// and bounds the size of a set-of-marks overlay.
+const MAX_LABEL_CHARS: usize = 4;
+
 fn label_to_pixels(label: &str) -> GlyphPixels {
-    let mut rows = vec![[false; FONT_WIDTH]; FONT_HEIGHT];
+    // MAX_LABEL_CHARS hard caps the number of glyphs; each glyph is
+    // FONT_WIDTH columns wide, so the column buffer must hold that many
+    // columns, not just one glyph's worth. Allocating FONT_WIDTH columns
+    // (the previous size) panicked as soon as a second glyph was rendered
+    // because `cols + col` walked past the end of every row.
+    let mut rows = vec![[false; FONT_WIDTH * MAX_LABEL_CHARS]; FONT_HEIGHT];
     let mut cols = 0_usize;
     for (char_index, ch) in label.chars().enumerate() {
-        if char_index >= 4 {
+        if char_index >= MAX_LABEL_CHARS {
             // Hard cap: marks only label short IDs.
             break;
         }
@@ -279,7 +288,7 @@ fn glyph_for(ch: char) -> [u8; FONT_HEIGHT] {
 
 const EMPTY_GLYPH: [u8; FONT_HEIGHT] = [0; FONT_HEIGHT];
 
-fn fill_unknown(rows: &mut [[bool; FONT_WIDTH]], col_offset: usize) {
+fn fill_unknown(rows: &mut [[bool; FONT_WIDTH * MAX_LABEL_CHARS]], col_offset: usize) {
     // Single center dot — narrower than a digit — keeps the column count.
     rows[2][col_offset + 1] = true;
     rows[3][col_offset + 1] = true;
@@ -377,5 +386,71 @@ mod tests {
     fn tree_label_is_decimal() {
         assert_eq!(tree_label(0), "0");
         assert_eq!(tree_label(42), "42");
+    }
+
+    #[test]
+    fn multi_char_label_renders_without_panicking() {
+        // Before the live the glyph column buffer was sized to one glyph
+        // (FONT_WIDTH=4). The second glyph in 'o12' pushed cols + col to
+        // index 4, past the end of a length-4 row, and
+        // `rows[row][cols + col] = on` panicked with
+        // "index out of bounds: the len is 4 but the index is 4".
+        // The label lives in an OCR observation whose box touches the
+        // right edge of the image — the clamp in draw_label must keep
+        // every on-pixel inside the canvas.
+        let image = RgbaImage::from_pixel(40, 12, Rgba([255, 255, 255, 255]));
+        let marks = vec![MarkBox {
+            rect: ImageRect {
+                x: 24,
+                y: 0,
+                width: 16,
+                height: 12,
+            },
+            label: "o12".to_string(),
+        }];
+        let marked = draw_marks(&image, &marks);
+        // The cell size is width / cols = 16 / 12 = 1, so every on-pixel
+        // should fall inside x in [24..40) and y in [0..12). No crash, and
+        // at least one pixel inside the box must differ from the white
+        // background.
+        let mut saw_drawn_pixel = false;
+        for y in 0..12 {
+            for x in 24..40 {
+                if marked.get_pixel(x, y).to_rgba() != Rgba([255, 255, 255, 255]) {
+                    saw_drawn_pixel = true;
+                    break;
+                }
+            }
+            if saw_drawn_pixel {
+                break;
+            }
+        }
+        assert!(
+            saw_drawn_pixel,
+            "marks must leave a non-white pixel inside the labelled box"
+        );
+    }
+
+    #[test]
+    fn multi_char_label_with_touching_right_edge_stays_inside() {
+        // OCR labels can be two or three chars (o0, o12) inside a box flush
+        // with the right edge of the canvas. draw_label clamps every on-pixel
+        // to `x + dx < w` so this used to be the panic site, not a stray
+        // pixel. The box border still paints, so we only assert the call
+        // returns and that no on-pixel would have walked past the right
+        // edge of the bitmap (the input width is 8, the box right edge is
+        // x = 8, the cell width is 4 / cols(8) = 0 so draw_label returns
+        // before drawing any glyph).
+        let image = RgbaImage::from_pixel(8, 8, Rgba([255, 255, 255, 255]));
+        let marks = vec![MarkBox {
+            rect: ImageRect {
+                x: 4,
+                y: 0,
+                width: 4,
+                height: 8,
+            },
+            label: "12".to_string(),
+        }];
+        let _marked = draw_marks(&image, &marks);
     }
 }
