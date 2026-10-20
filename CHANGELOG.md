@@ -136,6 +136,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A `vs Codex` summary under the parity table listing where we exceed, match, and fall short, with no marketing claims.
 - `docs(P15): honest parity audit` — added a `Verification` column to the parity table (`live` / `CI` / `compile-only`), downgraded `Synthetic focus enforcer` and `Virtual display / isolation` from `DONE` to `PARTIAL` to match the code, corrected the `vs Codex` summary (Codex does ship a foreground-only Windows backend with an app allowlist per OpenAI's docs, Codex captures per target window, Codex ships with a model trained for computer use — OpenAI reports GPT-5.5 at 78.7% OSWorld-Verified), and added a one-line tally under the table.
 
+### Fixed (live macOS testing, 2026-10-20)
+
+- `menu list` returned top-level menus with empty `children`: the submenu is the `AXMenu` child in `AXChildren`, not an attribute. `menu click` uses the same walk.
+- ScreenCaptureKit window screenshots (`capture_source: "sck"`) were vertically flipped, which broke OCR.
+- `screenshot --marks` panicked on an edge-touching label, and then wrote an unmarked PNG because the overlay was drawn on a copy and discarded. Labels are capped in size, numbering matches `tree`, and zero marks warns.
+- `apple-event` failed with `osascript: No such file or directory` (extra argv element).
+- `dock list` returned no items; it now walks the Dock's `AXList` of `AXDockItem`s.
+- An explicit `--tier event` on `type --element N` was ignored in favour of `set_value`.
+- `type --tier event` with no focused element now returns a `warning` instead of a silent success.
+- `scroll --dy -3` (negative value as a separate argument) was rejected by the parser.
+- `scroll --tier event` reported success without scrolling a background app: macOS does not deliver pid-posted wheel events to the app's views. Scroll now verifies through the AX scroll bar and falls back to setting `AXValue` (`via: "ax_scrollbar"`, `scrolled`, `before`/`after`, `step`); `--tier ax` uses the bar directly.
+
 ### Known limitations
 
 Items tested by code and CI but not exercised live for this release.
