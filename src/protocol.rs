@@ -1126,9 +1126,11 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
         }
         Action::Spaces {} => result_response(spaces_action(backend)),
         Action::BrowserTabs {} => result_response(browser_tabs(context, &prepared.subject)),
-        Action::BrowserActivate { target_id } => {
-            result_response(browser_activate(context, &prepared.subject, target_id.clone()))
-        }
+        Action::BrowserActivate { target_id } => result_response(browser_activate(
+            context,
+            &prepared.subject,
+            target_id.clone(),
+        )),
         Action::BrowserNavigate { url, target_id } => result_response(browser_navigate(
             context,
             &prepared.subject,
