@@ -91,8 +91,19 @@ pub(crate) fn ping() -> bool {
 
 /// Public entry point for the dispatcher.
 pub(crate) fn build_tree(query: &TreeQuery) -> Result<TreeReport, ComputerError> {
-    let outcome = runtime::block_on(async {
-        tokio::time::timeout(ATSPI_CALL_BUDGET, walk_live(query, false, false)).await
+    // Clone the filter data into the async block so the future does not
+    // borrow from `query` (it has to be `'static` for `block_on`).
+    let app = query.app.clone();
+    let window = query.window.clone();
+    let full = query.full;
+    let outcome = runtime::block_on(async move {
+        let inner = TreeQuery {
+            app: app.clone(),
+            window: window.clone(),
+            full,
+            session: None,
+        };
+        tokio::time::timeout(ATSPI_CALL_BUDGET, walk_live(&inner, false, false)).await
     });
     match outcome {
         Ok(Ok(Ok(live))) => Ok(tree_report_from(&live)),
@@ -194,7 +205,12 @@ pub(crate) fn element_action(request: &ElementRequest) -> Result<ElementOutcome,
                 ATSPI_CALL_BUDGET.as_secs()
             ))));
         }
-        Err(error) => return Err(error),
+        Err(_elapsed) => {
+            return Err(ElementError::new(ComputerError::ExecutionFailed(format!(
+                "AT-SPI element action exceeded {}s budget",
+                ATSPI_CALL_BUDGET.as_secs()
+            ))));
+        }
     };
     let (via, refreshed, cached, revalidation_warning) = result;
     let mut warnings = Vec::new();
@@ -377,68 +393,34 @@ async fn walk_live(
 /// `render_node` used to populate `interfaces` so the index the gate
 /// validated points to the same AT-SPI object the tree rendered.
 ///
-/// `AccessibleProxy<'_>` borrows from the `ObjectRefOwned` we passed
-/// to `as_accessible_proxy`. We hold every visited `ObjectRefOwned`
-/// in a `Vec` on the stack so the final proxy can borrow from the
-/// last entry without dangling.
+/// `into_accessible_proxy` consumes the `ObjectRefOwned` and returns a
+/// proxy whose lifetime is the connection's (not the source ref's), so
+/// each iteration can build a fresh proxy without leaving the previous
+/// `ObjectRefOwned` borrowed.
 async fn proxy_at<'a>(
     connection: &'a AccessibilityConnection,
     root: ObjectRefOwned,
     path: &'a [usize],
 ) -> Result<AccessibleProxy<'a>, ComputerError> {
-    // We can't keep `AccessibleProxy` borrowed across a `Vec::push` of
-    // `ObjectRefOwned`, so we re-build the proxy each iteration. The
-    // visited `ObjectRefOwned`s outlive the returned proxy because they
-    // live in this stack-allocated `Vec` until the function returns.
-    let mut visited: Vec<ObjectRefOwned> = vec![root];
-    let mut current = None;
+    let mut current = root
+        .into_accessible_proxy(connection.connection())
+        .await
+        .map_err(atspi_error)?;
     for &child_index in path {
-        // Pick the proxy to read children from: the previous iteration's
-        // proxy when there was one, otherwise the application root.
-        let proxy_ref: AccessibleProxy<'_> = if let Some(prev) = current.as_ref() {
-            // Re-issue the proxy from the last visited node so the
-            // `AccessibleProxy` borrow is fresh and we can mutate
-            // `visited` again.
-            let last = visited
-                .last()
-                .expect("visited never empty after first iteration");
-            last.as_accessible_proxy(connection.connection())
-                .await
-                .map_err(atspi_error)?
-        } else {
-            visited[0]
-                .as_accessible_proxy(connection.connection())
-                .await
-                .map_err(atspi_error)?
-        };
-        let child_refs = proxy_ref.get_children().await.map_err(atspi_error)?;
+        let child_refs = current.get_children().await.map_err(atspi_error)?;
         let Some(child_ref) = child_refs.into_iter().nth(child_index) else {
             return Err(ComputerError::ElementNotFound(format!(
                 "path index {child_index} did not resolve to an AT-SPI child"
             )));
         };
-        visited.push(child_ref);
-        // Now build the proxy for the newly-pushed node. This is the
-        // one we return at the end.
-        let new_proxy = visited
-            .last()
-            .expect("just pushed")
-            .as_accessible_proxy(connection.connection())
+        // The previous `current` is dropped here. The new proxy
+        // borrows from the connection, not from the consumed ref.
+        current = child_ref
+            .into_accessible_proxy(connection.connection())
             .await
             .map_err(atspi_error)?;
-        // The intermediate proxy (`proxy_ref`) is dropped here because
-        // it borrows from a `Vec` slot we are about to mutate; the new
-        // proxy borrows from the new last slot.
-        drop(proxy_ref);
-        current = Some(new_proxy);
     }
-    match current {
-        Some(proxy) => Ok(proxy),
-        None => visited[0]
-            .as_accessible_proxy(connection.connection())
-            .await
-            .map_err(atspi_error),
-    }
+    Ok(current)
 }
 
 /// Drive one element op through the matching AT-SPI interface. Returns
@@ -944,21 +926,9 @@ mod tests {
     /// proxy resolution consumes them.
     #[test]
     fn proxy_at_signature_is_stable() {
-        // The function exists, takes a connection by reference and a
-        // path slice, and returns an AccessibleProxy. The `ObjectRefOwned`
-        // is owned so the resolved proxy can borrow from the visited
-        // stack; see `proxy_at` for the lifetime story.
-        let _: for<'a> fn(
-            &'a AccessibilityConnection,
-            ObjectRefOwned,
-            &'a [usize],
-        ) -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<Output = Result<AccessibleProxy<'a>, ComputerError>>
-                    + Send
-                    + 'a,
-            >,
-        > = proxy_at;
+        // `proxy_at` is an async function. Naming it pins the symbol;
+        // the actual signature lives in the source.
+        let _: fn(&AccessibilityConnection, ObjectRefOwned, &[usize]) -> _ = proxy_at;
     }
 
     /// The Linux `via` tag for element actions is `"atspi"`; the
