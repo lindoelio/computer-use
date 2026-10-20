@@ -22,6 +22,7 @@ pub mod adapters;
 mod attempt;
 pub mod audit;
 pub mod backend;
+pub mod browser;
 pub mod cache;
 mod doctor;
 pub mod element;

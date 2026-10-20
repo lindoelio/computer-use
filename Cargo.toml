@@ -38,7 +38,8 @@ path = "src/main.rs"
 default = []
 # Crate dependencies are attached in the phase that uses them.
 # P1 declares the names so `--all-features` compiles on every OS.
-cdp = []
+# P10: `cdp` pulls chromiumoxide and a minimal tokio for CDP attach.
+cdp = ["dep:chromiumoxide", "dep:tokio", "dep:futures"]
 skylight = []
 virtual-display = ["skylight"]
 portal = []
@@ -54,6 +55,20 @@ serde_json = "1"
 thiserror = "2"
 toml = "0.8.23"
 xcap = "0.3.3"
+# P10: optional CDP client (attach only, never to spawn). Pinned to 0.9.1 per the
+# ROADMAP.md design.
+chromiumoxide = { version = "0.9.1", optional = true, default-features = false }
+# We create a `current_thread` runtime per call (P10 design). `macros` is unused
+# here but chromiumoxide itself needs `net`, `time`, etc.; cargo feature
+# unification picks those up from chromiumoxide's own deps.
+tokio = { version = "1", optional = true, default-features = false, features = [
+    "rt",
+] }
+# `chromiumoxide`'s handler is a `futures::Stream`; we only use `StreamExt`
+# to drive it inside our short-lived runtime.
+futures = { version = "0.3", optional = true, default-features = false, features = [
+    "std",
+] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

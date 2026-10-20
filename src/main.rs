@@ -110,6 +110,20 @@ struct Cli {
     #[arg(long, global = true)]
     no_overlay: bool,
 
+    /// Route `browser` commands to Chrome DevTools Protocol. Requires a
+    /// binary built with `--features cdp`. The CDP client attaches to a
+    /// Chrome that the user already started with `--remote-debugging-port=N`
+    /// — `computer-use` does not spawn a browser.
+    #[arg(long, global = true)]
+    cdp: bool,
+
+    /// Override the discovered CDP websocket URL. Default: scan the `--app`
+    /// pid's argv on macOS/Linux and connect to `ws://127.0.0.1:<port>`, or
+    /// `ws://127.0.0.1:9222` when no app is given. `http(s)://...` is also
+    /// accepted and resolved via `/json/version`.
+    #[arg(long, global = true, value_name = "URL")]
+    cdp_url: Option<String>,
+
     #[command(subcommand)]
     command: Option<CliCommand>,
 }
@@ -672,6 +686,89 @@ enum CliCommand {
         #[command(subcommand)]
         command: OverlayCommand,
     },
+
+    /// Chrome DevTools Protocol (CDP) subcommands. Requires `--cdp` and a
+    /// binary built with `--features cdp`.
+    ///
+    /// Attach-only. The user already started Chrome with
+    /// `--remote-debugging-port=N`. We never spawn, restart, or quit Chrome.
+    /// The default attach endpoint is derived from `--app`'s argv on macOS
+    /// and Linux, or `ws://127.0.0.1:9222` when `--app` is absent. Pass
+    /// `--cdp-url` to override.
+    ///
+    /// URLs are matched against `[browser].blocked_urls` in the policy
+    /// before they leave this process. A match returns `blocked_url` and the
+    /// websocket is never opened.
+    ///
+    /// Example: computer-use --cdp browser tabs
+    /// Example: computer-use --cdp --app "Google Chrome" browser navigate --url "https://example.com"
+    #[command(name = "browser", subcommand)]
+    Browser(#[command(subcommand)] CliBrowserCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum CliBrowserCommand {
+    /// List the targets Chrome exposes. Each entry is one CDP `Target`.
+    /// Tabs are `type == "page"`.
+    ///
+    /// Example: computer-use --cdp browser tabs
+    Tabs,
+
+    /// Bring a tab to the front. `--target` is the CDP `targetId` from
+    /// `browser tabs`.
+    Activate {
+        /// CDP `targetId`.
+        #[arg(long, value_name = "TARGET")]
+        target: String,
+    },
+
+    /// Navigate a tab (or the first page) to `--url`. The URL is blocked by
+    /// `[browser].blocked_urls` in the policy before it is sent.
+    Navigate {
+        /// Destination URL.
+        #[arg(long, value_name = "URL")]
+        url: String,
+        /// Restrict to one tab by `targetId`. Optional.
+        #[arg(long, value_name = "TARGET")]
+        target: Option<String>,
+    },
+
+    /// Click the element matched by CSS `--selector`.
+    Click {
+        /// CSS selector.
+        #[arg(long, value_name = "SELECTOR")]
+        selector: String,
+        /// Restrict to one tab by `targetId`. Optional.
+        #[arg(long, value_name = "TARGET")]
+        target: Option<String>,
+    },
+
+    /// Type `text` into the focused element or the one matched by `--selector`.
+    Text {
+        /// Text to type.
+        #[arg(long, value_name = "TEXT")]
+        text: String,
+        /// Optional CSS selector. When omitted the focused element receives input.
+        #[arg(long, value_name = "SELECTOR")]
+        selector: Option<String>,
+        /// Restrict to one tab by `targetId`. Optional.
+        #[arg(long, value_name = "TARGET")]
+        target: Option<String>,
+    },
+
+    /// Evaluate JavaScript in the page context. The script body is never
+    /// logged verbatim — only its length and a small hash appear in the
+    /// audit row.
+    Eval {
+        /// JavaScript source. The whole next argument is the script body.
+        /// Pass an empty `--eval ""` to evaluate an empty expression (which
+        /// resolves to `undefined`).
+        #[arg(long, value_name = "SCRIPT")]
+        eval: String,
+        /// Restrict to one tab by `targetId`. Optional.
+        #[arg(long, value_name = "TARGET")]
+        target: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -922,6 +1019,8 @@ fn run() -> u8 {
                 allow_foreground: cli.allow_foreground,
                 require_background: cli.require_background,
                 no_overlay: cli.no_overlay,
+                cdp: cli.cdp,
+                cdp_url: cli.cdp_url.clone(),
                 ..CallContext::default()
             };
             match command_action(command, context) {
@@ -1190,6 +1289,7 @@ fn command_action(
             },
         },
         CliCommand::Spaces => Action::Spaces {},
+        CliCommand::Browser(command) => browser_action(command, &mut context)?,
         CliCommand::Session { command } => match command {
             SessionCommand::End => Action::SessionEnd,
             SessionCommand::Prune { dry_run, ttl } => Action::SessionPrune {
@@ -1205,6 +1305,53 @@ fn command_action(
         }
     };
     Ok((action, context))
+}
+
+/// Convert the `browser` subcommand into a typed `Action`. The dispatcher's
+/// policy logic is responsible for blocking URLs and refusing off-platform
+/// bundles; this helper just enforces the `--cdp` gate and lifts flags into
+/// the action payload.
+fn browser_action(
+    command: &CliBrowserCommand,
+    context: &mut CallContext,
+) -> Result<Action, Response> {
+    if !context.cdp {
+        // The CLI sets this from `--cdp`. Returning a structured invalid-args
+        // error is friendlier than letting the dispatcher complain about a
+        // missing feature.
+        return Err(Response::failure(
+            "invalid_arguments",
+            "browser subcommands require --cdp",
+        ));
+    }
+    let action = match command {
+        CliBrowserCommand::Tabs => Action::BrowserTabs {},
+        CliBrowserCommand::Activate { target } => Action::BrowserActivate {
+            target_id: Some(target.clone()),
+        },
+        CliBrowserCommand::Navigate { url, target } => Action::BrowserNavigate {
+            url: url.clone(),
+            target_id: target.clone(),
+        },
+        CliBrowserCommand::Click { selector, target } => Action::BrowserClick {
+            selector: selector.clone(),
+            target_id: target.clone(),
+        },
+        CliBrowserCommand::Text {
+            text,
+            selector,
+            target,
+        } => Action::BrowserText {
+            text: text.clone(),
+            selector: selector.clone(),
+            target_id: target.clone(),
+        },
+        CliBrowserCommand::Eval { eval, target } => Action::BrowserEval {
+            script: eval.clone(),
+            target_id: target.clone(),
+        },
+    };
+    Ok(action)
 }
 
 fn emit_action(action: Action, context: &CallContext, pretty: bool) -> u8 {
@@ -1256,6 +1403,8 @@ fn line_options(cli: &Cli) -> LineOptions<'_> {
         allow_foreground: cli.allow_foreground,
         require_background: cli.require_background,
         no_overlay: cli.no_overlay,
+        cdp: cli.cdp,
+        cdp_url: cli.cdp_url.as_deref(),
     }
 }
 

@@ -589,3 +589,47 @@ fn exec_wait_roundtrip() {
     assert_eq!(value["id"], 9);
     assert_eq!(value["waited_ms"], 1);
 }
+
+#[test]
+fn help_lists_browser_command() {
+    let output = run(&["--help"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("browser"),
+        "missing browser in help: {stdout}"
+    );
+}
+
+#[test]
+fn browser_subcommand_without_cdp_flag_is_invalid_arguments() {
+    let output = run(&["browser", "tabs"]);
+    assert_eq!(output.status.code(), Some(1));
+    let value: Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout))
+        .expect("browser tabs response is JSON");
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["code"], "invalid_arguments");
+}
+
+#[test]
+fn browser_subcommand_help_lists_subs() {
+    let output = run(&["browser", "--help"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("tabs"));
+    assert!(stdout.contains("activate"));
+    assert!(stdout.contains("navigate"));
+    assert!(stdout.contains("click"));
+    assert!(stdout.contains("text"));
+    assert!(stdout.contains("eval"));
+}
+
+#[test]
+fn browser_navigate_in_exec_without_cdp_returns_unsupported() {
+    // The CLI --cdp flag is off in this invocation, so the JSON request fails
+    // with `unsupported` before it ever opens a websocket.
+    let body = r#"{"action":"browser_navigate","url":"https://example.com"}"#;
+    let output = run(&["exec", body]);
+    let value: Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["code"], "unsupported");
+}

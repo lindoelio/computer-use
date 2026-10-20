@@ -417,6 +417,61 @@ pub enum Action {
     /// between spaces; otherwise the action reports the visible state only.
     #[serde(alias = "spaces")]
     Spaces {},
+    /// List the tabs the running Chrome exposes. Requires `--features cdp`.
+    /// Without the feature this returns `unsupported`.
+    #[serde(rename = "browser_tabs", alias = "browser-tabs")]
+    BrowserTabs {},
+    /// Activate a tab by `target_id`. Requires `--features cdp`.
+    #[serde(rename = "browser_activate", alias = "browser-activate")]
+    BrowserActivate {
+        /// CDP `targetId` to bring to the front.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_id: Option<String>,
+    },
+    /// Navigate the named tab (or first page) to `url`. The URL is checked
+    /// against `[browser].blocked_urls` before the websocket is touched.
+    #[serde(rename = "browser_navigate", alias = "browser-navigate")]
+    BrowserNavigate {
+        /// Destination URL.
+        url: String,
+        /// Restrict to one tab. Optional.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_id: Option<String>,
+    },
+    /// Click an element matched by CSS `selector`. Requires `--features cdp`.
+    #[serde(rename = "browser_click", alias = "browser-click")]
+    BrowserClick {
+        /// CSS selector.
+        selector: String,
+        /// Restrict to one tab. Optional.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_id: Option<String>,
+    },
+    /// Type `text` into the focused element (or the one matched by `selector`).
+    /// Requires `--features cdp`.
+    #[serde(rename = "browser_text", alias = "browser-text")]
+    BrowserText {
+        /// Text to type.
+        text: String,
+        /// Optional CSS selector. When omitted the focused element receives input.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selector: Option<String>,
+        /// Restrict to one tab. Optional.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_id: Option<String>,
+    },
+    /// Evaluate `script` in the page context and return the JSON value.
+    /// Requires `--features cdp`. The script body is never logged verbatim;
+    /// only its length and a small hash appear in the audit row.
+    #[serde(rename = "browser_eval", alias = "browser-eval")]
+    BrowserEval {
+        /// JavaScript source. Quoted on the CLI via `--eval`; here it is just
+        /// a string field that the caller has already prepared.
+        script: String,
+        /// Restrict to one tab. Optional.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_id: Option<String>,
+    },
 }
 
 fn is_false(value: &bool) -> bool {
@@ -514,6 +569,17 @@ pub struct CallContext {
     pub require_background: bool,
     /// Do not send the agent point to the overlay helper.
     pub no_overlay: bool,
+    /// Route browser commands through CDP. The dispatcher refuses the request
+    /// when this flag is off (`invalid_arguments` for the CLI, `unsupported`
+    /// for the JSON path).
+    pub cdp: bool,
+    /// Override the discovered CDP websocket URL. Wins over `--app` argv
+    /// discovery. Accepts `ws://`, `wss://`, `http://`, `https://`.
+    pub cdp_url: Option<String>,
+    /// Cached `[browser].blocked_urls` from the loaded policy. The dispatcher
+    /// refuses the websocket connection (and the page activation) when the
+    /// destination URL is in here.
+    pub browser_blocked_urls: Vec<String>,
 }
 
 /// A JSON request: an optional `id`, shared flags, and an [`Action`].
@@ -568,6 +634,9 @@ fn take_context(object: &mut Map<String, Value>) -> Result<CallContext, Computer
         allow_foreground: take_bool(object, "allow_foreground")?,
         require_background: take_bool(object, "require_background")?,
         no_overlay: take_bool(object, "no_overlay")?,
+        cdp: take_bool(object, "cdp")?,
+        cdp_url: take_stringish(object, "cdp_url")?,
+        browser_blocked_urls: take_string_list(object, "browser_blocked_urls")?,
     })
 }
 
@@ -591,6 +660,27 @@ fn take_bool(object: &mut Map<String, Value>, key: &str) -> Result<bool, Compute
         Some(Value::Bool(value)) => Ok(value),
         Some(_) => Err(ComputerError::InvalidArguments(format!(
             "{key} must be a boolean"
+        ))),
+    }
+}
+
+fn take_string_list(
+    object: &mut Map<String, Value>,
+    key: &str,
+) -> Result<Vec<String>, ComputerError> {
+    match object.remove(key) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(values)) => values
+            .into_iter()
+            .map(|value| match value {
+                Value::String(text) => Ok(text),
+                _ => Err(ComputerError::InvalidArguments(format!(
+                    "{key} entries must be strings"
+                ))),
+            })
+            .collect(),
+        Some(_) => Err(ComputerError::InvalidArguments(format!(
+            "{key} must be a list of strings"
         ))),
     }
 }
@@ -641,6 +731,10 @@ pub struct LineOptions<'a> {
     pub require_background: bool,
     /// Process `--no-overlay`. Combined with the request by or.
     pub no_overlay: bool,
+    /// Process `--cdp` flag. Combined with the request by or.
+    pub cdp: bool,
+    /// Process `--cdp-url` flag. A request field wins.
+    pub cdp_url: Option<&'a str>,
 }
 
 /// Decode one JSON line. `cli_adapter` is the process `--adapter` flag.
@@ -686,6 +780,12 @@ pub fn handle_request_line_opts(line: &str, options: LineOptions<'_>) -> Respons
             request.context.allow_foreground |= options.allow_foreground;
             request.context.require_background |= options.require_background;
             request.context.no_overlay |= options.no_overlay;
+            request.context.cdp |= options.cdp;
+            if request.context.cdp_url.is_none() {
+                if let Some(url) = options.cdp_url {
+                    request.context.cdp_url = Some(url.to_string());
+                }
+            }
             dispatch_context(request.action, &request.context).with_id(request.id)
         }
         Err(error) => {
@@ -1025,6 +1125,42 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
             result_response(dock_click_action(backend, &title))
         }
         Action::Spaces {} => result_response(spaces_action(backend)),
+        Action::BrowserTabs {} => result_response(browser_tabs(context, &prepared.subject)),
+        Action::BrowserActivate { target_id } => {
+            result_response(browser_activate(context, &prepared.subject, target_id.clone()))
+        }
+        Action::BrowserNavigate { url, target_id } => result_response(browser_navigate(
+            context,
+            &prepared.subject,
+            url.clone(),
+            target_id.clone(),
+        )),
+        Action::BrowserClick {
+            selector,
+            target_id,
+        } => result_response(browser_click(
+            context,
+            &prepared.subject,
+            selector.clone(),
+            target_id.clone(),
+        )),
+        Action::BrowserText {
+            text,
+            selector,
+            target_id,
+        } => result_response(browser_text(
+            context,
+            &prepared.subject,
+            text.clone(),
+            selector.clone(),
+            target_id.clone(),
+        )),
+        Action::BrowserEval { script, target_id } => result_response(browser_eval(
+            context,
+            &prepared.subject,
+            script.clone(),
+            target_id.clone(),
+        )),
         Action::PolicyCheck => {
             let (response, subject) = policy_check(backend, context);
             let response = attach_post_state(backend, context, kind, response);
@@ -1183,6 +1319,12 @@ fn action_label(action: &Action) -> &'static str {
         Action::DockList { .. } => "dock_list",
         Action::DockClick { .. } => "dock_click",
         Action::Spaces { .. } => "spaces",
+        Action::BrowserTabs { .. } => "browser_tabs",
+        Action::BrowserActivate { .. } => "browser_activate",
+        Action::BrowserNavigate { .. } => "browser_navigate",
+        Action::BrowserClick { .. } => "browser_click",
+        Action::BrowserText { .. } => "browser_text",
+        Action::BrowserEval { .. } => "browser_eval",
     }
 }
 
@@ -1216,7 +1358,9 @@ fn policy_class(action: &Action) -> PolicyClass {
         | Action::PolicyCheck
         | Action::MenuList { .. }
         | Action::DockList { .. }
-        | Action::Spaces { .. } => PolicyClass::Observe,
+        | Action::Spaces { .. }
+        | Action::BrowserTabs { .. }
+        | Action::BrowserActivate { .. } => PolicyClass::Observe,
         Action::Quit { .. } => PolicyClass::Quit,
         Action::Key { .. } | Action::HoldKey { .. } => PolicyClass::Key,
         Action::ClipboardGet => PolicyClass::Benign,
@@ -1693,7 +1837,12 @@ fn post_state_kind(action: &Action) -> PostKind {
         | Action::MenuClick { .. }
         | Action::AppleEvent { .. }
         | Action::ShortcutsRun { .. }
-        | Action::DockClick { .. } => PostKind::Mutating,
+        | Action::DockClick { .. }
+        | Action::BrowserNavigate { .. }
+        | Action::BrowserClick { .. }
+        | Action::BrowserText { .. }
+        | Action::BrowserEval { .. }
+        | Action::BrowserActivate { .. } => PostKind::Mutating,
         Action::GetState
         | Action::Wait { .. }
         | Action::Displays
@@ -1710,7 +1859,8 @@ fn post_state_kind(action: &Action) -> PostKind {
         | Action::Resume
         | Action::MenuList { .. }
         | Action::DockList { .. }
-        | Action::Spaces { .. } => PostKind::ReadOnly,
+        | Action::Spaces { .. }
+        | Action::BrowserTabs { .. } => PostKind::ReadOnly,
     }
 }
 
@@ -2928,6 +3078,9 @@ fn clipboard_chars(action: &Action) -> Option<u64> {
         Action::ClipboardSet {
             text: Some(text), ..
         } => Some(u64::try_from(text.chars().count()).unwrap_or(u64::MAX)),
+        Action::BrowserText { text, .. } => {
+            Some(u64::try_from(text.chars().count()).unwrap_or(u64::MAX))
+        }
         _ => None,
     }
 }
@@ -5630,4 +5783,150 @@ mod tests {
             .unwrap()
             .contains("not both"));
     }
+}
+
+// -----------------------------------------------------------------------------
+// P10: CDP-backed browser helpers. Always return a structured error when the
+// context flag is off or when the runtime refuses the URL.
+//
+// `allow(items_after_test_module)`: these helpers live after the test module
+// for convenience; they are only here because P10 grew on top of the existing
+// module. Adding a new module for them would cost more than it saves.
+#[allow(clippy::items_after_test_module)]
+fn browser_action_options(
+    context: &CallContext,
+    subject: &policy::Subject,
+    target_id: Option<String>,
+) -> crate::browser::ActionOptions {
+    // Merge per-request `browser_blocked_urls` with whatever the loaded policy
+    // says. The CLI sets the per-request field to an empty vec by default, so
+    // the policy file is the source. `--policy` (and `XDG_CONFIG_HOME`)
+    // configure the policy file location.
+    let mut policy_blocked_urls = context.browser_blocked_urls.clone();
+    if policy_blocked_urls.is_empty() {
+        if let Ok(loaded) = policy::load_policy(context.policy.as_deref().map(Path::new)) {
+            policy_blocked_urls = loaded.blocked_urls().to_vec();
+        }
+    }
+    crate::browser::ActionOptions {
+        debug_url: context.cdp_url.clone(),
+        app: context.app.clone(),
+        app_pid: subject.pid,
+        target_id,
+        url: None,
+        selector: None,
+        text: None,
+        script: None,
+        command_timeout: Duration::from_secs(30),
+        policy_blocked_urls,
+        policy_subject: Some(subject.clone()),
+    }
+}
+
+fn browser_require_cdp(context: &CallContext) -> Result<(), ComputerError> {
+    if !context.cdp {
+        return Err(ComputerError::Unsupported(
+            "browser commands require --cdp (or `cdp: true` in the JSON request)".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn browser_tabs(context: &CallContext, subject: &policy::Subject) -> Result<Value, ComputerError> {
+    browser_require_cdp(context)?;
+    let opts = browser_action_options(context, subject, None);
+    let tabs = crate::browser::cdp::list_tabs(&opts)?;
+    serde_json::to_value(&tabs)
+        .map_err(|error| ComputerError::ExecutionFailed(format!("encode tabs: {error}")))
+}
+
+fn browser_activate(
+    context: &CallContext,
+    subject: &policy::Subject,
+    target_id: Option<String>,
+) -> Result<Value, ComputerError> {
+    browser_require_cdp(context)?;
+    let target = target_id.ok_or_else(|| {
+        ComputerError::InvalidArguments("browser activate requires --target".into())
+    })?;
+    let opts = browser_action_options(context, subject, Some(target));
+    let active = crate::browser::cdp::activate_tab(&opts)?;
+    Ok(json!({ "url": active }))
+}
+
+fn browser_navigate(
+    context: &CallContext,
+    subject: &policy::Subject,
+    url: String,
+    target_id: Option<String>,
+) -> Result<Value, ComputerError> {
+    browser_require_cdp(context)?;
+    let opts = browser_action_options(context, subject, target_id);
+    let landed = crate::browser::cdp::navigate(&crate::browser::ActionOptions {
+        url: Some(url.clone()),
+        ..opts
+    })?;
+    Ok(json!({ "url": landed }))
+}
+
+fn browser_click(
+    context: &CallContext,
+    subject: &policy::Subject,
+    selector: String,
+    target_id: Option<String>,
+) -> Result<Value, ComputerError> {
+    browser_require_cdp(context)?;
+    let opts = browser_action_options(context, subject, target_id);
+    crate::browser::cdp::click(&crate::browser::ActionOptions {
+        selector: Some(selector.clone()),
+        ..opts
+    })?;
+    Ok(json!({ "selector": selector }))
+}
+
+fn browser_text(
+    context: &CallContext,
+    subject: &policy::Subject,
+    text: String,
+    selector: Option<String>,
+    target_id: Option<String>,
+) -> Result<Value, ComputerError> {
+    browser_require_cdp(context)?;
+    let opts = browser_action_options(context, subject, target_id);
+    let chars = text.chars().count() as u64;
+    crate::browser::cdp::type_text(&crate::browser::ActionOptions {
+        selector,
+        text: Some(text.clone()),
+        ..opts
+    })?;
+    // P10 audit row sees only the character count, not the script body, for
+    // `browser eval` this is tracked separately.
+    Ok(json!({ "chars": chars }))
+}
+
+fn browser_eval(
+    context: &CallContext,
+    subject: &policy::Subject,
+    script: String,
+    target_id: Option<String>,
+) -> Result<Value, ComputerError> {
+    browser_require_cdp(context)?;
+    let opts = browser_action_options(context, subject, target_id);
+    let value = crate::browser::cdp::eval(&crate::browser::ActionOptions {
+        script: Some(script.clone()),
+        ..opts
+    })?;
+    // The script body never leaves this function. The audit row only sees
+    // its length and a 16-byte blake3-ish hash so an auditor can spot
+    // duplicates without seeing the contents.
+    let length = script.chars().count() as u64;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    script.hash(&mut hasher);
+    let hash = hasher.finish();
+    Ok(json!({
+        "result": value,
+        "script_chars": length,
+        "script_hash": format!("{hash:016x}"),
+    }))
 }
