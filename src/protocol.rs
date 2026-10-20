@@ -3450,8 +3450,8 @@ fn tree_query(context: &CallContext) -> TreeQuery {
 }
 
 /// OCR result for a window capture. The dispatcher returns one block list per
-/// recognized line. macOS reuses `VNRecognizeTextRequest`. Linux/Windows are
-/// structured `Unsupported`.
+/// recognized line. macOS reuses `VNRecognizeTextRequest`, Windows uses
+/// `Windows.Media.Ocr.OcrEngine`, and Linux is a structured `Unsupported`.
 fn ocr_action(
     backend: &dyn DesktopBackend,
     context: &CallContext,
@@ -3465,7 +3465,7 @@ fn ocr_action(
     }
     let prepared = latest_prepared_ocr_capture(backend, context)?;
     let OcrResult { blocks, note } = backend.recognize_text(&prepared.image, &prepared.map)?;
-    let redacted = redact_secure_ocr_blocks(blocks, backend, context)?;
+    let redacted = redact_secure_ocr_blocks(blocks, backend, context, &prepared.map)?;
     let blocks_json: Vec<Value> = redacted
         .iter()
         .map(|block| {
@@ -3512,11 +3512,13 @@ fn redact_secure_ocr_blocks(
     blocks: Vec<OcrBlock>,
     backend: &dyn DesktopBackend,
     context: &CallContext,
+    map: &crate::image_util::ScreenshotMap,
 ) -> Result<Vec<OcrBlock>, ComputerError> {
     // We do not walk the UiNode tree directly; the backend's secure-frame
-    // extraction lives in a `secure_ocr_frames()` method which returns
-    // image-pixel rectangles for secure elements. The default is empty.
-    let secure_frames = backend.secure_ocr_frames(&tree_query(context))?;
+    // extraction lives in a `secure_ocr_frames()` method. It receives the
+    // screenshot map because platform frames are screen points and the OCR
+    // blocks are image pixels. The default is an empty list.
+    let secure_frames = backend.secure_ocr_frames(&tree_query(context), map)?;
     Ok(crate::vision::redact_blocks(blocks, secure_frames))
 }
 
@@ -4780,6 +4782,81 @@ mod tests {
                     "image = pad + (screen - origin) * image_content_size / logical_size".into(),
             },
         }
+    }
+
+    #[test]
+    fn secure_ocr_frames_receives_the_map_of_the_ocr_capture() {
+        // Platform frames are screen points; OCR blocks are image pixels. The
+        // dispatcher must hand the backend the screenshot map of the capture
+        // the OCR ran on, or redaction compares two different spaces.
+        let cache = crate::cache::CacheEnv::acquire();
+        assert!(cache.dir().is_dir());
+        let backend = StubBackend::default();
+        *backend.secure_frames.lock().unwrap() = Some(vec![crate::vision::ocr::ImageRect {
+            x: 10,
+            y: 20,
+            width: 100,
+            height: 40,
+        }]);
+        let context = CallContext {
+            app: Some("Finder".into()),
+            session: Some("p12b-redact".into()),
+            ..CallContext::default()
+        };
+        let blocks = vec![OcrBlock {
+            text: "hunter2".into(),
+            x: 20,
+            y: 30,
+            width: 30,
+            height: 10,
+            confidence: 0.9,
+        }];
+        let map = sample_map();
+        let kept = redact_secure_ocr_blocks(blocks.clone(), &backend, &context, &map).unwrap();
+        assert!(kept.is_empty(), "the block sits inside the secure frame");
+
+        let seen = backend
+            .secure_frames_map
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("secure_ocr_frames was called");
+        assert_eq!(seen.origin, map.origin);
+        assert_eq!(seen.logical_width, map.logical_width);
+        assert_eq!(seen.content_width, map.content_width);
+
+        let outside = vec![OcrBlock {
+            text: "visible".into(),
+            x: 900,
+            y: 700,
+            width: 30,
+            height: 10,
+            confidence: 0.9,
+        }];
+        let kept = redact_secure_ocr_blocks(outside, &backend, &context, &map).unwrap();
+        assert_eq!(kept.len(), 1);
+    }
+
+    #[test]
+    fn no_secure_frames_keeps_every_ocr_block() {
+        let cache = crate::cache::CacheEnv::acquire();
+        assert!(cache.dir().is_dir());
+        let backend = StubBackend::default();
+        let context = CallContext {
+            app: Some("Finder".into()),
+            session: Some("p12b-redact-none".into()),
+            ..CallContext::default()
+        };
+        let blocks = vec![OcrBlock {
+            text: "hello".into(),
+            x: 1,
+            y: 2,
+            width: 3,
+            height: 4,
+            confidence: 0.9,
+        }];
+        let kept = redact_secure_ocr_blocks(blocks, &backend, &context, &sample_map()).unwrap();
+        assert_eq!(kept.len(), 1);
     }
 
     #[test]

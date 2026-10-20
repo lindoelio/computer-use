@@ -249,7 +249,16 @@ Input and capture need permission from the operating system. `get-state` still r
 
 ### Windows
 
-Run the process in a session that can send input (an interactive desktop, not Session 0). `screenshot` uses the desktop capture APIs. Frontmost-window lookup uses PowerShell and the foreground window. The accessibility tree is `null` with a note. A corporate policy that blocks UI Automation or simulated input will surface as `execution_failed` or a null field.
+Run the process in a session that can send input (an interactive desktop, not Session 0).
+
+- **Apps and windows** come from Win32 `EnumWindows`, `GetWindowTextW`, `GetWindowThreadProcessId`, and `QueryFullProcessImageNameW`. There is no PowerShell anywhere in the binary.
+- **The accessibility tree** is the UI Automation control-view walker (`uiautomation` 0.25.1). `tree` reports `source: "uia"`, `--app pid:NNN` is a deterministic selector, and `GetForegroundWindow` is never used to resolve a window the caller already named.
+- **Element actions** run through UIA control patterns (`Invoke`, `Value`, `Text`, `ScrollItem`, `ExpandCollapse`) in the background — tier `ax`, no cursor motion. `IsPassword` controls refuse `set_value` and `type --element`. When a pattern is missing, or its single call fails (some Win32 apps ignore `Invoke` until they are in front), the action is retried as tier `activate`: `SetForegroundWindow` plus enigo input, under the same `foreground.lock` as every other foreground path, with a `foreground required` warning on the result. `--require-background` refuses that fallback, and the P6 policy allowlist still applies.
+- **Per-window capture** is one `Windows.Graphics.Capture` frame from the resolved `HWND` (`windows-capture` 2.0.1). If graphics capture cannot produce a frame, the desktop image is cropped instead and reported as `capture_source: "xcap"`, so covered pixels may be wrong.
+- **OCR** is `Windows.Media.Ocr.OcrEngine` for the user-profile languages. If no recognizer language pack is installed, `ocr` returns `execution_failed` naming Settings → Apps → Optional features. `screenshot --marks` draws the tree frames or the OCR boxes.
+- **`doctor`** reports `accessibility` (did `UIAutomation::new` succeed), plus best-effort `uiaccess` and `integrity` read from the process token with `OpenProcessToken` / `GetTokenInformation`. Neither is a required grant.
+
+A corporate policy that blocks UI Automation or simulated input surfaces as `execution_failed` or a null field.
 
 ### Linux
 

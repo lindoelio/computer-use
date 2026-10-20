@@ -1,10 +1,10 @@
 //! Vision utilities: pure-image marks overlay and the OCR backend selector.
 //!
 //! The marks renderer in [`marks`] is platform-independent. The OCR backend in
-//! [`ocr`] is macOS-only today (`VNRecognizeTextRequest`); Windows and Linux
-//! return [`crate::error::ComputerError::Unsupported`]. The markup is kept
-//! inside `src/vision` so future P12 work can extend the same module without
-//! reshaping callers.
+//! [`ocr`] is `VNRecognizeTextRequest` on macOS (P11) and
+//! `Windows.Media.Ocr.OcrEngine` on Windows (P12b); Linux returns
+//! [`crate::error::ComputerError::Unsupported`]. Both platforms produce the
+//! same [`ocr::OcrBlock`] shape, so callers never branch.
 
 pub mod marks;
 pub mod ocr;

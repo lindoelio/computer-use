@@ -400,9 +400,15 @@ pub trait DesktopBackend: Send + Sync {
     /// The OCR dispatcher drops recognized text whose block falls inside
     /// any of these rectangles. The default returns an empty list, which
     /// matches every non-macOS platform and the mock backend.
+    ///
+    /// `map` is the screenshot map of the capture the OCR ran on. Platform
+    /// frames are screen points, so redaction is only correct when the
+    /// backend converts through it — P12b wires that up on Windows and
+    /// finishes the macOS placeholder it replaces.
     fn secure_ocr_frames(
         &self,
         _query: &TreeQuery,
+        _map: &crate::image_util::ScreenshotMap,
     ) -> Result<Vec<crate::vision::ocr::ImageRect>, ComputerError> {
         Ok(Vec::new())
     }
@@ -745,8 +751,52 @@ macro_rules! impl_platform_backend {
             fn secure_ocr_frames(
                 &self,
                 query: &TreeQuery,
+                map: &crate::image_util::ScreenshotMap,
             ) -> Result<Vec<crate::vision::ocr::ImageRect>, ComputerError> {
-                macos::secure_ocr_frames(query)
+                macos::secure_ocr_frames(query, map)
+            }
+
+            #[cfg(target_os = "windows")]
+            fn element_action(
+                &self,
+                request: &ElementRequest,
+            ) -> Result<ElementOutcome, ElementError> {
+                windows::element_action(request)
+            }
+
+            // P12b: Windows captures through `windows-capture` and recognizes
+            // text with `Windows.Media.Ocr`. The secure-frame walk is the
+            // same `UiNode` recursion as macOS, converted through the map.
+            #[cfg(target_os = "windows")]
+            fn capture_window(&self, target: &WindowTarget) -> Result<RawCapture, ComputerError> {
+                windows::capture_window(target)
+            }
+
+            #[cfg(target_os = "windows")]
+            fn marks_for_tree(
+                &self,
+                query: &TreeQuery,
+                map: &crate::image_util::ScreenshotMap,
+            ) -> Result<Vec<crate::vision::MarkBox>, ComputerError> {
+                windows::marks_for_tree(query, map)
+            }
+
+            #[cfg(target_os = "windows")]
+            fn recognize_text(
+                &self,
+                image: &image::RgbaImage,
+                map: &crate::image_util::ScreenshotMap,
+            ) -> Result<crate::vision::OcrResult, ComputerError> {
+                windows::recognize_text(image, map)
+            }
+
+            #[cfg(target_os = "windows")]
+            fn secure_ocr_frames(
+                &self,
+                query: &TreeQuery,
+                map: &crate::image_util::ScreenshotMap,
+            ) -> Result<Vec<crate::vision::ocr::ImageRect>, ComputerError> {
+                windows::secure_ocr_frames(query, map)
             }
         }
     };

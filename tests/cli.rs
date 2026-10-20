@@ -225,8 +225,11 @@ fn element_commands_reject_bad_arguments_without_acting() {
 }
 
 #[test]
-fn element_commands_are_unsupported_off_macos() {
-    if cfg!(target_os = "macos") {
+fn element_commands_are_unsupported_off_macos_and_windows() {
+    // Element actions are real on macOS (Accessibility) and on Windows since
+    // P12b wires `uiautomation` into the dispatcher. Linux is the only
+    // platform that still returns `unsupported` for them.
+    if cfg!(target_os = "macos") || cfg!(target_os = "windows") {
         return;
     }
     let output = run(&["focus", "--element", "0"]);

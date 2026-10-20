@@ -174,11 +174,26 @@ objc2-vision = { version = "0.3.2", default-features = false, features = [
 # P12a: Windows UI Automation. `windows` is the Win32 surface for window
 # enumeration and process lookups; `uiautomation` wraps the UIA COM stack
 # (control view walker, control patterns). Both are target-gated.
+#
+# P12b adds `windows-capture` 2.0.1 for one `Windows.Graphics.Capture` frame
+# from a resolved HWND, and `Media_Ocr` for `OcrEngine`. `Graphics_Imaging` is
+# the `SoftwareBitmap` the OCR engine takes, `Security_Cryptography` is the
+# `CryptographicBuffer::CreateFromByteArray` wrapper that copies our RGBA
+# buffer into a WinRT `IBuffer`, and `Win32_UI_HiDpi` is `GetDpiForWindow`.
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.62", default-features = false, features = [
+    "Foundation",
+    "Globalization",
+    "Graphics_Imaging",
+    "Media_Ocr",
+    "Security_Cryptography",
+    "Storage_Streams",
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_System_Com",
     "Win32_System_Threading",
+    "Win32_System_WinRT",
+    "Win32_UI_HiDpi",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Gdi",
 ] }
@@ -187,6 +202,7 @@ uiautomation = { version = "0.25.1", default-features = false, features = [
     "pattern",
     "input",
 ] }
+windows-capture = "2.0.1"
 
 [profile.release]
 lto = "thin"

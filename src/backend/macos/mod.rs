@@ -40,44 +40,31 @@ pub(crate) fn marks_for_tree(
 }
 
 /// Image-pixel rectangles of secure elements for OCR redaction.
+///
+/// P12b replaces the P11 placeholder: the `AXFrame` values are screen points
+/// and are now converted through the screenshot map of the capture the OCR ran
+/// on, so `redact_blocks` compares image pixels with image pixels.
 pub(crate) fn secure_ocr_frames(
     query: &TreeQuery,
+    map: &crate::image_util::ScreenshotMap,
 ) -> Result<Vec<crate::vision::ocr::ImageRect>, ComputerError> {
     let frames = ax::secure_frames(query)?;
-    let map = crate::image_util::ScreenshotMap {
-        width: 0,
-        height: 0,
-        scale: 1.0,
-        logical_width: 0,
-        logical_height: 0,
-        origin: crate::image_util::MapPoint { x: 0, y: 0 },
-        fit: "none".into(),
-        pad: crate::image_util::MapPoint { x: 0, y: 0 },
-        content_width: 1,
-        content_height: 1,
-        map: crate::image_util::MapFormulas {
-            image_to_screen: String::new(),
-            screen_to_image: String::new(),
-        },
-    };
     Ok(frames
         .into_iter()
-        .map(|frame| crate::vision::ocr::ImageRect {
-            x: frame.x.round().max(0.0) as i32,
-            y: frame.y.round().max(0.0) as i32,
-            width: frame.width.max(0.0).round().max(1.0) as u32,
-            height: frame.height.max(0.0).round().max(1.0) as u32,
+        .filter_map(|frame| {
+            crate::image_util::screen_rect_to_image(
+                map,
+                frame.x,
+                frame.y,
+                frame.width,
+                frame.height,
+            )
         })
-        // Placeholder: actual screen-to-image conversion belongs here once
-        // a real capture ships with the OCR. The vision layer stores the
-        // secure rects as plain image pixels.
-        .collect::<Vec<_>>()
-        .into_iter()
-        .filter(|_| {
-            // Keep the function-level side effect so the compiler doesn't
-            // lint the unused `map` placeholder while we wire this up.
-            let _ = &map;
-            true
+        .map(|(x, y, width, height)| crate::vision::ocr::ImageRect {
+            x,
+            y,
+            width,
+            height,
         })
         .collect())
 }

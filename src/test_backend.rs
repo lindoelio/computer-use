@@ -93,6 +93,13 @@ pub struct StubBackend {
     pub tiers_run: Mutex<Vec<String>>,
     /// Event and synthetic tiers report cursor motion. With `--require-background` they fail first.
     pub event_moves_cursor: bool,
+    /// Secure-field rectangles returned by `secure_ocr_frames`, in image
+    /// pixels. `None` keeps the empty list every non-macOS backend returns.
+    pub secure_frames: Mutex<Option<Vec<crate::vision::ocr::ImageRect>>>,
+    /// Screenshot map handed to the last `secure_ocr_frames` call. Platform
+    /// frames are screen points, so redaction is only correct when the
+    /// dispatcher passes the map of the capture the OCR ran on.
+    pub secure_frames_map: Mutex<Option<crate::image_util::ScreenshotMap>>,
     /// Buttons still down. One-shot dispatch releases these.
     pub held_buttons: Mutex<Vec<MouseButton>>,
     /// Buttons released by [`DesktopBackend::release_held`], not by `mouse_up`.
@@ -178,6 +185,8 @@ impl Default for StubBackend {
             fail_tiers: Mutex::new(Vec::new()),
             tiers_run: Mutex::new(Vec::new()),
             event_moves_cursor: false,
+            secure_frames: Mutex::new(None),
+            secure_frames_map: Mutex::new(None),
             held_buttons: Mutex::new(Vec::new()),
             releases: Mutex::new(Vec::new()),
             holds_ms: Mutex::new(Vec::new()),
@@ -1023,8 +1032,15 @@ impl DesktopBackend for StubBackend {
     fn secure_ocr_frames(
         &self,
         _query: &TreeQuery,
+        map: &crate::image_util::ScreenshotMap,
     ) -> Result<Vec<crate::vision::ocr::ImageRect>, ComputerError> {
-        Ok(Vec::new())
+        *self.secure_frames_map.lock().expect("secure map") = Some(map.clone());
+        Ok(self
+            .secure_frames
+            .lock()
+            .expect("secure frames")
+            .clone()
+            .unwrap_or_default())
     }
 
     fn marks_for_tree(

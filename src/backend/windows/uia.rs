@@ -20,8 +20,9 @@
 
 use std::time::Duration;
 
+use crate::backend::windows::activate::{self, LockRoute};
 use crate::backend::windows::apps;
-use crate::element::{ElementOp, ElementOutcome, ElementRequest, GateInput};
+use crate::element::{ElementError, ElementOp, ElementOutcome, ElementRequest, GateInput};
 use crate::error::ComputerError;
 use crate::target::{
     parse_app_selector, parse_window_selector, resolve, AppInfo, ResolvedTarget, WindowInfo,
@@ -445,16 +446,76 @@ pub(crate) fn element_action(
     let revision = tree::revision_of(&live_rendered.root);
     let op = request.op.clone();
     let request_clone = request.clone();
+    let gate_clone = gate.clone();
 
-    run_uia_with_timeout(
+    let dispatched = run_uia_with_timeout(
         TREE_TIMEOUT_SECONDS,
-        move || -> Result<ElementOutcome, ComputerError> {
+        move || -> Result<Result<ElementOutcome, DispatchFailure>, ComputerError> {
             let element = resolve_uia_element_inner(hwnd, &gate.path)?;
-            dispatch_inner(&element, &op, revision, &request_clone)
-                .map_err(|element_error| element_error.error)
+            Ok(dispatch_inner(&element, &op, revision, &request_clone))
         },
-    )
-    .map_err(ElementError::new)
+    );
+
+    let failure = match dispatched {
+        Err(timeout) => return Err(ElementError::new(timeout)),
+        Ok(Ok(outcome)) => return Ok(outcome),
+        Ok(Err(DispatchFailure::Fatal(error))) => return Err(error),
+        Ok(Err(DispatchFailure::Retryable(failure))) => failure,
+    };
+
+    // The pattern is missing or its call failed. Retry as tier `activate`,
+    // which is the documented foreground fallback (see `activate.rs`).
+    let (route, lock) = acquire_lock(request.allow_foreground).map_err(ElementError::new)?;
+    let plan = activate::plan(
+        &request.op,
+        &failure,
+        request.require_background,
+        route,
+        gate_clone.center,
+    );
+    let focus_restored = match plan {
+        activate::FallbackPlan::Refuse(error) => return Err(ElementError::new(error)),
+        activate::FallbackPlan::Activate => {
+            // `lock` stays held for the whole foreground round-trip.
+            let restored =
+                activate::run(hwnd, &request.op, &gate_clone).map_err(ElementError::new)?;
+            drop(lock);
+            restored
+        }
+    };
+    let extra: Vec<String> = gate_clone.outside_warning.into_iter().collect();
+    Ok(activate::outcome(request, revision, focus_restored, &extra))
+}
+
+/// Take `foreground.lock` for the activate fallback.
+///
+/// `--allow-foreground` skips it. A platform that cannot name a lock path is
+/// reported as [`LockRoute::Allowed`], which is how `macos::input` treats the
+/// same situation. A lock held by another session is *not* an error here: the
+/// refusal is [`activate::plan`]'s job, so the reason is tested in one place.
+fn acquire_lock(
+    allow_foreground: bool,
+) -> Result<(LockRoute, Option<crate::foreground::ForegroundLock>), ComputerError> {
+    if allow_foreground {
+        return Ok((LockRoute::Allowed, None));
+    }
+    let Some(path) = crate::foreground::lock_path() else {
+        return Ok((LockRoute::Allowed, None));
+    };
+    match crate::foreground::try_lock(&path) {
+        Ok(lock) => Ok((LockRoute::Acquired, Some(lock))),
+        Err(crate::foreground::LockError::Held { pid, .. }) => Ok((LockRoute::Busy(pid), None)),
+        Err(other) => Err(other.into_computer()),
+    }
+}
+
+/// Why the pattern path inside the UIA worker did not produce an outcome.
+enum DispatchFailure {
+    /// No fallback is allowed; surface this error.
+    Fatal(ElementError),
+    /// A pattern was missing or its call failed; the activate fallback may
+    /// reproduce the action.
+    Retryable(activate::PatternFailure),
 }
 
 /// Dispatch one [`ElementOp`] through the appropriate UI Automation pattern.
@@ -467,17 +528,26 @@ fn dispatch_inner(
     op: &ElementOp,
     revision: u64,
     request: &ElementRequest,
-) -> Result<ElementOutcome, crate::element::ElementError> {
+) -> Result<ElementOutcome, DispatchFailure> {
+    use crate::backend::windows::activate::PatternFailure;
     use crate::element::ElementError;
-    let pattern_missing = |name: &str, error: uiautomation::errors::Error| {
-        ElementError::new(ComputerError::ExecutionFailed(format!(
-            "uia:{name}: missing control pattern: {error}"
-        )))
+    // A missing pattern and a failed call are both recoverable: some Win32
+    // apps ignore `Invoke` until their window is foreground, so both hand the
+    // caller a `Retryable` failure for the activate fallback to consider.
+    let pattern_missing = |pattern: &'static str, error: uiautomation::errors::Error| {
+        DispatchFailure::Retryable(PatternFailure::Missing {
+            pattern,
+            detail: error.to_string(),
+        })
     };
-    let pattern_call = |name: &str, error: uiautomation::errors::Error| {
-        ElementError::new(ComputerError::ExecutionFailed(format!(
-            "uia:{name}: call failed: {error}"
-        )))
+    let pattern_call = |pattern: &'static str, error: uiautomation::errors::Error| {
+        DispatchFailure::Retryable(PatternFailure::Call {
+            pattern,
+            detail: error.to_string(),
+        })
+    };
+    let fatal = |message: String| -> DispatchFailure {
+        DispatchFailure::Fatal(ElementError::new(ComputerError::ExecutionFailed(message)))
     };
     let via = match op {
         ElementOp::Press { .. } => {
@@ -496,9 +566,9 @@ fn dispatch_inner(
                 .and_then(|variant| variant.try_into().ok())
                 .unwrap_or(false);
             if is_password {
-                return Err(ElementError::new(ComputerError::ExecutionFailed(
+                return Err(fatal(
                     "uia:set_value: refusing to write a password element".into(),
-                )));
+                ));
             }
             let pattern = element
                 .get_pattern::<UIValuePattern>()
@@ -553,9 +623,9 @@ fn dispatch_inner(
                 .and_then(|variant| variant.try_into().ok())
                 .unwrap_or(false);
             if is_password {
-                return Err(ElementError::new(ComputerError::ExecutionFailed(
+                return Err(fatal(
                     "uia:type: refusing to type into a password element".into(),
-                )));
+                ));
             }
             let pattern = element
                 .get_pattern::<UIValuePattern>()
@@ -573,9 +643,9 @@ fn dispatch_inner(
             "uia:Focus"
         }
         ElementOp::Perform { name } => {
-            return Err(ElementError::new(ComputerError::ExecutionFailed(format!(
+            return Err(fatal(format!(
                 "uia:perform_action: \"{name}\" is not supported on Windows; use one of press/set_value/select_text/scroll_to"
-            ))));
+            )));
         }
     };
     Ok(crate::element::outcome(
@@ -589,7 +659,10 @@ fn dispatch_inner(
 /// Resolve one cached element through UIA. Worker-internal — must not be
 /// called from outside the `run_uia_with_timeout` closure; the returned
 /// [`UIElement`] cannot cross thread boundaries.
-fn resolve_uia_element_inner(hwnd: u32, path: &[usize]) -> Result<UIElement, ComputerError> {
+pub(crate) fn resolve_uia_element_inner(
+    hwnd: u32,
+    path: &[usize],
+) -> Result<UIElement, ComputerError> {
     let hwnd_isize = hwnd as isize;
     let automation = uia_with_timeout()?;
     let root = automation
@@ -623,6 +696,27 @@ fn resolve_uia_element_inner(hwnd: u32, path: &[usize]) -> Result<UIElement, Com
             path.len()
         ))
     })
+}
+
+/// Put keyboard focus on one cached element through UIA.
+///
+/// Used by the activate fallback for `type`: `set_focus` is a background-safe
+/// UIA call, so the only foreground step is the `SetForegroundWindow` the
+/// fallback already performed. Runs inside the worker because [`UIElement`]
+/// cannot cross a thread boundary. Only `type` calls it, and the test build
+/// never reaches the input path.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn focus_element(hwnd: u32, path: &[usize]) -> Result<(), ComputerError> {
+    let path = path.to_vec();
+    run_uia_with_timeout(
+        TREE_TIMEOUT_SECONDS,
+        move || -> Result<(), ComputerError> {
+            let element = resolve_uia_element_inner(hwnd, &path)?;
+            element.set_focus().map_err(|error| {
+                ComputerError::ExecutionFailed(format!("uia:focus: set_focus failed: {error}"))
+            })
+        },
+    )
 }
 
 /// Probe whether UI Automation is reachable. Used by `doctor`. Lives

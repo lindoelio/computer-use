@@ -255,6 +255,36 @@ pub fn outcome(
     }
 }
 
+/// Outcome for an action that the `activate` tier performed.
+///
+/// [`outcome`] reports `focus_restored: Some(true)` for every `activate` via,
+/// which is right on macOS (that tier puts the previous app back). Windows
+/// activates an element pattern as a *retry*, and passes what its own
+/// `SetForegroundWindow` restore actually achieved, so this constructor takes
+/// the flag instead of assuming it.
+pub fn activate_outcome(
+    request: &ElementRequest,
+    revision: u64,
+    warnings: Vec<String>,
+    focus_restored: bool,
+) -> ElementOutcome {
+    ElementOutcome {
+        action: request.op.action_name().to_string(),
+        element: request.index,
+        revision,
+        tier: "activate".to_string(),
+        cursor_moved: true,
+        focus_restored: Some(focus_restored),
+        warnings,
+        via: Some("activate".to_string()),
+        name: None,
+        count: match request.op {
+            ElementOp::Press { count, .. } => Some(count),
+            _ => None,
+        },
+    }
+}
+
 /// Failure that may carry the fresh tree for `stale_element`.
 #[derive(Debug)]
 pub struct ElementError {

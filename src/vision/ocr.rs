@@ -36,13 +36,19 @@ pub struct OcrResult {
 
 /// Run OCR on `image` and return per-line blocks.
 ///
-/// Returns `Unsupported` on Windows and Linux today (per ROADMAP P11).
+/// macOS uses `VNRecognizeTextRequest`, Windows uses
+/// `Windows.Media.Ocr.OcrEngine` over the user's profile languages, and Linux
+/// returns `Unsupported` (no engine in 0.2.0).
 pub fn recognize(image: &RgbaImage, _map: &ScreenshotMap) -> Result<OcrResult, ComputerError> {
     #[cfg(target_os = "macos")]
     {
         macos::recognize(image)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        windows::recognize(image)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = image;
         Err(unsupported_on_this_os())
@@ -125,7 +131,7 @@ where
 
 /// `computer_error::Unsupported("ocr is not available on linux")` etc. Lives
 /// here so the `unsupported` branch has one source of truth.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
 fn unsupported_on_this_os() -> ComputerError {
     #[cfg(target_os = "linux")]
     {
@@ -133,15 +139,38 @@ fn unsupported_on_this_os() -> ComputerError {
             "no OCR backend on Linux in 0.2.0 — OCR returns unsupported".into(),
         )
     }
-    #[cfg(target_os = "windows")]
-    {
-        ComputerError::Unsupported(
-            "ocr is not available on Windows in P11 — Media OCR lands in P12".into(),
-        )
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(not(target_os = "linux"))]
     {
         ComputerError::Unsupported("ocr backend missing on this platform".into())
+    }
+}
+
+/// Convert a Windows.Media.Ocr bounding box to an [`ImageRect`].
+///
+/// `OcrWord::BoundingRect` already reports device-independent image pixels with
+/// a **top-left** origin, so unlike Vision there is no flip — only clamping to
+/// the image and a minimum of one pixel. Kept platform-independent so the
+/// conversion is unit-tested on every runner, not only in the Windows job.
+#[cfg_attr(all(not(target_os = "windows"), not(test)), allow(dead_code))]
+pub(crate) fn ocr_box_to_image(
+    image_width: u32,
+    image_height: u32,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> ImageRect {
+    let max_x = image_width as f64;
+    let max_y = image_height as f64;
+    let left = x.round().clamp(0.0, max_x) as i32;
+    let top = y.round().clamp(0.0, max_y) as i32;
+    let right = (x + width).round().clamp(f64::from(left), max_x) as i32;
+    let bottom = (y + height).round().clamp(f64::from(top), max_y) as i32;
+    ImageRect {
+        x: left,
+        y: top,
+        width: (right - left).max(1) as u32,
+        height: (bottom - top).max(1) as u32,
     }
 }
 
@@ -339,9 +368,364 @@ mod macos {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Windows implementation
+// ---------------------------------------------------------------------------
+//
+// Real `Windows.Media.Ocr` call through the `windows` 0.62 crate feature
+// `Media_Ocr`. Pipeline: swizzle the RGBA capture to the BGRA the engine
+// requires -> copy it into a WinRT `IBuffer` -> `SoftwareBitmap` ->
+// `OcrEngine::TryCreateFromUserProfileLanguages()` -> `RecognizeAsync` ->
+// `join()` -> one `OcrBlock` per `OcrLine`, whose box is the union of its
+// words' `BoundingRect`s.
+//
+// The whole pass runs on a dedicated worker that calls `RoInitialize`
+// itself (Media OCR refuses an uninitialized thread) and is joined with a
+// `recv_timeout`, so a wedged engine cannot hang the CLI. Only `Send`-able
+// `OcrResult` / `ComputerError` values cross back, matching the UIA worker in
+// P12a.
+//
+// The engine reports no confidence, so `confidence` stays 0 exactly like the
+// macOS path when Vision cannot say.
+
+#[cfg(target_os = "windows")]
+mod windows {
+    // `RoInitialize`, `CoIncrementMTAUsage` and friends have no safe Rust
+    // equivalent in the `windows` crate. The audit surface stays limited to
+    // this module, which is target-gated to Windows.
+    #![allow(unsafe_code)]
+
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::thread;
+    use std::time::Duration;
+
+    use super::{ocr_box_to_image, OcrBlock, OcrResult};
+    use crate::error::ComputerError;
+    use image::RgbaImage;
+    use windows::Graphics::Imaging::{BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap};
+    use windows::Media::Ocr::{OcrEngine, OcrLine};
+    use windows::Security::Cryptography::CryptographicBuffer;
+
+    use windows::Win32::Foundation::S_FALSE;
+    use windows::Win32::System::Com::{
+        CoDecrementMTAUsage, CoIncrementMTAUsage, CO_MTA_USAGE_COOKIE,
+    };
+    use windows::Win32::System::WinRT::{RoInitialize, RoUninitialize, RO_INIT_MULTITHREADED};
+
+    /// How long one Media OCR pass may take before the CLI gives up on it.
+    const OCR_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Run Media OCR on the supplied image. Real Windows only.
+    pub fn recognize(image: &RgbaImage) -> Result<OcrResult, ComputerError> {
+        let image = image.clone();
+        let (sender, receiver) = mpsc::channel::<Result<OcrResult, ComputerError>>();
+        let worker = thread::Builder::new()
+            .name("computer-use-ocr".into())
+            .spawn(move || {
+                let result = recognize_on_worker(&image);
+                let _ = sender.send(result);
+            });
+        if worker.is_err() {
+            return Err(ComputerError::ExecutionFailed(
+                "Windows.Media.Ocr worker thread could not start".into(),
+            ));
+        }
+        match receiver.recv_timeout(OCR_TIMEOUT) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => Err(ComputerError::ExecutionFailed(format!(
+                "Windows.Media.Ocr did not finish within {}s",
+                OCR_TIMEOUT.as_secs()
+            ))),
+            Err(RecvTimeoutError::Disconnected) => Err(ComputerError::ExecutionFailed(
+                "Windows.Media.Ocr worker stopped without a result".into(),
+            )),
+        }
+    }
+
+    /// The actual pass, on a thread that has initialized WinRT.
+    fn recognize_on_worker(image: &RgbaImage) -> Result<OcrResult, ComputerError> {
+        let _mta = MtaUsage::new()?;
+        let _apartment = Apartment::new()?;
+
+        let (width, height) = (image.width(), image.height());
+        let bitmap = software_bitmap(image)?;
+        let engine = engine()?;
+
+        let operation = engine.RecognizeAsync(&bitmap).map_err(|error| {
+            ComputerError::ExecutionFailed(format!("Windows.Media.Ocr RecognizeAsync: {error}"))
+        })?;
+        let result = operation.join().map_err(|error| {
+            ComputerError::ExecutionFailed(format!("Windows.Media.Ocr RecognizeAsync: {error}"))
+        })?;
+
+        let mut blocks = Vec::new();
+        let lines = result.Lines().map_err(|error| {
+            ComputerError::ExecutionFailed(format!("Windows.Media.Ocr OcrResult.Lines: {error}"))
+        })?;
+        for line in &lines {
+            let Some((text, box_rect)) = line_block(&line) else {
+                continue;
+            };
+            let rect = ocr_box_to_image(
+                width, height, box_rect.0, box_rect.1, box_rect.2, box_rect.3,
+            );
+            blocks.push(OcrBlock {
+                text,
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: rect.height,
+                confidence: 0.0,
+            });
+        }
+
+        Ok(OcrResult {
+            blocks,
+            note: language_note(&engine),
+        })
+    }
+
+    /// One `OcrLine` as `(text, (x, y, width, height))`, or `None` when the
+    /// line has no non-empty word.
+    fn line_block(line: &OcrLine) -> Option<(String, (f64, f64, f64, f64))> {
+        let words = line.Words().ok()?;
+        let mut text_parts: Vec<String> = Vec::new();
+        let mut left = f64::MAX;
+        let mut top = f64::MAX;
+        let mut right = f64::MIN;
+        let mut bottom = f64::MIN;
+        for word in &words {
+            let word_text = word.Text().ok()?.to_string();
+            if word_text.trim().is_empty() {
+                continue;
+            }
+            let rect = word.BoundingRect().ok()?;
+            text_parts.push(word_text);
+            let (x, y) = (f64::from(rect.X), f64::from(rect.Y));
+            left = left.min(x);
+            top = top.min(y);
+            right = right.max(x + f64::from(rect.Width));
+            bottom = bottom.max(y + f64::from(rect.Height));
+        }
+        if text_parts.is_empty() {
+            return None;
+        }
+        Some((
+            text_parts.join(" "),
+            (left, top, (right - left).max(1.0), (bottom - top).max(1.0)),
+        ))
+    }
+
+    /// An engine for the user's profile languages.
+    fn engine() -> Result<OcrEngine, ComputerError> {
+        OcrEngine::TryCreateFromUserProfileLanguages().map_err(|error| {
+            ComputerError::ExecutionFailed(format!(
+                "Windows.Media.Ocr has no engine for the user-profile languages. Install a \
+                 language pack (Settings > Time & Language > Language > Language options, or \
+                 the OCR Recognizer in Settings > Apps > Optional features): {error}"
+            ))
+        })
+    }
+
+    /// Report which recognizer language ran, when the engine will say.
+    fn language_note(engine: &OcrEngine) -> Option<String> {
+        let tag = engine
+            .RecognizerLanguage()
+            .ok()?
+            .LanguageTag()
+            .ok()?
+            .to_string();
+        if tag.is_empty() {
+            None
+        } else {
+            Some(format!("Media OCR recognizer language: {tag}"))
+        }
+    }
+
+    /// Copy the RGBA capture into a BGRA `SoftwareBitmap`.
+    ///
+    /// Media OCR takes BGRA8 premultiplied. A screenshot is fully opaque, so
+    /// straight and premultiplied alpha are the same bytes; the channel swap
+    /// is the only real work.
+    fn software_bitmap(image: &RgbaImage) -> Result<SoftwareBitmap, ComputerError> {
+        let (width, height) = (image.width(), image.height());
+        let width = i32::try_from(width).map_err(|_| {
+            ComputerError::ExecutionFailed(format!("capture width {width} is too large"))
+        })?;
+        let height = i32::try_from(height).map_err(|_| {
+            ComputerError::ExecutionFailed(format!("capture height {height} is too large"))
+        })?;
+        let max_edge = OcrEngine::MaxImageDimension().unwrap_or(0);
+        if max_edge > 0
+            && (u32::try_from(width).unwrap_or(u32::MAX) > max_edge
+                || u32::try_from(height).unwrap_or(u32::MAX) > max_edge)
+        {
+            return Err(ComputerError::ExecutionFailed(format!(
+                "Windows.Media.Ocr accepts at most {max_edge} px per edge; the capture is \
+                 {width}x{height}"
+            )));
+        }
+        let source = image.as_raw();
+        let mut bgra = Vec::with_capacity(source.len());
+        for pixel in source.chunks_exact(4) {
+            bgra.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+        }
+        let buffer = CryptographicBuffer::CreateFromByteArray(&bgra).map_err(|error| {
+            ComputerError::ExecutionFailed(format!(
+                "CryptographicBuffer::CreateFromByteArray: {error}"
+            ))
+        })?;
+        SoftwareBitmap::CreateCopyWithAlphaFromBuffer(
+            &buffer,
+            BitmapPixelFormat::Bgra8,
+            width,
+            height,
+            BitmapAlphaMode::Premultiplied,
+        )
+        .map_err(|error| {
+            ComputerError::ExecutionFailed(format!(
+                "SoftwareBitmap::CreateCopyWithAlphaFromBuffer: {error}"
+            ))
+        })
+    }
+
+    /// Keeps the MTA alive for as long as the WinRT calls run.
+    struct MtaUsage {
+        cookie: CO_MTA_USAGE_COOKIE,
+    }
+
+    impl MtaUsage {
+        fn new() -> Result<Self, ComputerError> {
+            let cookie = unsafe { CoIncrementMTAUsage() }.map_err(|error| {
+                ComputerError::ExecutionFailed(format!("CoIncrementMTAUsage: {error}"))
+            })?;
+            Ok(Self { cookie })
+        }
+    }
+
+    impl Drop for MtaUsage {
+        fn drop(&mut self) {
+            let _ = unsafe { CoDecrementMTAUsage(self.cookie) };
+        }
+    }
+
+    /// `RoInitialize` / `RoUninitialize` for this worker only.
+    struct Apartment {
+        initialized: bool,
+    }
+
+    impl Apartment {
+        fn new() -> Result<Self, ComputerError> {
+            match unsafe { RoInitialize(RO_INIT_MULTITHREADED) } {
+                Ok(()) => Ok(Self { initialized: true }),
+                Err(error) if error.code() == S_FALSE => Ok(Self { initialized: false }),
+                Err(error) => Err(ComputerError::ExecutionFailed(format!(
+                    "RoInitialize(RO_INIT_MULTITHREADED) failed: {error}"
+                ))),
+            }
+        }
+    }
+
+    impl Drop for Apartment {
+        fn drop(&mut self) {
+            if self.initialized {
+                unsafe { RoUninitialize() };
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------------
+    // P12b: Windows.Media.Ocr box conversion. Pure math, tested on every
+    // runner so the Windows job is not the only place it is exercised.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn ocr_box_passes_through_image_pixels() {
+        let rect = ocr_box_to_image(800, 600, 100.0, 50.0, 200.0, 30.0);
+        assert_eq!(
+            rect,
+            ImageRect {
+                x: 100,
+                y: 50,
+                width: 200,
+                height: 30
+            }
+        );
+    }
+
+    #[test]
+    fn ocr_box_keeps_the_top_left_origin() {
+        // Unlike Vision, `OcrWord::BoundingRect` is already top-left, so a
+        // word in the upper half must stay in the upper half.
+        let rect = ocr_box_to_image(400, 400, 10.0, 20.0, 50.0, 15.0);
+        assert_eq!(rect.y, 20);
+        assert!(rect.y < 200, "{rect:?}");
+    }
+
+    #[test]
+    fn ocr_box_rounds_to_whole_pixels() {
+        // left 10.4 -> 10, right 10.4+30.5 = 40.9 -> 41, so 31 px wide.
+        // top 20.6 -> 21, bottom 20.6+40.4 = 61.0 -> 61, so 40 px tall.
+        let rect = ocr_box_to_image(800, 600, 10.4, 20.6, 30.5, 40.4);
+        assert_eq!(rect.x, 10);
+        assert_eq!(rect.y, 21);
+        assert_eq!(rect.width, 31);
+        assert_eq!(rect.height, 40);
+    }
+
+    #[test]
+    fn ocr_box_is_clamped_to_the_image() {
+        let rect = ocr_box_to_image(200, 100, 190.0, 90.0, 80.0, 80.0);
+        assert_eq!(rect.x, 190);
+        assert_eq!(rect.y, 90);
+        assert!(rect.x + rect.width as i32 <= 200, "{rect:?}");
+        assert!(rect.y + rect.height as i32 <= 100, "{rect:?}");
+    }
+
+    #[test]
+    fn ocr_box_clamps_a_negative_origin_to_zero() {
+        let rect = ocr_box_to_image(200, 100, -40.0, -10.0, 60.0, 20.0);
+        assert_eq!(rect.x, 0);
+        assert_eq!(rect.y, 0);
+        assert_eq!(rect.width, 20);
+        assert_eq!(rect.height, 10);
+    }
+
+    #[test]
+    fn ocr_box_is_never_empty() {
+        let rect = ocr_box_to_image(200, 100, 50.0, 50.0, 0.0, 0.0);
+        assert_eq!(rect.width, 1);
+        assert_eq!(rect.height, 1);
+    }
+
+    #[test]
+    fn ocr_box_feeds_the_screenshot_map_back_to_a_screen_point() {
+        let map = crate::image_util::ScreenshotMap {
+            width: 800,
+            height: 600,
+            scale: 1.0,
+            logical_width: 800,
+            logical_height: 600,
+            origin: crate::image_util::MapPoint { x: 120, y: 40 },
+            fit: "none".into(),
+            pad: crate::image_util::MapPoint { x: 0, y: 0 },
+            content_width: 800,
+            content_height: 600,
+            map: crate::image_util::MapFormulas {
+                image_to_screen: String::new(),
+                screen_to_image: String::new(),
+            },
+        };
+        let rect = ocr_box_to_image(800, 600, 100.0, 50.0, 200.0, 30.0);
+        let (screen_x, screen_y) = rect.to_screen(&map).expect("on screen");
+        assert!((screen_x - 320.0).abs() < 0.001, "{screen_x}");
+        assert!((screen_y - 105.0).abs() < 0.001, "{screen_y}");
+    }
 
     fn block(x: i32, y: i32, w: u32, h: u32) -> OcrBlock {
         OcrBlock {

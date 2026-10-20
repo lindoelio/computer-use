@@ -13,7 +13,9 @@
 // `#![deny(unsafe_code)]` here only.
 #![allow(unsafe_code)]
 
+pub mod activate;
 pub mod apps;
+pub mod capture;
 pub mod uia;
 
 use crate::doctor::{self, DoctorInput, DoctorOptions};
@@ -119,12 +121,114 @@ pub(crate) fn end_session(session: Option<&str>) -> Result<Vec<i32>, ComputerErr
 /// Element actions on Windows go through `uiautomation` control patterns.
 ///
 /// The cached tree is loaded by the dispatcher; this function revalidates
-/// against UIA, walks the cached path, and dispatches the pattern.
+/// against UIA, walks the cached path, and dispatches the pattern. A missing
+/// pattern or a failed call is retried as tier `activate` unless the caller
+/// passed `--require-background` — see [`activate`].
 #[allow(dead_code)]
 pub(crate) fn element_action(
     request: &ElementRequest,
 ) -> Result<crate::element::ElementOutcome, ElementError> {
     uia::element_action(request)
+}
+
+/// Capture one window through `Windows.Graphics.Capture`, falling back to a
+/// crop of the xcap desktop image. See [`capture`].
+#[allow(dead_code)]
+pub(crate) fn capture_window(
+    target: &super::WindowTarget,
+) -> Result<crate::types::RawCapture, ComputerError> {
+    capture::capture_window(target)
+}
+
+/// Run `Windows.Media.Ocr` on a prepared capture.
+#[allow(dead_code)]
+pub(crate) fn recognize_text(
+    image: &image::RgbaImage,
+    _map: &crate::image_util::ScreenshotMap,
+) -> Result<crate::vision::OcrResult, ComputerError> {
+    crate::vision::recognize(image, _map)
+}
+
+/// Numbered boxes for `--marks`, taken from the live UIA tree.
+#[allow(dead_code)]
+pub(crate) fn marks_for_tree(
+    query: &TreeQuery,
+    map: &crate::image_util::ScreenshotMap,
+) -> Result<Vec<crate::vision::MarkBox>, ComputerError> {
+    let root = uia::build_tree(query)?;
+    let mut out: Vec<crate::vision::MarkBox> = Vec::new();
+    let mut index = 0_u32;
+    walk_marks(&root.root, map, &mut index, &mut out);
+    Ok(out)
+}
+
+/// Image-pixel rectangles of every `IsPassword` element, converted through the
+/// screenshot map so `vision::ocr::redact_blocks` compares like with like.
+#[allow(dead_code)]
+pub(crate) fn secure_ocr_frames(
+    query: &TreeQuery,
+    map: &crate::image_util::ScreenshotMap,
+) -> Result<Vec<crate::vision::ocr::ImageRect>, ComputerError> {
+    let tree = uia::build_tree(query)?;
+    let mut out = Vec::new();
+    walk_secure(&tree.root, map, &mut out);
+    Ok(out)
+}
+
+fn walk_marks(
+    node: &crate::tree::UiNode,
+    map: &crate::image_util::ScreenshotMap,
+    index: &mut u32,
+    out: &mut Vec<crate::vision::MarkBox>,
+) {
+    let label = index.to_string();
+    *index = index.saturating_add(1);
+    if let Some(frame) = node.frame {
+        if let Some((x, y, width, height)) = screen_rect(frame, map) {
+            out.push(crate::vision::MarkBox {
+                rect: crate::vision::marks::ImageRect {
+                    x,
+                    y,
+                    width,
+                    height,
+                },
+                label,
+            });
+        }
+    }
+    for child in &node.children {
+        walk_marks(child, map, index, out);
+    }
+}
+
+fn walk_secure(
+    node: &crate::tree::UiNode,
+    map: &crate::image_util::ScreenshotMap,
+    out: &mut Vec<crate::vision::ocr::ImageRect>,
+) {
+    if crate::tree::node_is_secure(node) {
+        if let Some(frame) = node.frame {
+            if let Some((x, y, width, height)) = screen_rect(frame, map) {
+                out.push(crate::vision::ocr::ImageRect {
+                    x,
+                    y,
+                    width,
+                    height,
+                });
+            }
+        }
+    }
+    for child in &node.children {
+        walk_secure(child, map, out);
+    }
+}
+
+/// One platform frame (Win32 screen points) mapped into image pixels.
+fn screen_rect(
+    frame: crate::tree::NodeFrame,
+    map: &crate::image_util::ScreenshotMap,
+) -> Option<(i32, i32, u32, u32)> {
+    crate::image_util::screen_rect_to_image(map, frame.x, frame.y, frame.width, frame.height)
 }
 
 pub(crate) fn doctor(options: DoctorOptions) -> Result<DoctorReport, ComputerError> {
@@ -140,7 +244,7 @@ pub(crate) fn doctor(options: DoctorOptions) -> Result<DoctorReport, ComputerErr
     if accessibility_ok == Some(false) {
         notes.push("UI Automation returned a non-trust state".into());
     }
-    notes.push("screen-capture probe lands in P12b (windows-capture + Media Foundation)".into());
+    notes.push("P12b: window capture is windows-capture with an xcap crop fallback; doctor does not probe the screen".into());
     notes.push("uiaccess and integrity are best-effort and are not required grants".into());
 
     let report = doctor::assemble(DoctorInput {

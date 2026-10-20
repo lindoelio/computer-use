@@ -61,8 +61,9 @@ pub(crate) fn build_apps(snapshots: &[WindowSnapshot]) -> Vec<AppInfo> {
                 .map(|path| path.to_string_lossy().into_owned()),
             // `EnumWindows` walks visible + invisible top-level windows.
             // Treat every returned app as live: a hidden owner window would
-            // still enumerate here, but the frontmost contract uses
-            // `GetForegroundWindow` for the active row in P12b.
+            // still enumerate here. `frontmost()` reports z-order row 0
+            // instead, and P12b's activate fallback reads
+            // `GetForegroundWindow` only to put it back.
             active: true,
             // `IsWindowVisible` is already applied during enumeration.
             hidden: false,

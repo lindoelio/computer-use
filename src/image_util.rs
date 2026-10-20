@@ -374,6 +374,130 @@ pub fn screen_to_image(map: &ScreenshotMap, screen_x: f64, screen_y: f64) -> (f6
     (image_x, image_y)
 }
 
+/// Map a screen-point rectangle into image pixels of `map`.
+///
+/// Shared by every backend that draws platform frames over a capture: UIA
+/// bounding rectangles on Windows, `AXFrame` on macOS. Both are in screen
+/// points, so both need this exact conversion before a frame can be compared
+/// with an OCR block or drawn as a mark.
+///
+/// Returns `None` when the rect falls entirely off the canvas. The result is
+/// `(x, y, width, height)` with a minimum of one pixel per side.
+#[cfg_attr(all(not(target_os = "windows"), not(test)), allow(dead_code))]
+pub fn screen_rect_to_image(
+    map: &ScreenshotMap,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> Option<(i32, i32, u32, u32)> {
+    let content_w = f64::from(map.content_width.max(1));
+    let content_h = f64::from(map.content_height.max(1));
+    let pad_x = map.pad.x as f64;
+    let pad_y = map.pad.y as f64;
+    let logical_w = f64::from(map.logical_width.max(1));
+    let logical_h = f64::from(map.logical_height.max(1));
+    let ix = pad_x + (x - map.origin.x as f64) * content_w / logical_w;
+    let iy = pad_y + (y - map.origin.y as f64) * content_h / logical_h;
+    let iw = (width * content_w / logical_w).max(1.0);
+    let ih = (height * content_h / logical_h).max(1.0);
+    let i = ix.round() as i32;
+    let j = iy.round() as i32;
+    let w = iw.round().max(1.0) as u32;
+    let h = ih.round().max(1.0) as u32;
+    if i < 0 || j < 0 {
+        return None;
+    }
+    if f64::from(i) + f64::from(w) > content_w + pad_x + 1.0
+        || f64::from(j) + f64::from(h) > content_h + pad_y + 1.0
+    {
+        return None;
+    }
+    Some((i, j, w, h))
+}
+
+#[cfg_attr(all(not(target_os = "windows"), not(test)), allow(dead_code))]
+/// DPI assumed when a platform reports none for a window.
+pub const DEFAULT_DPI: u32 = 96;
+
+/// Where a per-window capture sits in screen space, plus its backing scale.
+///
+/// Windows (P12b) needs this because its capture buffer is in device pixels
+/// while every coordinate the crate emits — `GetWindowRect` bounds, UIA
+/// bounding rectangles, `SetCursorPos` — is in the process's screen-point
+/// space. `logical_*` is therefore the window *rect*, and `scale` records the
+/// DPI ratio that produced the device-pixel buffer. The screenshot map absorbs
+/// the difference, because `image_to_screen` divides by `content_*`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(all(not(target_os = "windows"), not(test)), allow(dead_code))]
+pub struct WindowPlacement {
+    /// Left edge of the window in screen points.
+    pub origin_x: i32,
+    /// Top edge of the window in screen points.
+    pub origin_y: i32,
+    /// Window width in screen points.
+    pub logical_width: u32,
+    /// Window height in screen points.
+    pub logical_height: u32,
+    /// Capture backing scale (`dpi / 96`).
+    pub scale: f64,
+}
+
+/// Build a [`WindowPlacement`] from a window rect and its DPI.
+///
+/// `dpi` is whatever `GetDpiForWindow` returned. `0` — the documented "this
+/// window has no monitor" answer — is treated as [`DEFAULT_DPI`] so the scale
+/// stays 1.0. The rect is used verbatim for the logical size (never divided by
+/// the scale), which keeps the map agreeing with every other screen point the
+/// platform reports.
+#[cfg_attr(all(not(target_os = "windows"), not(test)), allow(dead_code))]
+pub fn window_placement(
+    origin_x: i32,
+    origin_y: i32,
+    rect_width: u32,
+    rect_height: u32,
+    dpi: u32,
+) -> WindowPlacement {
+    WindowPlacement {
+        origin_x,
+        origin_y,
+        logical_width: rect_width.max(1),
+        logical_height: rect_height.max(1),
+        scale: backing_scale(dpi),
+    }
+}
+
+/// `dpi / 96`, folding the invalid inputs (`0`, absurd ratios) to 1.0.
+#[cfg_attr(all(not(target_os = "windows"), not(test)), allow(dead_code))]
+pub fn backing_scale(dpi: u32) -> f64 {
+    let dpi = if dpi == 0 { DEFAULT_DPI } else { dpi };
+    normalize_scale(f64::from(dpi) / f64::from(DEFAULT_DPI))
+}
+
+/// A warning when a captured buffer does not match the window rect at the
+/// reported scale. Returns `None` when the two agree.
+///
+/// A mismatch is not an error — the screenshot map absorbs it. It is worth
+/// reporting because it usually means the window was resized between resolving
+/// it and the frame arriving.
+#[cfg_attr(all(not(target_os = "windows"), not(test)), allow(dead_code))]
+pub fn size_mismatch_warning(
+    pixel_width: u32,
+    pixel_height: u32,
+    placement: &WindowPlacement,
+) -> Option<String> {
+    let expected_w = (f64::from(placement.logical_width) * placement.scale).round() as u32;
+    let expected_h = (f64::from(placement.logical_height) * placement.scale).round() as u32;
+    if pixel_width == expected_w && pixel_height == expected_h {
+        return None;
+    }
+    Some(format!(
+        "captured frame is {pixel_width}x{pixel_height} px but the window rect implies \
+         {expected_w}x{expected_h} px at scale {}; the screenshot map uses the rect",
+        placement.scale,
+    ))
+}
+
 /// Draw `layers` into one image. Later layers paint over earlier ones.
 ///
 /// The pixel grid is the union of the logical rectangles times `scale`.
@@ -551,6 +675,94 @@ mod tests {
         assert_eq!((png.width, png.height), (2, 2));
         let jpeg = encode_image(&frame, ImageFormat::Jpeg, None).unwrap();
         assert_eq!(&jpeg.bytes[..2], &[0xFF, 0xD8]);
+    }
+
+    // ------------------------------------------------------------------
+    // P12b: Windows per-window capture geometry. Pure math, so it is
+    // tested on every runner rather than only in the Windows job.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn window_placement_keeps_the_rect_in_screen_points() {
+        let placement = window_placement(120, 40, 800, 500, 96);
+        assert_eq!(placement.origin_x, 120);
+        assert_eq!(placement.origin_y, 40);
+        assert_eq!(placement.logical_width, 800);
+        assert_eq!(placement.logical_height, 500);
+        assert_eq!(placement.scale, 1.0);
+    }
+
+    #[test]
+    fn backing_scale_is_dpi_over_96() {
+        assert_eq!(backing_scale(96), 1.0);
+        assert_eq!(backing_scale(120), 1.25);
+        assert_eq!(backing_scale(144), 1.5);
+        assert_eq!(backing_scale(192), 2.0);
+        // GetDpiForWindow reports 0 when the window has no monitor. That must
+        // never become a zero scale.
+        assert_eq!(backing_scale(0), 1.0);
+    }
+
+    #[test]
+    fn window_placement_never_reports_an_empty_logical_size() {
+        let placement = window_placement(0, 0, 0, 0, 96);
+        assert_eq!(placement.logical_width, 1);
+        assert_eq!(placement.logical_height, 1);
+    }
+
+    #[test]
+    fn a_150_percent_window_maps_its_device_pixels_into_the_rect() {
+        // A 1920x1200 device-pixel frame on a 1.5x display covers 1280x800
+        // screen points, which is exactly the rect the caller resolved.
+        let placement = window_placement(10, 20, 1280, 800, 144);
+        assert_eq!(placement.logical_width, 1280);
+        assert_eq!(placement.scale, 1.5);
+        assert_eq!(size_mismatch_warning(1920, 1200, &placement), None);
+
+        let prepared = prepare_shot(
+            &solid(1920, 1200, [0, 0, 0, 255]),
+            ShotFit {
+                scale: placement.scale,
+                origin_x: placement.origin_x,
+                origin_y: placement.origin_y,
+                logical_width: placement.logical_width,
+                logical_height: placement.logical_height,
+                max_width: 0,
+                canvas: None,
+            },
+        )
+        .unwrap();
+        // max_width 0 keeps the source size, so an image pixel is worth
+        // 1/1.5 screen points inside the rect.
+        let (x, y) = image_to_screen(&prepared.map, 150.0, 90.0);
+        assert!((x - 110.0).abs() < 0.001, "{x}");
+        assert!((y - 80.0).abs() < 0.001, "{y}");
+        // And the inverse round-trips.
+        let (ix, iy) = screen_to_image(&prepared.map, x, y);
+        assert!((ix - 150.0).abs() < 0.001, "{ix}");
+        assert!((iy - 90.0).abs() < 0.001, "{iy}");
+    }
+
+    #[test]
+    fn size_mismatch_warning_is_silent_when_the_buffer_matches() {
+        let placement = window_placement(0, 0, 640, 480, 96);
+        assert_eq!(size_mismatch_warning(640, 480, &placement), None);
+    }
+
+    #[test]
+    fn size_mismatch_warning_reports_a_window_resized_after_resolution() {
+        let placement = window_placement(0, 0, 640, 480, 96);
+        let warning = size_mismatch_warning(600, 480, &placement).expect("warning");
+        assert!(warning.contains("600x480"), "{warning}");
+        assert!(warning.contains("640x480"), "{warning}");
+    }
+
+    #[test]
+    fn size_mismatch_warning_names_the_scale_that_did_not_match() {
+        let placement = window_placement(0, 0, 1000, 1000, 192);
+        let warning = size_mismatch_warning(1000, 1000, &placement).expect("warning");
+        assert!(warning.contains("2000x2000"), "{warning}");
+        assert!(warning.contains("scale 2"), "{warning}");
     }
 
     #[test]
