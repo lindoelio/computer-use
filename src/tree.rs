@@ -556,7 +556,13 @@ fn display_value(node: &UiNode) -> String {
 }
 
 fn is_secure(node: &UiNode) -> bool {
+    // macOS reports `AXSecureTextField`; Linux reports the AT-SPI
+    // `Role::PasswordText` (its `Role::name()` is `"password text"`).
+    // Both redacts the value. Windows uses `IsPassword` on the
+    // `IRawElementProviderFragmentRoot`; UIA sets `node.secure` directly
+    // from `IsPassword`, so the dedicated bool field covers it.
     node.role == "AXSecureTextField"
+        || node.role == "password text"
         || node
             .subrole
             .as_deref()
