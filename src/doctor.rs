@@ -314,7 +314,13 @@ pub fn parse_codesign(text: &str) -> (&'static str, Option<String>) {
 /// Last RID of an integrity SID such as `S-1-16-8192`.
 ///
 /// The Windows doctor parses this. Other OS builds keep it for tests.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+///
+/// P12a: still kept around because the shared `parse_token_lines`
+/// unit test exercises it; the live Windows doctor no longer shells
+/// out, but the helpers stay so the parsing contract has a
+/// representative test. Always allow `dead_code` because call sites
+/// are conditional.
+#[allow(dead_code)]
 pub fn integrity_from_sid(sid: &str) -> Option<&'static str> {
     let rid: u32 = sid.rsplit('-').next()?.trim().parse().ok()?;
     Some(match rid {
@@ -330,7 +336,8 @@ pub fn integrity_from_sid(sid: &str) -> Option<&'static str> {
 /// Mandatory label from `whoami /groups`.
 ///
 /// The Windows doctor parses this. Other OS builds keep it for tests.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+/// See the note on `integrity_from_sid`.
+#[allow(dead_code)]
 pub fn integrity_from_whoami(text: &str) -> Option<&'static str> {
     let lower = text.to_ascii_lowercase();
     if lower.contains("protected process mandatory level") {
@@ -356,8 +363,8 @@ pub fn integrity_from_whoami(text: &str) -> Option<&'static str> {
 
 /// `uiaccess=` / `integrity=` / `integrity_sid=` lines, or a whoami group listing.
 ///
-/// The Windows doctor parses this. Other OS builds keep it for tests.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+/// Kept for the shared unit test in `doctor::tests`.
+#[allow(dead_code)]
 pub fn parse_token_lines(text: &str) -> (Option<bool>, Option<String>) {
     let mut uiaccess = None;
     let mut integrity = None;

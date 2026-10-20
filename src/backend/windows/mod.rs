@@ -3,13 +3,18 @@
 //! Input uses enigo (Win32 `SendInput`). Window and process enumeration uses
 //! native `EnumWindows` + `GetWindowTextW` + `GetWindowThreadProcessId` +
 //! `QueryFullProcessImageNameW` through the `windows` crate. The legacy
-//! PowerShell foreground script is gone (P12a); the accessibility tree is
-//! built through `uiautomation` 0.25.1.
+//! PowerShell foreground and token scripts are gone (P12a); the
+//! accessibility tree is built through `uiautomation` 0.25.1 and the
+//! token probes live entirely inside Rust.
+
+// The whole module is gated on `cfg(target_os = "windows")`. The token
+// probes need `unsafe` for `OpenProcessToken` / `GetTokenInformation`,
+// which have no safe equivalent on Windows. Lift the crate's
+// `#![deny(unsafe_code)]` here only.
+#![allow(unsafe_code)]
 
 pub mod apps;
 pub mod uia;
-
-use std::time::Duration;
 
 use crate::doctor::{self, DoctorInput, DoctorOptions};
 use crate::element::{ElementError, ElementRequest};
@@ -18,8 +23,17 @@ use crate::target::{AppInfo, DoctorReport, LaunchResult, QuitResult, WindowList}
 use crate::tree::TreeQuery;
 use crate::types::FrontmostInfo;
 
-use super::command::{run_timeout, stderr_snippet};
 use super::unsupported;
+
+#[cfg(target_os = "windows")]
+use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
+#[cfg(target_os = "windows")]
+use windows::Win32::Security::{
+    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenIntegrityLevel,
+    TokenUIAccess, PSID, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+};
+#[cfg(target_os = "windows")]
+use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 /// Windows desktop backend. Methods are implemented in the parent module.
 #[derive(Debug, Default, Clone, Copy)]
@@ -144,135 +158,184 @@ pub(crate) fn doctor(options: DoctorOptions) -> Result<DoctorReport, ComputerErr
 
 /// Best-effort UIAccess and integrity. A failure leaves a null and a note.
 fn read_token() -> (Option<bool>, Option<String>, Option<String>) {
-    let (uiaccess, mut integrity, mut note) = match token_script() {
-        Ok((uiaccess, integrity)) => (uiaccess, integrity, None),
-        Err(error) => (None, None, Some(error)),
-    };
-    if integrity.is_none() {
-        integrity = whoami_integrity();
-    }
-    if uiaccess.is_none() || integrity.is_none() {
-        let detail = note.unwrap_or_else(|| "token fields were incomplete".to_string());
-        note = Some(detail);
+    let (uiaccess, integrity, note) = read_token_via_windows_crate();
+    (uiaccess, integrity, note)
+}
+
+/// Probe the process token for UIAccess and integrity level. Uses the
+/// `windows` crate exclusively; no PowerShell.
+///
+/// Returns `(Some(uiaccess), Some(integrity), None)` on success. On any
+/// failure each field is `None` and the last `note` explains the most
+/// recent error. The function is best-effort: the doctor never errors out
+/// because a token probe failed.
+fn read_token_via_windows_crate() -> (Option<bool>, Option<String>, Option<String>) {
+    unsafe { read_token_inner() }
+}
+
+unsafe fn read_token_inner() -> (Option<bool>, Option<String>, Option<String>) {
+    // OpenProcessToken on the current process.
+    let mut token_handle: HANDLE = HANDLE(std::ptr::null_mut());
+    let open_result =
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token_handle) };
+    let mut uiaccess: Option<bool> = None;
+    let mut integrity: Option<String> = None;
+    let mut note: Option<String> = None;
+    match open_result {
+        Ok(()) => {
+            // Read TokenUIAccess: a single u32 with 0/1.
+            let mut ui_buf = 0u32;
+            let mut ui_len: u32 = 0;
+            let ui_call = unsafe {
+                GetTokenInformation(
+                    token_handle,
+                    TokenUIAccess,
+                    Some(&mut ui_buf as *mut u32 as *mut _),
+                    std::mem::size_of::<u32>() as u32,
+                    &mut ui_len,
+                )
+            };
+            match ui_call {
+                Ok(()) => uiaccess = Some(ui_buf != 0),
+                Err(error) => note = Some(format!("TokenUIAccess: {error}")),
+            }
+
+            // Read TokenIntegrityLevel: variable length; first call returns
+            // the required size, then we allocate and call again.
+            let mut needed: u32 = 0;
+            let size_call = unsafe {
+                GetTokenInformation(token_handle, TokenIntegrityLevel, None, 0, &mut needed)
+            };
+            match size_call {
+                Err(error) => {
+                    if let Some(existing) = note.as_ref() {
+                        note = Some(format!("{existing}; TokenIntegrityLevel size: {error}"));
+                    } else {
+                        note = Some(format!("TokenIntegrityLevel size: {error}"));
+                    }
+                }
+                Ok(()) if needed == 0 => {}
+                Ok(()) => {
+                    let mut buffer = vec![0u8; needed as usize];
+                    let mut actual: u32 = 0;
+                    let call = unsafe {
+                        GetTokenInformation(
+                            token_handle,
+                            TokenIntegrityLevel,
+                            Some(buffer.as_mut_ptr() as *mut _),
+                            needed,
+                            &mut actual,
+                        )
+                    };
+                    match call {
+                        Ok(()) => {
+                            // SAFETY: GetTokenInformation wrote a
+                            // `TOKEN_MANDATORY_LABEL` to the buffer with
+                            // `actual` valid bytes.
+                            let tml =
+                                unsafe { &*(buffer.as_ptr() as *const TOKEN_MANDATORY_LABEL) };
+                            let label = integrity_label_from_sid(tml.Label.Sid);
+                            match label {
+                                Ok(parsed) => integrity = Some(parsed),
+                                Err(error) => {
+                                    if let Some(existing) = note.as_ref() {
+                                        note = Some(format!("{existing}; integrity SID: {error}"));
+                                    } else {
+                                        note = Some(format!("integrity SID: {error}"));
+                                    }
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            if let Some(existing) = note.as_ref() {
+                                note = Some(format!("{existing}; TokenIntegrityLevel: {error}"));
+                            } else {
+                                note = Some(format!("TokenIntegrityLevel: {error}"));
+                            }
+                        }
+                    }
+                    let _ = unsafe { LocalFree(Some(HLOCAL(buffer.as_mut_ptr() as *mut _))) };
+                }
+            }
+            let _ = unsafe { CloseHandle(token_handle) };
+        }
+        Err(error) => {
+            note = Some(format!("OpenProcessToken: {error}"));
+        }
     }
     (uiaccess, integrity, note)
 }
 
-fn token_script() -> Result<(Option<bool>, Option<String>), String> {
-    let path = std::env::temp_dir().join(format!("computer-use-token-{}.ps1", std::process::id()));
-    std::fs::write(&path, TOKEN_SCRIPT)
-        .map_err(|error| format!("could not write token script: {error}"))?;
-    let result = run_timeout(
-        "powershell",
-        &[
-            "-NoProfile",
-            "-NonInteractive",
-            "-File",
-            &path.to_string_lossy(),
-        ],
-        Duration::from_secs(8),
-    );
-    let _ = std::fs::remove_file(&path);
-    let output = result?;
-    if !output.status.success() {
-        return Err(stderr_snippet(&output.stderr));
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    Ok(doctor::parse_token_lines(&text))
-}
-
-fn whoami_integrity() -> Option<String> {
-    let output = run_timeout("whoami", &["/groups"], Duration::from_secs(4)).ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    doctor::integrity_from_whoami(&text).map(str::to_string)
-}
-
-const TOKEN_SCRIPT: &str = r#"
-$ErrorActionPreference = 'Stop'
-Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-public class CuToken {
-  const uint TOKEN_QUERY = 8;
-  [DllImport("advapi32.dll", SetLastError=true)]
-  static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
-  [DllImport("advapi32.dll", SetLastError=true)]
-  static extern bool GetTokenInformation(IntPtr token, int cls, IntPtr info, int len, out int ret);
-  [DllImport("kernel32.dll")]
-  static extern IntPtr GetCurrentProcess();
-  [DllImport("kernel32.dll")]
-  static extern bool CloseHandle(IntPtr handle);
-  [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
-  static extern bool ConvertSidToStringSid(IntPtr sid, out IntPtr text);
-  [DllImport("kernel32.dll")]
-  static extern IntPtr LocalFree(IntPtr handle);
-  public static string Read() {
-    IntPtr token;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, out token)) {
-      return "uiaccess=\nintegrity=";
-    }
-    string ui = "";
-    string level = "";
-    try {
-      int ret;
-      IntPtr uiBuf = Marshal.AllocHGlobal(4);
-      if (GetTokenInformation(token, 26, uiBuf, 4, out ret)) {
-        ui = Marshal.ReadInt32(uiBuf) != 0 ? "true" : "false";
-      }
-      Marshal.FreeHGlobal(uiBuf);
-      int size = 0;
-      GetTokenInformation(token, 25, IntPtr.Zero, 0, out size);
-      if (size > 0) {
-        IntPtr buf = Marshal.AllocHGlobal(size);
-        if (GetTokenInformation(token, 25, buf, size, out ret)) {
-          IntPtr sid = Marshal.ReadIntPtr(buf);
-          IntPtr text;
-          if (sid != IntPtr.Zero && ConvertSidToStringSid(sid, out text)) {
-            string sidText = Marshal.PtrToStringUni(text);
-            if (text != IntPtr.Zero) LocalFree(text);
-            level = Rid(sidText);
-          }
+/// Translate the SID pointed to by `sid` to a `low/medium/high/system` label
+/// for the `--doctor` JSON. The integrity RID is the *last* sub-authority in
+/// the SID, per the Microsoft integrity-level convention.
+fn integrity_label_from_sid(sid: PSID) -> Result<String, String> {
+    unsafe {
+        if sid.0.is_null() {
+            return Err("null SID".into());
         }
-        Marshal.FreeHGlobal(buf);
-      }
-    } finally {
-      CloseHandle(token);
+        let count_ptr = GetSidSubAuthorityCount(sid);
+        if count_ptr.is_null() {
+            return Err("GetSidSubAuthorityCount returned null".into());
+        }
+        let count = *count_ptr;
+        if count == 0 {
+            return Err("SID has no sub-authorities".into());
+        }
+        let last = count - 1;
+        let rid_ptr = GetSidSubAuthority(sid, last as u32);
+        if rid_ptr.is_null() {
+            return Err("GetSidSubAuthority returned null".into());
+        }
+        let rid = *rid_ptr;
+        Ok(map_integrity_rid(rid).to_string())
     }
-    return "uiaccess=" + ui + "\nintegrity=" + level;
-  }
-  static string Rid(string sid) {
-    if (sid == null) return "";
-    int cut = sid.LastIndexOf('-');
-    if (cut < 0 || cut + 1 >= sid.Length) return "";
-    uint rid;
-    if (!uint.TryParse(sid.Substring(cut + 1), out rid)) {
-      return "";
-    }
-    if (rid >= 0x5000) return "protected";
-    if (rid >= 0x4000) return "system";
-    if (rid >= 0x3000) return "high";
-    if (rid >= 0x2000) return "medium";
-    if (rid >= 0x1000) return "low";
-    return "untrusted";
-  }
 }
-"@
-[CuToken]::Read()
-"#;
+
+/// Map an integrity-level sub-authority RID to a label. The ranges follow
+/// the Microsoft ML_\* constants: untrusted (0), low (0x1000), medium
+/// (0x2000), high (0x3000), system (0x4000), protected (0x5000+).
+fn map_integrity_rid(rid: u32) -> &'static str {
+    match rid {
+        0x5000.. => "protected",
+        0x4000..=0x4FFF => "system",
+        0x3000..=0x3FFF => "high",
+        0x2000..=0x2FFF => "medium",
+        0x1000..=0x1FFF => "low",
+        _ => "untrusted",
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn tree_is_unsupported() {
-        // This is a placeholder. `tree()` on Windows is real, not
-        // unsupported; we still keep this test to make sure the
-        // `super::tree` symbol is reachable in tests.
+    fn tree_function_is_reachable() {
+        // `tree()` is real on Windows (UIA-driven via `uia::build_tree`).
+        // We don't actually invoke it from this unit test because it would
+        // try to call into UIA, which would require a real desktop session
+        // and turn CI red on the test runner. Instead we keep the symbol
+        // pinned at this type so the dispatcher can reach it without any
+        // feature-gating here.
         let _tree: fn(&TreeQuery) -> Result<crate::tree::TreeReport, ComputerError> = tree;
+    }
+
+    #[test]
+    fn integrity_rid_mapping_covers_required_buckets() {
+        // The integrity RID ranges must cover all required buckets so the
+        // doctor can always emit a label.
+        assert_eq!(map_integrity_rid(0), "untrusted");
+        assert_eq!(map_integrity_rid(0x1000), "low");
+        assert_eq!(map_integrity_rid(0x1FFF), "low");
+        assert_eq!(map_integrity_rid(0x2000), "medium");
+        assert_eq!(map_integrity_rid(0x2FFF), "medium");
+        assert_eq!(map_integrity_rid(0x3000), "high");
+        assert_eq!(map_integrity_rid(0x3FFF), "high");
+        assert_eq!(map_integrity_rid(0x4000), "system");
+        assert_eq!(map_integrity_rid(0x4FFF), "system");
+        assert_eq!(map_integrity_rid(0x5000), "protected");
+        assert_eq!(map_integrity_rid(0x6000), "protected");
     }
 
     #[test]

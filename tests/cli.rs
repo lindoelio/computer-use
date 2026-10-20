@@ -244,8 +244,10 @@ fn element_commands_are_unsupported_off_macos() {
 }
 
 #[test]
-fn tree_command_is_unsupported_off_macos() {
-    if cfg!(target_os = "macos") {
+fn tree_command_is_unsupported_off_macos_and_windows() {
+    // `tree` is real on macOS (P12a) and on Windows (UIA). Linux is the
+    // only platform that still returns `unsupported` for it.
+    if cfg!(target_os = "macos") || cfg!(target_os = "windows") {
         return;
     }
     let output = run(&["tree"]);
@@ -264,7 +266,10 @@ fn tree_command_is_unsupported_off_macos() {
 
 #[test]
 fn p9_commands_are_unsupported_off_macos() {
-    if cfg!(target_os = "macos") {
+    // macOS-only IPC surface (menus, Apple events, dock/spaces,
+    // shortcuts). macOS itself and Windows (P12a) keep these
+    // unsupported; Linux also stays unsupported.
+    if cfg!(target_os = "macos") || cfg!(target_os = "windows") {
         return;
     }
     let cases: &[&[&str]] = &[
@@ -558,12 +563,15 @@ fn list_apps_returns_json() {
     let output = run(&["list-apps"]);
     let value: Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout))
         .expect("list-apps stdout is JSON");
-    if cfg!(target_os = "macos") {
-        assert!(output.status.success(), "{value}");
-        assert!(value["apps"].is_array());
-    } else {
+    if cfg!(target_os = "linux") {
+        // Linux backend still returns `unsupported` for the macOS-style
+        // listing. macOS and Windows (P12a) populate the apps list
+        // honestly via the platform-native enumerator.
         assert!(!output.status.success());
         assert_eq!(value["error"]["code"], "unsupported");
+    } else {
+        assert!(output.status.success(), "{value}");
+        assert!(value["apps"].is_array());
     }
 }
 

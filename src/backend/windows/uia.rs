@@ -188,15 +188,24 @@ pub(crate) fn resolve_target(
 }
 
 /// Build the canonical `UiNode` tree rooted at the resolved HWND.
+///
+/// The whole tree build runs on the UIA worker so the live COM walks are
+/// bounded by `TREE_TIMEOUT_SECONDS`.
 fn build_root_for_window(target: &ResolvedTarget, full: bool) -> Result<UiNode, ComputerError> {
     let hwnd = target
         .window_id
         .ok_or_else(|| ComputerError::WindowNotFound("resolved target has no window id".into()))?;
-    let automation = uia_with_timeout()?;
-    let element = automation
-        .element_from_handle(uiautomation::types::Handle::from(hwnd as isize))
-        .map_err(|error| ComputerError::WindowNotFound(format!("hwnd {hwnd}: {error}")))?;
-    walk(&automation, &element, 0, full)
+    let hwnd_isize = hwnd as isize;
+    run_uia_with_timeout(
+        TREE_TIMEOUT_SECONDS,
+        move || -> Result<UiNode, ComputerError> {
+            let automation = uia_with_timeout()?;
+            let element = automation
+                .element_from_handle(uiautomation::types::Handle::from(hwnd_isize))
+                .map_err(|error| ComputerError::WindowNotFound(format!("hwnd {hwnd}: {error}")))?;
+            walk(&automation, &element, 0, full)
+        },
+    )
 }
 
 /// Walk the control view from `element` down, producing a `UiNode` for each
@@ -293,19 +302,70 @@ fn rect_property(element: &UIElement) -> Option<NodeFrame> {
     })
 }
 
-/// Create a `UIAutomation` with a 2-second global timeout. The crate does
-/// not expose a per-call timeout, so the bound is enforced by the tree
-/// walker limits (control view, depth cap). `CoInitialize` is implicit.
-fn uia_with_timeout() -> Result<UIAutomation, ComputerError> {
-    let _timeout = Duration::from_secs(TREE_TIMEOUT_SECONDS);
+/// Create a `UIAutomation`, mapping the COM failure modes onto our error
+/// enum. The call itself is fast (it instantiates a CLSCTX_ALL
+/// `IUIAutomation` after `CoInitializeEx(MTA)`), so no timeout wrapper is
+/// needed here — the wrapper is applied by [`run_uia_with_timeout`] at
+/// the call sites that actually walk live COM (`build_root_for_window`
+/// and the dispatch path), where the timeout matters.
+///
+/// E_ACCESSDENIED comes back when the process lacks UIA access
+/// (integrity level higher than the target).
+pub(crate) fn uia_with_timeout() -> Result<UIAutomation, ComputerError> {
     UIAutomation::new().map_err(|error| match error.code() as u32 {
-        // E_ACCESSDENIED comes back when the process lacks UIA access
-        // (integrity level higher than the target).
         0x80070005 | 0x80004005 => {
             ComputerError::PermissionRequired(format!("UI Automation: {error}"))
         }
         _ => ComputerError::ExecutionFailed(format!("UIAutomation::new failed: {error}")),
     })
+}
+
+/// Run a closure that does UIA work on a fresh worker thread, and wait up
+/// to `seconds` for it. The worker is COM-initialised by the closure
+/// itself (via [`uia_with_timeout`] or `UIAutomation::new`), so each
+/// closure that touches UIA *must* build its own `UIAutomation` instance
+/// inside the closure rather than reuse one across calls. Pass closures by
+/// value; the closure runs exactly once.
+///
+/// On timeout the worker is detached and the error
+/// `UI Automation call timed out after Ns` is returned. The caller never
+/// blocks indefinitely on a stuck UIA target.
+///
+/// `UIElement` and `UIAutomation` are not `Send`; closures must not
+/// return them. Restructure the call site so the closure drives the
+/// whole COM operation and returns a primitive / owned value
+/// (typically [`UiNode`] or [`ElementOutcome`]).
+pub(crate) fn run_uia_with_timeout<T, F>(seconds: u64, closure: F) -> Result<T, ComputerError>
+where
+    F: FnOnce() -> Result<T, ComputerError> + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel::<Result<T, ComputerError>>();
+    let builder = std::thread::Builder::new();
+    builder
+        .name("cu-uia".into())
+        .spawn(move || {
+            let result = closure();
+            let _ = tx.send(result);
+        })
+        .map_err(|error| {
+            ComputerError::ExecutionFailed(format!("could not spawn UIA worker: {error}"))
+        })?;
+    match rx.recv_timeout(Duration::from_secs(seconds)) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            // We deliberately do not join the thread: it will complete when
+            // UIA does, but the CLI must not block on a stuck target
+            // window. The detached worker has no observable side effects
+            // on the caller.
+            Err(ComputerError::ExecutionFailed(format!(
+                "UI Automation call timed out after {seconds}s"
+            )))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(
+            ComputerError::ExecutionFailed("UI Automation worker disconnected".into()),
+        ),
+    }
 }
 
 /// Run the element action.
@@ -315,6 +375,13 @@ fn uia_with_timeout() -> Result<UIAutomation, ComputerError> {
 /// cached path through UIA, and dispatches the pattern. Missing pattern
 /// => `execution_failed` (no invented click). `IsPassword` redact forbids
 /// `set_value`.
+///
+/// The UIA path-walk + dispatch is run inside a [`run_uia_with_timeout`]
+/// worker so a stuck target window cannot block the CLI: on timeout we
+/// return `execution_failed("UI Automation call timed out after Ns")` and
+/// the worker detaches. The resolved `UIAutomation` / `UIElement` never
+/// leave the worker thread — the closure returns the final
+/// `ElementOutcome`.
 #[allow(dead_code)]
 pub(crate) fn element_action(
     request: &ElementRequest,
@@ -375,18 +442,30 @@ pub(crate) fn element_action(
             request.window.clone().unwrap_or_default(),
         ))
     })?;
-    let element = resolve_uia_element(hwnd, &gate.path).map_err(ElementError::new)?;
     let revision = tree::revision_of(&live_rendered.root);
-    dispatch(&element, &request.op, revision, live.pid, request)
+    let op = request.op.clone();
+    let request_clone = request.clone();
+
+    run_uia_with_timeout(
+        TREE_TIMEOUT_SECONDS,
+        move || -> Result<ElementOutcome, ComputerError> {
+            let element = resolve_uia_element_inner(hwnd, &gate.path)?;
+            dispatch_inner(&element, &op, revision, &request_clone)
+                .map_err(|element_error| element_error.error)
+        },
+    )
+    .map_err(ElementError::new)
 }
 
 /// Dispatch one [`ElementOp`] through the appropriate UI Automation pattern.
-#[allow(dead_code)]
-fn dispatch(
+/// Worker-internal — must not be called from outside the
+/// `run_uia_with_timeout` closure that also resolves the element,
+/// because [`UIElement`] is not `Send` and would otherwise have to cross
+/// a thread boundary.
+fn dispatch_inner(
     element: &UIElement,
     op: &ElementOp,
     revision: u64,
-    pid: i32,
     request: &ElementRequest,
 ) -> Result<ElementOutcome, crate::element::ElementError> {
     use crate::element::ElementError;
@@ -400,8 +479,6 @@ fn dispatch(
             "uia:{name}: call failed: {error}"
         )))
     };
-    let _ = revision;
-    let _ = pid;
     let via = match op {
         ElementOp::Press { .. } => {
             let pattern = element
@@ -509,13 +586,14 @@ fn dispatch(
     ))
 }
 
-/// Resolve one cached element through UIA. The cached path is walked on
-/// the live tree; each step advances by the child index.
-#[allow(dead_code)]
-fn resolve_uia_element(hwnd: u32, path: &[usize]) -> Result<UIElement, ComputerError> {
+/// Resolve one cached element through UIA. Worker-internal — must not be
+/// called from outside the `run_uia_with_timeout` closure; the returned
+/// [`UIElement`] cannot cross thread boundaries.
+fn resolve_uia_element_inner(hwnd: u32, path: &[usize]) -> Result<UIElement, ComputerError> {
+    let hwnd_isize = hwnd as isize;
     let automation = uia_with_timeout()?;
     let root = automation
-        .element_from_handle(uiautomation::types::Handle::from(hwnd as isize))
+        .element_from_handle(uiautomation::types::Handle::from(hwnd_isize))
         .map_err(|error| ComputerError::WindowNotFound(format!("hwnd {hwnd}: {error}")))?;
     let walker = automation.get_control_view_walker().map_err(|error| {
         ComputerError::ExecutionFailed(format!("uia:ControlViewWalker: {error}"))
@@ -547,10 +625,13 @@ fn resolve_uia_element(hwnd: u32, path: &[usize]) -> Result<UIElement, ComputerE
     })
 }
 
-/// Probe whether UI Automation is reachable. Used by `doctor`.
+/// Probe whether UI Automation is reachable. Used by `doctor`. Lives
+/// inside the worker so the probe itself is bounded by the UIA timeout.
 pub(crate) fn doctor_accessibility() -> Result<bool, ComputerError> {
-    let _automation = uia_with_timeout()?;
-    Ok(true)
+    run_uia_with_timeout(TREE_TIMEOUT_SECONDS, || -> Result<bool, ComputerError> {
+        let _: UIAutomation = uia_with_timeout()?;
+        Ok(true)
+    })
 }
 
 /// Resolve `pid` against the current desktop for the `--app pid=...`
@@ -572,14 +653,6 @@ pub(crate) fn pid_only_query(pid: i32) -> TreeQuery {
         app: Some(format!("pid:{pid}")),
         ..TreeQuery::default()
     }
-}
-
-/// Dummy argument to make the imports reachable even when a tree walk
-/// never touches TextPattern variants directly. Kept private.
-#[doc(hidden)]
-#[allow(dead_code)]
-fn _forced_unused() -> (TextUnit, TextPatternRangeEndpoint) {
-    (TextUnit::Character, TextPatternRangeEndpoint::Start)
 }
 
 #[cfg(test)]
@@ -747,17 +820,13 @@ mod tests {
         let apps_list = fake_apps();
         let windows = vec![fake_window(1, 10, "Untitled", "notepad")];
         let q = pid_only_query(999);
-        // When --app pid:NNN does not match any window, the resolved
-        // app list has no entry and `resolve` returns an
-        // `app_not_found`. We accept any structured error from this
-        // shape, because the dispatcher turns the missing app into a
-        // stale_element / element_not_found, never a raw empty list.
+        // Per ROADMAP, an unmatched `--app pid:NNN` returns
+        // `app_not_found`. This is the only contract here: the dispatcher
+        // turns a missing app into a structured `AppNotFound` error before
+        // any element work runs, so callers can rely on it.
         let err = resolve_target(&q, &apps_list, &windows).unwrap_err();
         assert!(
-            matches!(
-                err,
-                ComputerError::WindowNotFound(_) | ComputerError::ExecutionFailed(_)
-            ),
+            matches!(err, ComputerError::AppNotFound(_)),
             "unexpected error: {err:?}"
         );
     }
@@ -809,5 +878,47 @@ mod tests {
             session: req.session.clone(),
         };
         assert_eq!(q.app.as_deref(), Some("pid:42"));
+    }
+
+    #[test]
+    fn run_uia_with_timeout_returns_error_when_closure_overruns() {
+        // Sleeping longer than the bound must yield a structured
+        // `ExecutionFailed` with the standard message. The closure is the
+        // generic worker — it has no UIA dependency, so this test runs
+        // purely against the wrapper.
+        let result: Result<(), ComputerError> = run_uia_with_timeout(1, || {
+            std::thread::sleep(Duration::from_millis(1500));
+            Ok(())
+        });
+        let err = result.unwrap_err();
+        match err {
+            ComputerError::ExecutionFailed(message) => {
+                assert!(
+                    message.contains("UI Automation call timed out after 1s"),
+                    "expected timeout message, got: {message}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_uia_with_timeout_returns_closure_result_when_fast_enough() {
+        // A closure that finishes within the bound returns its value
+        // unchanged.
+        let result: Result<u32, ComputerError> = run_uia_with_timeout(2, || Ok(7));
+        assert_eq!(result.unwrap(), 7);
+    }
+
+    #[test]
+    fn run_uia_with_timeout_propagates_closure_errors() {
+        // Closure errors are returned verbatim, not wrapped into a
+        // timeout.
+        let result: Result<(), ComputerError> =
+            run_uia_with_timeout(2, || Err(ComputerError::ExecutionFailed("nope".into())));
+        match result.unwrap_err() {
+            ComputerError::ExecutionFailed(message) => assert_eq!(message, "nope"),
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }
