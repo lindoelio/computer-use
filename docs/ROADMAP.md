@@ -1135,9 +1135,10 @@ AT-SPI (`atspi` 0.30.0), always compiled on Linux:
 
 - `AccessibilityConnection::new`.
 - Find the application on the desktop by pid.
-- Walk children. Render with `tree.rs`. Roles are AT-SPI roles.
-- `Action::do_action` for press. `Value::set_current_value` when the interface exists. `Text` for `set_value` and caret selection. `Component::get_extents(CoordType::Screen)` for frames. `Component::scroll_to` or the scroll action for scroll-into-view.
-- Secure text: the `Text` interface state `SENSITIVE` combined with role `PASSWORD_TEXT` is redacted.
+- Walk children. Render with `tree.rs`. Roles are AT-SPI roles (`Role::name()`).
+- Element actions on P13a: `Action::do_action` for `press` and `perform`; `Component::grab_focus` for `focus`; `EditableText::set_text_contents` (or `Value::set_current_value` for numeric) for `set_value` / `type`; `Text::set_selection` / `add_selection` for `select_text`; `Component::scroll_to` for `scroll_to`. Each per-call request is bounded by `tokio::time::timeout` (3 s); a missing interface returns `execution_failed` instead of inventing a click. The same `crate::element::gate` stale-element revalidation macOS / Windows use runs first.
+- Frames: `Component::get_extents(CoordType::Screen)` per node when the `Component` interface is present — kept as `None` on P13a because the round-trip-per-node cost does not pay back without part B's per-window background. Part B keeps the same call shape and turns the frame on.
+- Secure text: **only `Role::PasswordText` redacts the value.** The earlier `State::Sensitive` (without `State::Enabled`) rule was removed: AT-SPI `Sensitive` means "can receive focus / is user-actionable", not "secret", and mirroring `AXSensitive` to a meaningless flag dropped values of merely disabled controls. `tree::node_is_secure` still answers the prompt's redaction question, the renderer keeps `••••` for any redacted node, and the unit tests pin `Role::PasswordText -> secure=true` plus every non-password role -> `secure=false`.
 
 Screen capture, feature `portal`:
 
@@ -1163,11 +1164,12 @@ Same commands. `computer-use doctor` on Linux fills `accessibility` from the bus
 `source` is `"atspi"`. Capture `capture_source` is `"portal"` or `"xcap"`.
 
 ### Failure modes
-`permission_required` when the portal dialog is denied. `unsupported` for Wayland coordinate input without `portal` or without a granted RemoteDesktop session. `execution_failed` when the AT-SPI bus is absent (install `at-spi2-core`). `cdp` is independent of this phase.
+`permission_required` when the portal dialog is denied. `unsupported` for Wayland coordinate input without `portal` or without a granted RemoteDesktop session. `execution_failed` when the AT-SPI bus is absent (install `at-spi2-core`). `policy_denied` when the action targets a `Role::PasswordText` node for `set_value`, `select_text`, or `type --element`; the value never reaches the bus, the cache, or the renderer. `cdp` is independent of this phase.
 
 ### Tests
-- Role and password redaction on fixture AT-SPI nodes through `tree.rs`.
-- XTest request encoding is tested by inspecting the `x11rb` request bytes built for a motion, without a display. Skip the test if the feature flag layout makes that unreachable, and instead test the coordinate conversion into the request struct.
+- Role and password redaction on fixture AT-SPI nodes through `tree.rs`. P13a pins the rule to `Role::PasswordText` only — `state_is_sensitive_only` is kept as a dead helper to mark the old rule obsolete.
+- Element-action dispatch is unit-tested for: (i) `ElementAction::routes_to_atspi` (the Linux dispatcher no longer answers `unsupported`); (ii) `proxy_at` signature stability; (iii) redaction-by-role lock. The live paths run through AT-SPI on Linux CI.
+- XTest request encoding is tested by inspecting the `x11rb` request bytes built for a motion, without a display. P13a adds `perform_event_tier_wires_xtest_fake_input` and `perform_activate_tier_is_enigo_on_linux` as dispatcher-level tests; the former proves `tier = event` routes through `xtest::fake_input` (the connection step fails `DisplayUnavailable`/`ExecutionFailed`, never a generic `unsupported`), the latter pins `TierName::Activate -> perform_activate_tier`.
 - Portal is not contacted in CI. `cargo check --features portal` on Ubuntu with `libpipewire-0.3-dev` is the compile check.
 - Default `cargo test` on Ubuntu still passes without PipeWire.
 

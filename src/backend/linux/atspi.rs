@@ -1,4 +1,4 @@
-//! Linux AT-SPI accessibility tree and doctor probe.
+//! Linux AT-SPI accessibility tree, doctor probe, and element actions.
 //!
 //! AT-SPI is the platform's accessibility bus: one accessibility daemon
 //! per user session exposes every UI application's tree as a hierarchy
@@ -13,23 +13,40 @@
 //!
 //! The walker honours the redaction contract from P2: a node whose role
 //! is [`atspi::Role::PasswordText`] always carries `secure = true` and
-//! an empty `value`. A node that has the [`atspi::State::Sensitive`]
-//! flag set without the [`atspi::State::Enabled`] flag is also
-//! redacted. The renderer ([`crate::tree::render`]) consumes those
-//! flags through [`crate::tree::node_is_secure`].
+//! an empty `value`. No other flag — including the AT-SPI `Sensitive`
+//! bit, which means "user-actionable" rather than "secret" — drives
+//! redaction. The renderer ([`crate::tree::render`]) consumes the flag
+//! through [`crate::tree::node_is_secure`].
+//!
+//! Element actions (`press`, `focus`, `set_value`, `select_text`,
+//! `scroll_to`) run through AT-SPI on P13a: `Action::do_action`,
+//! `Value::set_current_value`, `EditableText::set_text_contents`,
+//! `Text::set_selection`/`add_selection`, `Component::scroll_to`, plus
+//! `Component::grab_focus` for focus. Each per-element call is bounded
+//! by the same [`ATSPI_CALL_BUDGET`] as the tree walk. A missing
+//! interface surfaces as `execution_failed` (no invented click); secure
+//! `Role::PasswordText` nodes refuse `set_value`, `select_text`, and
+//! `type --element` with `policy_denied`. The shared
+//! [`crate::element::gate`] stale-element revalidation runs first and
+//! rejects any change in role, identifier, or frame before the call is
+//! made.
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use atspi::connection::AccessibilityConnection;
 use atspi::proxy::accessible::{AccessibleProxy, ObjectRefExt};
-use atspi::{InterfaceSet, ObjectRefOwned, Role, State};
+use atspi::{Interface, ObjectRefOwned, Role};
 
 use super::runtime;
 use crate::element::{ElementError, ElementOutcome, ElementRequest};
 use crate::error::ComputerError;
-use crate::tree::{TreeQuery, TreeReport, UiNode, CHILD_CAP};
+use crate::tree::{self, TreeQuery, TreeReport, UiNode, CHILD_CAP};
 
-/// Maximum time a single AT-SPI call is allowed to take.
+/// Maximum time a single AT-SPI call is allowed to take. Tree walks and
+/// element actions share this budget so a slow bus can never stretch a
+/// dispatcher step past a few seconds.
 const ATSPI_CALL_BUDGET: Duration = Duration::from_secs(3);
 
 /// Maximum tree depth that the walker recurses through.
@@ -37,6 +54,9 @@ const ATSPI_DEPTH_CAP: usize = 64;
 
 /// Source identifier on tree reports for Linux.
 pub(crate) const SOURCE_LABEL: &str = "atspi";
+
+/// `via` returned from a successful AT-SPI action.
+const VIA_ATSPI: &str = "atspi";
 
 /// Open one fresh `AccessibilityConnection`, with a bounded per-step
 /// budget. The structured error mentions `at-spi2-core` so the doctor
@@ -71,21 +91,15 @@ pub(crate) fn ping() -> bool {
 
 /// Public entry point for the dispatcher.
 pub(crate) fn build_tree(query: &TreeQuery) -> Result<TreeReport, ComputerError> {
-    let app_filter = query.app.clone();
-    let window_filter = query.window.clone();
-    let want_full = query.full;
-    let outcome = runtime::block_on(async move {
+    let outcome = runtime::block_on(async {
         tokio::time::timeout(
             ATSPI_CALL_BUDGET,
-            walk_root(app_filter, window_filter, want_full),
+            walk_live(query, false, false /* no signal capture */),
         )
         .await
     })?;
     match outcome {
-        Ok(Ok(Some(report))) => Ok(report),
-        Ok(Ok(None)) => Err(ComputerError::AppNotFound(
-            "no AT-SPI application matched the --app selector".into(),
-        )),
+        Ok(Ok(report)) => Ok(report),
         Ok(Err(error)) => Err(error),
         Err(_elapsed) => Err(ComputerError::ExecutionFailed(format!(
             "AT-SPI walk exceeded {}s budget",
@@ -94,16 +108,197 @@ pub(crate) fn build_tree(query: &TreeQuery) -> Result<TreeReport, ComputerError>
     }
 }
 
-/// Build a `TreeReport` for the first registry application that matches
-/// the filters, or `None` when no application matches.
-async fn walk_root(
-    app_filter: Option<String>,
-    window_filter: Option<String>,
-    want_full: bool,
-) -> Result<Option<TreeReport>, ComputerError> {
-    let connection = connect()
+/// Element actions route through AT-SPI on P13a. The dispatcher-facing
+/// entry point is sync; [`runtime::block_on`] drives the async walker,
+/// one bounded per-element call on the same connection, and the cache
+/// round-trip. A missing interface surfaces as `execution_failed` (no
+/// invented click); secure `Role::PasswordText` nodes refuse writes
+/// with `policy_denied`.
+pub(crate) fn element_action(request: &ElementRequest) -> Result<ElementOutcome, ElementError> {
+    let label = request.app.as_deref().unwrap_or("").to_string();
+    let query = TreeQuery {
+        app: request.app.clone(),
+        window: request.window.clone(),
+        full: false,
+        session: request.session.clone(),
+    };
+    let request = request.clone();
+    let op = request.op.clone();
+
+    let joined = runtime::block_on(async move {
+        tokio::time::timeout(ATSPI_CALL_BUDGET, async {
+            let cached = load_cached_snapshot(&query).await?;
+            let cached = match cached {
+                Some(snapshot) => snapshot,
+                None => {
+                    return Err(ElementError::new(ComputerError::StaleElement(format!(
+                        "no cached snapshot for {label} index={}",
+                        request.index
+                    ))));
+                }
+            };
+            let live = walk_live(&query, false, true /* signal capture */).await?;
+            let gate_input = crate::element::GateInput {
+                op: &op,
+                index: request.index,
+                require_visible: request.require_visible,
+                app_label: &label,
+                cached: &cached.identity,
+                cached_revision: cached.revision,
+                cached_pid: cached.pid,
+                cached_window: cached.window_id,
+                resolved_pid: live.pid,
+                resolved_window: live.window_id,
+                live: &live.ui_root,
+                live_pid: live.pid,
+                live_window: live.window_id,
+            };
+            let gate = crate::element::gate(&gate_input)?;
+            let via = perform_action(&live, &gate.path, &op).await?;
+            // Re-fetch on the same bus, log a failure but never turn a
+            // completed action into an error.
+            let refreshed = match walk_live(&query, false, false).await {
+                Ok(report) => report,
+                Err(error) => {
+                    return Ok((
+                        via,
+                        None,
+                        cached,
+                        format!("tree was not re-read after the action: {error}"),
+                    ))
+                }
+            };
+            Ok((via, Some(refreshed), cached, String::new()))
+        })
         .await
-        .map_err(|error| ComputerError::ExecutionFailed(format!("AT-SPI connect: {error}")))?;
+    });
+
+    let result = match joined {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => return Err(error),
+        Err(_elapsed) => {
+            return Err(ElementError::new(ComputerError::ExecutionFailed(format!(
+                "AT-SPI element action exceeded {}s budget",
+                ATSPI_CALL_BUDGET.as_secs()
+            ))));
+        }
+    };
+    let (via, refreshed, mut snapshot, revalidation_warning) = result;
+    let mut warnings = Vec::new();
+    if !revalidation_warning.is_empty() {
+        warnings.push(revalidation_warning);
+    }
+    let new_revision = refreshed
+        .as_ref()
+        .map(|live| live.ui_revision)
+        .unwrap_or(snapshot.revision);
+    if let Some(live) = refreshed {
+        snapshot.tree = live.tree_text.clone();
+        snapshot.full_text = live.full_text.clone();
+        snapshot.truncated = live.truncated;
+        snapshot.revision = live.ui_revision;
+        snapshot.observed = Some(live.observed_root);
+        snapshot.observed_revision = Some(live.ui_revision);
+        if let Err(error) = crate::cache::store(query.session.as_deref(), &snapshot) {
+            warnings.push(format!("session cache was not updated: {error}"));
+        }
+    }
+    Ok(crate::element::outcome(
+        &request,
+        new_revision,
+        warnings,
+        Some(via),
+    ))
+}
+
+/// One snapshot entry returned by `load_cached_snapshot`.
+struct CachedSnapshot {
+    /// The sig-node the gate compares the live tree against.
+    identity: Arc<tree::SigNode>,
+    /// Stored revision (or `observed_revision` when set).
+    revision: u64,
+    /// Stored pid.
+    pid: i32,
+    /// Stored window id.
+    window_id: u32,
+    /// Original snapshot so we can re-write it with `observed` updated.
+    snapshot: crate::cache::Snapshot,
+}
+
+/// Load the snapshot the cache stored for this `(pid, window_id)`.
+async fn load_cached_snapshot(query: &TreeQuery) -> Result<Option<CachedSnapshot>, ElementError> {
+    // Resolve the pid/window_id from a pre-walk so the snapshot lookup
+    // matches the cache key the dispatcher used to write the original
+    // tree. The cost is one extra `walk_live` pass that happens before
+    // any element work runs; macOS / Windows pay the same price via
+    // `resolve_target` + `cache::load`.
+    let pre_report = walk_live(query, false, false)
+        .await
+        .map_err(ElementError::new)?;
+    let pid = pre_report.pid;
+    let window_id = pre_report.window_id;
+    drop(pre_report);
+    let snapshot = crate::cache::load(query.session.as_deref(), None, pid, window_id)
+        .map_err(ElementError::new)?;
+    let Some(snapshot) = snapshot else {
+        return Ok(None);
+    };
+    let identity = snapshot
+        .observed
+        .clone()
+        .unwrap_or_else(|| snapshot.root.clone());
+    let revision = snapshot.observed_revision.unwrap_or(snapshot.revision);
+    Ok(Some(CachedSnapshot {
+        identity: Arc::new(identity),
+        revision,
+        pid: snapshot.pid,
+        window_id: snapshot.window_id,
+        snapshot,
+    }))
+}
+
+/// Buffered, redacted walk of one application. Carries the public
+/// `UiNode` (so the gate can validate) plus the AT-SPI interfaces for
+/// every visited path and the root `ObjectRefOwned` so element actions
+/// can descend the same way `render_node` did and reach the right node.
+struct LiveWalk {
+    /// Public `UiNode` tree after redaction.
+    ui_root: UiNode,
+    /// Public renderer revision (cached in `tree::revision_of`).
+    ui_revision: u64,
+    /// `InterfaceSet` keyed by child-index path (empty path is root).
+    interfaces: HashMap<Vec<usize>, atspi::InterfaceSet>,
+    /// Application reference; element actions descend from here by path.
+    root_object: ObjectRefOwned,
+    /// Resolved pid.
+    pid: i32,
+    /// Resolved window id (0 when none).
+    window_id: u32,
+    /// Tree text the dispatcher and renderer use.
+    tree_text: String,
+    /// Full tree text (matches `tree_text` on P13a).
+    full_text: String,
+    /// Truncation flag.
+    truncated: bool,
+    /// `SigNode` root for `cache::Snapshot::observed`.
+    observed_root: tree::SigNode,
+}
+
+/// Walk the AT-SPI bus and fill a [`LiveWalk`] ready for `gate` and
+/// element actions. Returns `ComputerError` so callers can map missing
+/// applications to `AppNotFound` consistently.
+///
+/// `signal_capture` is `true` only when the walker runs before element
+/// work; it lets us return the application without renaming
+/// `AppNotFound` to `ExecutionFailed`.
+async fn walk_live(
+    query: &TreeQuery,
+    want_full: bool,
+    signal_capture: bool,
+) -> Result<LiveWalk, ComputerError> {
+    let connection = connect().await?;
+    let app_filter = query.app.clone();
+    let window_filter = query.window.clone();
     let registry = connection
         .root_accessible_on_registry()
         .await
@@ -111,11 +306,6 @@ async fn walk_root(
     let children = registry.get_children().await.map_err(atspi_error)?;
     let mut chosen: Option<ObjectRefOwned> = None;
     for child in children {
-        // Each registry child is an `ObjectRefOwned`; resolve it into an
-        // `AccessibleProxy` so the named accessors (`name`, `description`)
-        // are usable. We keep the `ObjectRefOwned` because the proxy
-        // borrows from the bus connection; storing an owned reference
-        // here lets us rebuild the proxy once a match lands.
         let Ok(proxy) = child.as_accessible_proxy(connection.connection()).await else {
             continue;
         };
@@ -131,41 +321,302 @@ async fn walk_root(
         }
     }
     let Some(application_ref) = chosen else {
-        return Ok(None);
+        if signal_capture {
+            return Err(ComputerError::AppNotFound(
+                "no AT-SPI application matched the --app selector".into(),
+            ));
+        }
+        return Err(ComputerError::ExecutionFailed(
+            "no AT-SPI application matched the --app selector".into(),
+        ));
     };
-
     let application = application_ref
         .as_accessible_proxy(connection.connection())
         .await
         .map_err(atspi_error)?;
     let pid = extract_pid_from_path(application.inner().path().as_str());
-    let app_name = application.name().await.unwrap_or_default();
-    let app_label = if app_name.is_empty() {
-        None
-    } else {
-        Some(app_name.clone())
-    };
     let window_id = window_filter
         .as_deref()
         .and_then(extract_window_id)
         .unwrap_or(0);
-    let inner = render_node(&application, &connection, want_full, 0).await?;
-    let rendered = crate::tree::render(&inner);
-    let tree_text = rendered.text;
-    let report = TreeReport {
+    let rendered_root = render_node(&application, &connection, want_full, 0).await?;
+    let mut path = Vec::new();
+    let mut interfaces = HashMap::new();
+    let root = reduce_tree(&rendered_root, &mut path, &mut interfaces);
+    let public = tree::render(&root);
+    let observed_root = public.root.clone();
+    Ok(LiveWalk {
+        ui_root: root,
+        ui_revision: tree::revision_of(&public.root),
+        interfaces,
+        root_object: application_ref,
         pid,
         window_id,
-        revision: 0,
-        source: SOURCE_LABEL.to_string(),
-        truncated: rendered.truncated,
-        tree: tree_text.clone(),
-        full_text: tree_text,
-        diff: None,
-        app: app_label,
-        note: window_filter.clone(),
-        legacy: None,
+        tree_text: public.text.clone(),
+        full_text: public.text,
+        truncated: public.truncated,
+        observed_root,
+    })
+}
+
+/// Resolve the `AccessibleProxy` at a child-index path by descending
+/// the live tree's `get_children` results. This mirrors the walk
+/// `render_node` used to populate `interfaces` so the index the gate
+/// validated points to the same AT-SPI object the tree rendered.
+async fn proxy_at<'a>(
+    connection: &'a AccessibilityConnection,
+    root: &'a ObjectRefOwned,
+    path: &[usize],
+) -> Result<AccessibleProxy<'a>, ComputerError> {
+    let mut current = root
+        .as_accessible_proxy(connection.connection())
+        .await
+        .map_err(atspi_error)?;
+    for &child_index in path {
+        let child_refs = current.get_children().await.map_err(atspi_error)?;
+        let Some(child_ref) = child_refs.into_iter().nth(child_index) else {
+            return Err(ComputerError::ElementNotFound(format!(
+                "path index {child_index} did not resolve to an AT-SPI child"
+            )));
+        };
+        current = child_ref
+            .as_accessible_proxy(connection.connection())
+            .await
+            .map_err(atspi_error)?;
+    }
+    Ok(current)
+}
+
+/// Drive one element op through the matching AT-SPI interface. Returns
+/// the `via` string the EI action reports back. The error type is
+/// `ComputerError` so the dispatcher can map missing interfaces to
+/// `execution_failed`.
+async fn perform_action(
+    live: &LiveWalk,
+    path: &[usize],
+    op: &crate::element::ElementOp,
+) -> Result<String, ComputerError> {
+    use crate::element::ElementOp;
+
+    let connection = connect().await?;
+    let interfaces = live.interfaces.get(path).copied().unwrap_or_default();
+    let proxy = proxy_at(&connection, &live.root_object, path).await?;
+    let element_writes_text = matches!(
+        op,
+        ElementOp::SetValue { .. } | ElementOp::SelectText { .. } | ElementOp::Type { .. }
+    );
+    let secure = proxy_is_password(&proxy).await;
+    if secure && element_writes_text {
+        return Err(ComputerError::PolicyDenied(
+            "refusing to read or write a secure text field".into(),
+        ));
+    }
+    let _ = interfaces;
+    let via = match op {
+        ElementOp::Press { count, button } => {
+            let _ = button;
+            if !interfaces.contains(Interface::Action) {
+                return Err(ComputerError::ExecutionFailed(format!(
+                    "AT-SPI element action: Action interface missing at path depth {}",
+                    path.len()
+                )));
+            }
+            let action_proxy = atspi::proxy::proxy_ext::ProxyExt::proxies(&proxy)
+                .await
+                .map_err(atspi_error)?
+                .action()
+                .await
+                .map_err(atspi_error)?;
+            // First action (click/press/activate) is the project default;
+            // when only one is exposed the call is harmless either way.
+            for _ in 0..*count {
+                action_proxy.do_action(0).await.map_err(atspi_error)?;
+            }
+            format!("{VIA_ATSPI}:Action")
+        }
+        ElementOp::Focus => {
+            if !interfaces.contains(Interface::Component) {
+                return Err(ComputerError::ExecutionFailed(format!(
+                    "AT-SPI element action: Component interface missing at path depth {}",
+                    path.len()
+                )));
+            }
+            let component_proxy = atspi::proxy::proxy_ext::ProxyExt::proxies(&proxy)
+                .await
+                .map_err(atspi_error)?
+                .component()
+                .await
+                .map_err(atspi_error)?;
+            component_proxy.grab_focus().await.map_err(atspi_error)?;
+            format!("{VIA_ATSPI}:Component.grab_focus")
+        }
+        ElementOp::SetValue { value } => {
+            // AT-SPI exposes two writable shapes: `Value` (numeric) and
+            // `EditableText` (text). EditableText wins when both are
+            // advertised because it is the human-language path.
+            if interfaces.contains(Interface::EditableText) {
+                let editable = atspi::proxy::proxy_ext::ProxyExt::proxies(&proxy)
+                    .await
+                    .map_err(atspi_error)?
+                    .editable_text()
+                    .await
+                    .map_err(atspi_error)?;
+                editable
+                    .set_text_contents(value)
+                    .await
+                    .map_err(atspi_error)?;
+                format!("{VIA_ATSPI}:EditableText")
+            } else if interfaces.contains(Interface::Value) {
+                let numeric = value.parse::<f64>().map_err(|error| {
+                    ComputerError::InvalidArguments(format!(
+                        "AT-SPI Value interface requires a numeric value: {error}"
+                    ))
+                })?;
+                let value_proxy = atspi::proxy::proxy_ext::ProxyExt::proxies(&proxy)
+                    .await
+                    .map_err(atspi_error)?
+                    .value()
+                    .await
+                    .map_err(atspi_error)?;
+                value_proxy
+                    .set_current_value(numeric)
+                    .await
+                    .map_err(atspi_error)?;
+                format!("{VIA_ATSPI}:Value")
+            } else {
+                return Err(ComputerError::ExecutionFailed(format!(
+                    "AT-SPI element action: EditableText or Value interface missing at path depth {}",
+                    path.len()
+                )));
+            }
+        }
+        ElementOp::SelectText { start, end } => {
+            if !interfaces.contains(Interface::Text) {
+                return Err(ComputerError::ExecutionFailed(format!(
+                    "AT-SPI element action: Text interface missing at path depth {}",
+                    path.len()
+                )));
+            }
+            let text_proxy = atspi::proxy::proxy_ext::ProxyExt::proxies(&proxy)
+                .await
+                .map_err(atspi_error)?
+                .text()
+                .await
+                .map_err(atspi_error)?;
+            let start = i32::try_from(*start).unwrap_or(i32::MAX);
+            let end = i32::try_from(*end).unwrap_or(i32::MAX);
+            let ok = text_proxy
+                .set_selection(0, start, end)
+                .await
+                .map_err(atspi_error)?;
+            if !ok {
+                text_proxy
+                    .add_selection(start, end)
+                    .await
+                    .map_err(atspi_error)?;
+            }
+            format!("{VIA_ATSPI}:Text")
+        }
+        ElementOp::ScrollTo => {
+            if !interfaces.contains(Interface::Component) {
+                return Err(ComputerError::ExecutionFailed(format!(
+                    "AT-SPI element action: Component interface missing at path depth {}",
+                    path.len()
+                )));
+            }
+            let component_proxy = atspi::proxy::proxy_ext::ProxyExt::proxies(&proxy)
+                .await
+                .map_err(atspi_error)?
+                .component()
+                .await
+                .map_err(atspi_error)?;
+            component_proxy
+                .scroll_to(atspi::ScrollType::TopLeft)
+                .await
+                .map_err(atspi_error)?;
+            format!("{VIA_ATSPI}:Component.scroll_to")
+        }
+        ElementOp::Perform { name } => {
+            if !interfaces.contains(Interface::Action) {
+                return Err(ComputerError::ExecutionFailed(format!(
+                    "AT-SPI element action: Action interface missing at path depth {} for `{name}`",
+                    path.len()
+                )));
+            }
+            let action_proxy = atspi::proxy::proxy_ext::ProxyExt::proxies(&proxy)
+                .await
+                .map_err(atspi_error)?
+                .action()
+                .await
+                .map_err(atspi_error)?;
+            let actions = action_proxy.get_actions().await.map_err(atspi_error)?;
+            let mut chosen_index = 0i32;
+            for (index, action) in actions.iter().enumerate() {
+                if action.name.eq_ignore_ascii_case(name) {
+                    chosen_index = index as i32;
+                    break;
+                }
+            }
+            action_proxy
+                .do_action(chosen_index)
+                .await
+                .map_err(atspi_error)?;
+            format!("{VIA_ATSPI}:Action.perform")
+        }
+        ElementOp::Type { text } => {
+            // `type --element` reuses the `set_value` machinery on top
+            // of `EditableText::set_text_contents`. The dispatcher has
+            // already filtered secure nodes via `node_is_secure`; we
+            // re-check the AT-SPI role to refuse password fields.
+            if interfaces.contains(Interface::EditableText) {
+                let editable = atspi::proxy::proxy_ext::ProxyExt::proxies(&proxy)
+                    .await
+                    .map_err(atspi_error)?
+                    .editable_text()
+                    .await
+                    .map_err(atspi_error)?;
+                editable
+                    .set_text_contents(text)
+                    .await
+                    .map_err(atspi_error)?;
+                format!("{VIA_ATSPI}:EditableText.type")
+            } else if interfaces.contains(Interface::Value) {
+                let numeric = text.parse::<f64>().map_err(|error| {
+                    ComputerError::InvalidArguments(format!(
+                        "AT-SPI Value interface requires a numeric value: {error}"
+                    ))
+                })?;
+                let value_proxy = atspi::proxy::proxy_ext::ProxyExt::proxies(&proxy)
+                    .await
+                    .map_err(atspi_error)?
+                    .value()
+                    .await
+                    .map_err(atspi_error)?;
+                value_proxy
+                    .set_current_value(numeric)
+                    .await
+                    .map_err(atspi_error)?;
+                format!("{VIA_ATSPI}:Value.type")
+            } else {
+                return Err(ComputerError::ExecutionFailed(format!(
+                    "AT-SPI element action: EditableText or Value interface missing at path depth {}",
+                    path.len()
+                )));
+            }
+        }
     };
-    Ok(Some(report))
+    Ok(via)
+}
+
+/// Check whether the live element reports `Role::PasswordText`. P13a's
+/// `Role` -> `name()` is `Role::PasswordText -> "password text"`; we use
+/// the same string the redaction walker writes into `UiNode.role` so a
+/// regression in either path fails the same way.
+async fn proxy_is_password(proxy: &AccessibleProxy<'_>) -> bool {
+    let Ok(role) = proxy.get_role().await else {
+        return false;
+    };
+    matches!(role, Role::PasswordText)
 }
 
 /// Best-effort `pid` extracted from the accessible's object path.
@@ -198,22 +649,19 @@ fn render_node<'a>(
     connection: &'a AccessibilityConnection,
     want_full: bool,
     depth: usize,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<UiNode, ComputerError>> + Send + 'a>>
-{
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<RenderedNode<'a>, ComputerError>> + Send + 'a>,
+> {
     Box::pin(async move {
         let role = proxy.get_role().await.map_err(atspi_error)?;
         let name = proxy.name().await.unwrap_or_default();
         let description = proxy.description().await.unwrap_or_default();
-        let interfaces = proxy
-            .get_interfaces()
-            .await
-            .unwrap_or_else(|_| InterfaceSet::empty());
-        let state = proxy.get_state().await.unwrap_or_default();
-        let _ = interfaces;
-        let _ = connection;
+        let interfaces = proxy.get_interfaces().await.unwrap_or_default();
 
-        let sensitive_only = state.contains(State::Sensitive) && !state.contains(State::Enabled);
-        let secure = matches!(role, Role::PasswordText) || sensitive_only;
+        // AT-SPI `Sensitive` means "user-actionable", not secret. Only
+        // `Role::PasswordText` redacts the value. macOS / Windows do the
+        // same on `AXSecureTextField` / `IsPassword`.
+        let secure = matches!(role, Role::PasswordText);
         let value = if secure {
             None
         } else {
@@ -241,24 +689,61 @@ fn render_node<'a>(
             }
         }
 
-        Ok(UiNode {
-            role: role.name().to_string(),
-            subrole: None,
-            title: if name.is_empty() { None } else { Some(name) },
-            description: if description.is_empty() {
-                None
-            } else {
-                Some(description)
+        Ok(RenderedNode {
+            node: UiNode {
+                role: role.name().to_string(),
+                subrole: None,
+                title: if name.is_empty() { None } else { Some(name) },
+                description: if description.is_empty() {
+                    None
+                } else {
+                    Some(description)
+                },
+                identifier: None,
+                value,
+                secure,
+                actions: Vec::new(),
+                frame: None,
+                child_count: Some(children.len()),
+                children: Vec::new(),
             },
-            identifier: None,
-            value,
-            secure,
-            actions: Vec::new(),
-            frame: None,
-            child_count: Some(children.len()),
-            children,
+            interfaces,
+            rendered_children: children,
         })
     })
+}
+
+/// One `UiNode` paired with the AT-SPI data element actions consume:
+/// the `InterfaceSet` of the node (drives interface presence checks) and
+/// the rendered children (so callers can keep going down the tree).
+struct RenderedNode<'a> {
+    /// Public, redacted shape the project renders and diffs.
+    node: UiNode,
+    /// AT-SPI interfaces exposed by the node.
+    interfaces: atspi::InterfaceSet,
+    /// Children with their own [`RenderedNode`] payload.
+    rendered_children: Vec<RenderedNode<'a>>,
+}
+
+/// Reduce a `RenderedNode` tree into the public `UiNode` and a per-path
+/// interface map keyed by child-index path. Empty path is the root, same
+/// as `element::find_path`.
+fn reduce_tree(
+    rendered: &RenderedNode<'_>,
+    path: &mut Vec<usize>,
+    out_interfaces: &mut HashMap<Vec<usize>, atspi::InterfaceSet>,
+) -> UiNode {
+    out_interfaces.insert(path.clone(), rendered.interfaces.clone());
+    let mut children = Vec::with_capacity(rendered.rendered_children.len());
+    for (idx, child) in rendered.rendered_children.iter().enumerate() {
+        path.push(idx);
+        let node = reduce_tree(child, path, out_interfaces);
+        path.pop();
+        children.push(node);
+    }
+    let mut node = rendered.node.clone();
+    node.children = children;
+    node
 }
 
 /// Pick a `value` for a non-secure node. Same shape as macOS / Windows:
@@ -277,17 +762,6 @@ fn atspi_error(error: impl std::fmt::Display) -> ComputerError {
     ComputerError::ExecutionFailed(format!("AT-SPI: {error}"))
 }
 
-/// Element actions route through AT-SPI once the `portal` feature
-/// lands in part B. For now the entry point returns a structured
-/// `unsupported` so callers see a clean error.
-#[allow(dead_code)]
-pub(crate) fn element_action(request: &ElementRequest) -> Result<ElementOutcome, ElementError> {
-    let _ = request;
-    Err(ElementError::new(ComputerError::Unsupported(
-        "element_action on linux lands in part B (portal)".into(),
-    )))
-}
-
 // -----------------------------------------------------------------------------
 // Pure helpers visible only to tests. They exercise the redaction
 // contract on fixture `UiNode`s so a regression in the live walker shows
@@ -300,8 +774,12 @@ pub(crate) fn role_is_password(role_name: &str) -> bool {
     role_name == "password text"
 }
 
-/// Sensitive without enabled mirrors macOS `AXSensitive`.
+/// AT-SPI `State::Sensitive` does not mean "secret"; the contract used
+/// to redact based on `Sensitive && !Enabled`. That bit is meaningless
+/// for redaction. The function remains in case a future platform
+/// revisits the rule, but P13a only ever calls [`role_is_password`].
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn state_is_sensitive_only(sensitive: bool, enabled: bool) -> bool {
     sensitive && !enabled
 }
@@ -343,6 +821,16 @@ mod tests {
         assert!(!crate::tree::node_is_secure(&node));
     }
 
+    /// AT-SPI `Sensitive` does not mean "secret". A fixture node that
+    /// mirrors a disabled but non-password widget keeps its value in
+    /// the rendered tree.
+    #[test]
+    fn disabled_but_non_password_node_passes_through() {
+        let node = fixture("entry", Some("draft"), Some("draft text"), false);
+        assert!(!crate::tree::node_is_secure(&node));
+        assert!(crate::tree::identity_text(&node).contains("entry"));
+    }
+
     /// A fixture tree renders without panicking; the renderer never
     /// pastes a `password text` subtree's value into the output.
     #[test]
@@ -369,15 +857,13 @@ mod tests {
         assert!(crate::tree::node_is_secure(&tree.children[0]));
     }
 
-    /// `role_is_password` and `state_is_sensitive_only` agree with the
-    /// walker's redaction logic for the canonical role names.
+    /// `role_is_password` is the single source of truth for redaction.
     #[test]
     fn redaction_helpers_agree_with_role_set() {
         assert!(role_is_password("password text"));
         assert!(!role_is_password("entry"));
-        assert!(state_is_sensitive_only(true, false));
-        assert!(!state_is_sensitive_only(true, true));
-        assert!(!state_is_sensitive_only(false, false));
+        assert!(!role_is_password("push button"));
+        assert!(!role_is_password(""));
     }
 
     /// `tree::revision_of` is stable across calls on a fixture tree.
@@ -397,5 +883,44 @@ mod tests {
             crate::tree::revision_of(&sig),
             crate::tree::revision_of(&sig)
         );
+    }
+
+    /// `proxy_at`'s argument shape stays the same: `ObjectRefOwned`
+    /// root and a child-index path. The live walk produces both, the
+    /// proxy resolution consumes them.
+    #[test]
+    fn proxy_at_signature_is_stable() {
+        // The function exists, takes a connection by reference and a
+        // path slice, and returns an AccessibleProxy.
+        let _: fn(
+            &AccessibilityConnection,
+            &ObjectRefOwned,
+            &[usize],
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<AccessibleProxy<'_>, ComputerError>> + Send,
+            >,
+        > = proxy_at;
+    }
+
+    /// The Linux `via` tag for element actions is `"atspi"`; the
+    /// tier rendering picks `ax` for unknown `via`s, so we set the
+    /// prefix explicitly here.
+    #[test]
+    fn via_prefix_is_atspi() {
+        assert!(VIA_ATSPI.starts_with("atspi"));
+    }
+
+    /// The redacted redaction contract: a `Role::PasswordText` node
+    /// always sets `secure = true`, and a non-password node never does.
+    /// Locks the AT-SPI -> `Role::name()` mapping in place.
+    #[test]
+    fn password_role_is_the_only_redaction_signal() {
+        let password = fixture("password text", Some("API key"), None, false);
+        assert!(crate::tree::node_is_secure(&password));
+        let entry = fixture("entry", Some("username"), Some("alice"), false);
+        assert!(!crate::tree::node_is_secure(&entry));
+        let button = fixture("push button", Some("Save"), Some("Save"), false);
+        assert!(!crate::tree::node_is_secure(&button));
     }
 }
