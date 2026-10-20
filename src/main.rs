@@ -743,12 +743,27 @@ enum CliBrowserCommand {
         target: Option<String>,
     },
 
-    /// Type `text` into the focused element or the one matched by `--selector`.
+    /// Read the `innerText` of the first element matched by CSS `--selector`.
+    /// The current page URL is checked against `[browser].blocked_urls` first.
+    /// A selector that matches nothing returns `element_not_found`.
     Text {
+        /// CSS selector whose `innerText` should be returned.
+        #[arg(long, value_name = "SELECTOR")]
+        selector: String,
+        /// Restrict to one tab by `targetId`. Optional.
+        #[arg(long, value_name = "TARGET")]
+        target: Option<String>,
+    },
+
+    /// Type `text` into the element matched by `--selector` (or the page body
+    /// when no selector is given). Classified like `type`: the body is never
+    /// stored, only its character count. The current page URL is checked
+    /// against `[browser].blocked_urls` first.
+    Type {
         /// Text to type.
         #[arg(long, value_name = "TEXT")]
         text: String,
-        /// Optional CSS selector. When omitted the focused element receives input.
+        /// Optional CSS selector. When omitted the page body receives input.
         #[arg(long, value_name = "SELECTOR")]
         selector: Option<String>,
         /// Restrict to one tab by `targetId`. Optional.
@@ -1337,11 +1352,15 @@ fn browser_action(
             selector: selector.clone(),
             target_id: target.clone(),
         },
-        CliBrowserCommand::Text {
+        CliBrowserCommand::Text { selector, target } => Action::BrowserText {
+            selector: selector.clone(),
+            target_id: target.clone(),
+        },
+        CliBrowserCommand::Type {
             text,
             selector,
             target,
-        } => Action::BrowserText {
+        } => Action::BrowserType {
             text: text.clone(),
             selector: selector.clone(),
             target_id: target.clone(),

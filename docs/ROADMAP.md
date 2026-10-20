@@ -965,11 +965,32 @@ Feature `cdp` only. Off by default.
 ### Design
 `src/browser/cdp.rs` uses `chromiumoxide` 0.9.1 on a current-thread `tokio` runtime created for the call and dropped after it. `DesktopBackend` stays sync. The runtime is created on the CLI thread, never inside a tokio worker.
 
-Attach only. Do not spawn a new Chrome. Discover an existing port by reading the target pid's command line for `--remote-debugging-port=N` (`/proc` on Linux, `sysctl` KERN_PROCARGS2 on macOS, `Win32` command-line query on Windows). Otherwise require `--cdp-url ws://127.0.0.1:9222`. The command also requires `--cdp` so a binary built with the feature still does nothing until the flag is present.
+Attach only. **Never spawn a new Chrome and never call `Browser::new_page`.** Discover an existing port by reading the target pid's command line for `--remote-debugging-port=N` (`/proc` on Linux, `sysctl` KERN_PROCARGS2 on macOS, `Win32` command-line query on Windows). Otherwise require `--cdp-url ws://127.0.0.1:9222`. The command also requires `--cdp` so a binary built with the feature still does nothing until the flag is present.
 
-Operations: list targets, activate a target, `Page.navigate`, CSS `querySelector`, click by selector (element box center, then the normal click path in image or screen space), `innerText` of a selector, and `Runtime.evaluate` only when `--eval` is also set. `evaluate` is off by default because it is an arbitrary script channel.
+When the caller does not pass `--target` and no `page` target exists in the attached browser, every operation returns `cdp_unavailable` with the stable phrasing `no page target found ... computer-use is attach-only and will not create new pages`. A new tab must be opened in Chrome by hand before retrying.
 
-Navigation and the current URL go through `policy::blocked_url` before `Page.navigate`. A blocked URL never reaches the socket.
+Operations: list targets, activate a target, `Page.navigate`, CSS `querySelector`, click by selector (see *Click path* below), `innerText` of a selector, type into a selector (or the page body), and `Runtime.evaluate` only when `--eval` is also set. `evaluate` is off by default because it is an arbitrary script channel.
+
+**URL checks** go through `policy::url_blocked` twice:
+
+1. The *requested* URL is checked before any websocket is opened. `browser navigate --url <blocked>` returns `blocked_url` and never opens the websocket.
+2. The *current* page URL is read after attach and checked against the same list. This blocks `click`, `text`, `type`, `eval`, and `activate` against a tab that has already landed on a denied URL, so a follow-up op never sends data into a blocked page.
+
+### Read vs type (`browser text` and `browser type`)
+
+`browser text --selector S` reads the first element's `innerText` and returns it in the result; it does not type. The selector is required. A selector that matches nothing returns `element_not_found` (mapped from `chromiumoxide`'s `CdpError::Chrome` / `ChromeMessage` messages that contain `no node` or `node with given id ... not found`).
+
+Typing lives in a separate `browser type --selector S --text T` / `Action::BrowserType` action (no selector means the page body). It is classified like `Action::Type` for audit purposes: the text body is never stored, only its character count appears in the audit row. `BrowserType` is `Mutate`; `BrowserText` is `Observe` (read-only).
+
+### Click path
+
+Spec asked for the element box centre to flow through the same path as a screen-space click (window bounds + `window.screenX/Y` + `outerHeight-innerHeight` + devicePixelRatio). We **kept the CDP `Input.dispatchMouseEvent` tier instead** because:
+
+- Chrome owns its own window; a separate process would have to read the bounds via the Accessibility API or window list, then map CSS px -> device px, then map window-relative -> screen via display configuration. Each link is OS-specific and has no public CDP equivalent.
+- The result of CDP click already lands in Chrome's own gesture/IME path; layering screen-space mouse simulation on top would race with Chrome's input pipeline.
+- The CDP path is reliable enough for an automation attach, and the JSON result already names the tier.
+
+The deviation is documented here and in `src/browser/cdp.rs::click`. A future revision can return a JSON `tier: "cdp"` field if a caller needs to know which path ran.
 
 ### CLI
 ```
@@ -977,6 +998,7 @@ computer-use browser tabs --cdp --app "Google Chrome"
 computer-use browser navigate --cdp --url https://example.com
 computer-use browser click --cdp --selector "button.save"
 computer-use browser text --cdp --selector "h1"
+computer-use browser type --cdp --selector "#name" --text "hello"
 ```
 
 ### JSON
@@ -985,14 +1007,17 @@ computer-use browser text --cdp --selector "h1"
 {"action":"browser_navigate","cdp":true,"url":"https://example.com"}
 {"action":"browser_click","cdp":true,"selector":"button.save"}
 {"action":"browser_text","cdp":true,"selector":"h1"}
+{"action":"browser_type","cdp":true,"text":"hello","selector":"#name"}
 ```
 
 ### Failure modes
-`unsupported` when the feature is off. `cdp_unavailable` when no port and no `--cdp-url`. `blocked_url` before navigate. `element_not_found` when the selector matches nothing. `policy_denied` when the browser bundle is denied.
+`unsupported` when the feature is off. `cdp_unavailable` when no port and no `--cdp-url`, when the websocket cannot connect, or when no `page` target exists. `blocked_url` for `navigate` before the websocket opens *and* for `click` / `text` / `type` / `eval` / `activate` against a tab whose current URL matches `[browser].blocked_urls`. `element_not_found` when the selector matches nothing. `policy_denied` when the browser bundle is denied.
 
 ### Tests
-- Adapter from a fixture WebSocket is not required. Test URL blocking, command-line port parsing, and the "feature off" error with `#[cfg(not(feature = "cdp"))]`.
+- Adapter from a fixture WebSocket is not required. Test URL blocking, command-line port parsing, error mapping (`map_cdp_error`), the "no page target" message, and the "feature off" error with `#[cfg(not(feature = "cdp"))]`.
 - With the feature, a unit test builds the request types. Do not launch Chrome in CI.
+- A CLI integration test writes a temp `policy.toml`, runs `browser navigate --cdp --cdp-url ws://127.0.0.1:1 --url <blocked>` and asserts `blocked_url` *without* connecting (the connect would otherwise report `cdp_unavailable`).
+- Another CLI integration test confirms `browser tabs --cdp --app "Google Chrome"` returns `cdp_unavailable` when no Chrome is running.
 - `--all-features` clippy is the compile check on all three OS.
 
 ## P11 — Vision fallback and set-of-marks

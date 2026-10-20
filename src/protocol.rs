@@ -447,13 +447,28 @@ pub enum Action {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target_id: Option<String>,
     },
-    /// Type `text` into the focused element (or the one matched by `selector`).
-    /// Requires `--features cdp`.
+    /// Read the `innerText` of the first element matched by CSS `selector`.
+    /// Requires `--features cdp`. The current page URL is checked against
+    /// `[browser].blocked_urls` first; a selector that matches nothing returns
+    /// `element_not_found`.
     #[serde(rename = "browser_text", alias = "browser-text")]
     BrowserText {
+        /// CSS selector whose `innerText` should be returned.
+        selector: String,
+        /// Restrict to one tab. Optional.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_id: Option<String>,
+    },
+    /// Type `text` into the element matched by `selector` (or the page body
+    /// when no selector is given). Requires `--features cdp`. Classified like
+    /// [`Action::Type`] for audit: the body is never stored, only its
+    /// character count. The current page URL is checked against
+    /// `[browser].blocked_urls` first.
+    #[serde(rename = "browser_type", alias = "browser-type")]
+    BrowserType {
         /// Text to type.
         text: String,
-        /// Optional CSS selector. When omitted the focused element receives input.
+        /// Optional CSS selector. When omitted the page body receives input.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         selector: Option<String>,
         /// Restrict to one tab. Optional.
@@ -1147,10 +1162,19 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
             target_id.clone(),
         )),
         Action::BrowserText {
-            text,
             selector,
             target_id,
         } => result_response(browser_text(
+            context,
+            &prepared.subject,
+            selector.clone(),
+            target_id.clone(),
+        )),
+        Action::BrowserType {
+            text,
+            selector,
+            target_id,
+        } => result_response(browser_type(
             context,
             &prepared.subject,
             text.clone(),
@@ -1326,6 +1350,7 @@ fn action_label(action: &Action) -> &'static str {
         Action::BrowserNavigate { .. } => "browser_navigate",
         Action::BrowserClick { .. } => "browser_click",
         Action::BrowserText { .. } => "browser_text",
+        Action::BrowserType { .. } => "browser_type",
         Action::BrowserEval { .. } => "browser_eval",
     }
 }
@@ -1362,6 +1387,7 @@ fn policy_class(action: &Action) -> PolicyClass {
         | Action::DockList { .. }
         | Action::Spaces { .. }
         | Action::BrowserTabs { .. }
+        | Action::BrowserText { .. }
         | Action::BrowserActivate { .. } => PolicyClass::Observe,
         Action::Quit { .. } => PolicyClass::Quit,
         Action::Key { .. } | Action::HoldKey { .. } => PolicyClass::Key,
@@ -1843,6 +1869,7 @@ fn post_state_kind(action: &Action) -> PostKind {
         | Action::BrowserNavigate { .. }
         | Action::BrowserClick { .. }
         | Action::BrowserText { .. }
+        | Action::BrowserType { .. }
         | Action::BrowserEval { .. }
         | Action::BrowserActivate { .. } => PostKind::Mutating,
         Action::GetState
@@ -3080,7 +3107,7 @@ fn clipboard_chars(action: &Action) -> Option<u64> {
         Action::ClipboardSet {
             text: Some(text), ..
         } => Some(u64::try_from(text.chars().count()).unwrap_or(u64::MAX)),
-        Action::BrowserText { text, .. } => {
+        Action::BrowserType { text, .. } => {
             Some(u64::try_from(text.chars().count()).unwrap_or(u64::MAX))
         }
         _ => None,
@@ -5785,6 +5812,134 @@ mod tests {
             .unwrap()
             .contains("not both"));
     }
+
+    // ----- P10 gap fixes -----
+
+    #[test]
+    fn browser_text_action_round_trips_with_only_selector() {
+        let text: Action =
+            serde_json::from_str(r#"{"action":"browser_text","selector":"h1"}"#).unwrap();
+        match &text {
+            Action::BrowserText {
+                selector,
+                target_id,
+            } => {
+                assert_eq!(selector, "h1");
+                assert!(target_id.is_none());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let encoded = serde_json::to_string(&text).unwrap();
+        let decoded: Action = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, text);
+    }
+
+    #[test]
+    fn browser_type_action_round_trips_with_text_and_optional_selector() {
+        let action: Action =
+            serde_json::from_str(r##"{"action":"browser_type","text":"hi","selector":"#name"}"##)
+                .unwrap();
+        match &action {
+            Action::BrowserType {
+                text,
+                selector,
+                target_id,
+            } => {
+                assert_eq!(text, "hi");
+                assert_eq!(selector.as_deref(), Some("#name"));
+                assert!(target_id.is_none());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let encoded = serde_json::to_string(&action).unwrap();
+        let decoded: Action = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, action);
+    }
+
+    #[test]
+    fn browser_text_label_is_browser_text_and_class_is_observe() {
+        // BrowserText reads innerText; classified Observe (read-only).
+        let action = Action::BrowserText {
+            selector: "h1".into(),
+            target_id: None,
+        };
+        assert_eq!(action_label(&action), "browser_text");
+        assert!(matches!(policy_class(&action), PolicyClass::Observe));
+    }
+
+    #[test]
+    fn browser_type_label_is_browser_type_and_class_is_mutate() {
+        // BrowserType types text; classified Mutate (write). The text body
+        // never leaves the audit row — only the char count does.
+        let action = Action::BrowserType {
+            text: "abc".into(),
+            selector: Some("#name".into()),
+            target_id: None,
+        };
+        assert_eq!(action_label(&action), "browser_type");
+        assert!(matches!(policy_class(&action), PolicyClass::Mutate));
+        assert_eq!(clipboard_chars(&action), Some(3));
+    }
+
+    #[test]
+    fn browser_text_does_not_record_chars_in_audit() {
+        // Reading innerText must not push a chars count into the audit row.
+        let action = Action::BrowserText {
+            selector: "h1".into(),
+            target_id: None,
+        };
+        assert_eq!(clipboard_chars(&action), None);
+    }
+
+    #[test]
+    #[cfg(feature = "cdp")]
+    fn browser_navigate_blocks_url_before_connecting() {
+        // Use a deliberately unreachable WebSocket URL. If the URL block ran
+        // before the connect attempt, we get blocked_url. If the order were
+        // wrong we would see cdp_unavailable from the connection failure.
+        let backend = StubBackend::default();
+        let context = CallContext {
+            cdp: true,
+            cdp_url: Some("ws://127.0.0.1:1".into()),
+            browser_blocked_urls: vec!["https://blocked.example.com".into()],
+            ..CallContext::default()
+        };
+        let response = dispatch_with_context(
+            &backend,
+            Action::BrowserNavigate {
+                url: "https://blocked.example.com".into(),
+                target_id: None,
+            },
+            &context,
+        );
+        assert!(!response.ok);
+        let value = response.to_value();
+        assert_eq!(value["error"]["code"], "blocked_url");
+    }
+
+    #[test]
+    #[cfg(feature = "cdp")]
+    fn browser_navigate_unblocked_url_still_attempts_connect() {
+        // Sanity: without a matching pattern, navigate goes through the
+        // normal path and reports the connect failure (cdp_unavailable).
+        let backend = StubBackend::default();
+        let context = CallContext {
+            cdp: true,
+            cdp_url: Some("ws://127.0.0.1:1".into()),
+            ..CallContext::default()
+        };
+        let response = dispatch_with_context(
+            &backend,
+            Action::BrowserNavigate {
+                url: "https://example.com".into(),
+                target_id: None,
+            },
+            &context,
+        );
+        assert!(!response.ok);
+        let value = response.to_value();
+        assert_eq!(value["error"]["code"], "cdp_unavailable");
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -5889,21 +6044,35 @@ fn browser_click(
 fn browser_text(
     context: &CallContext,
     subject: &policy::Subject,
+    selector: String,
+    target_id: Option<String>,
+) -> Result<Value, ComputerError> {
+    browser_require_cdp(context)?;
+    let opts = browser_action_options(context, subject, target_id);
+    let text = crate::browser::cdp::read_inner_text(&crate::browser::ActionOptions {
+        selector: Some(selector.clone()),
+        ..opts
+    })?;
+    Ok(json!({ "selector": selector, "text": text }))
+}
+
+fn browser_type(
+    context: &CallContext,
+    subject: &policy::Subject,
     text: String,
     selector: Option<String>,
     target_id: Option<String>,
 ) -> Result<Value, ComputerError> {
     browser_require_cdp(context)?;
     let opts = browser_action_options(context, subject, target_id);
-    let chars = text.chars().count() as u64;
     crate::browser::cdp::type_text(&crate::browser::ActionOptions {
         selector,
         text: Some(text.clone()),
         ..opts
     })?;
-    // P10 audit row sees only the character count, not the script body, for
-    // `browser eval` this is tracked separately.
-    Ok(json!({ "chars": chars }))
+    // Audit captures the character count via `clipboard_chars`; the text body
+    // never leaves this function.
+    Ok(json!({ "chars": text.chars().count() as u64 }))
 }
 
 fn browser_eval(

@@ -620,6 +620,7 @@ fn browser_subcommand_help_lists_subs() {
     assert!(stdout.contains("navigate"));
     assert!(stdout.contains("click"));
     assert!(stdout.contains("text"));
+    assert!(stdout.contains("type"));
     assert!(stdout.contains("eval"));
 }
 
@@ -632,4 +633,97 @@ fn browser_navigate_in_exec_without_cdp_returns_unsupported() {
     let value: Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
     assert_eq!(value["ok"], false);
     assert_eq!(value["error"]["code"], "unsupported");
+}
+
+#[test]
+#[cfg(feature = "cdp")]
+fn browser_text_in_exec_without_cdp_returns_unsupported() {
+    // `browser_text` now reads innerText; class Observe. Without the --cdp
+    // flag, dispatch refuses with `unsupported` regardless of payload.
+    let body = r#"{"action":"browser_text","selector":"h1"}"#;
+    let output = run(&["exec", body]);
+    let value: Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["code"], "unsupported");
+}
+
+#[test]
+#[cfg(feature = "cdp")]
+fn browser_type_in_exec_without_cdp_returns_unsupported() {
+    let body = r##"{"action":"browser_type","text":"hi","selector":"#name"}"##;
+    let output = run(&["exec", body]);
+    let value: Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["code"], "unsupported");
+}
+
+#[test]
+#[cfg(feature = "cdp")]
+fn browser_navigate_blocks_url_before_connecting_with_temp_policy() {
+    // Spin up a temp policy.toml blocking https://blocked.example.com/*. With
+    // --cdp pointing at an unreachable port, navigate must return
+    // blocked_url without ever trying to connect. We pass `--policy` because
+    // tests do not read the ambient XDG_CONFIG_HOME.
+    let policy_dir =
+        std::env::temp_dir().join(format!("computer-use-cli-p10-block-{}", std::process::id()));
+    std::fs::create_dir_all(&policy_dir).expect("policy dir");
+    let policy_path = policy_dir.join("policy.toml");
+    std::fs::write(
+        &policy_path,
+        "version = 1\n\n[browser]\nblocked_urls = [\"https://blocked.example.com/*\"]\n",
+    )
+    .expect("policy file");
+
+    let policy_path_string = policy_path.to_string_lossy().to_string();
+    let output = Command::new(bin())
+        .args([
+            "--cdp",
+            "--cdp-url",
+            "ws://127.0.0.1:1",
+            "--policy",
+            &policy_path_string,
+            "browser",
+            "navigate",
+            "--url",
+            "https://blocked.example.com/page",
+        ])
+        .env("XDG_CACHE_HOME", cache_home())
+        .env("XDG_CONFIG_HOME", config_home())
+        .env("XDG_STATE_HOME", state_home())
+        .env("COMPUTER_USE_ADMIN_POLICY", missing_admin())
+        .env_remove("COMPUTER_USE_CONFIRM_CMD")
+        .output()
+        .expect("binary run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: Value = serde_json::from_str(&stdout).expect("json response");
+    assert_eq!(value["ok"], false, "stderr: {stdout}");
+    assert_eq!(
+        value["error"]["code"], "blocked_url",
+        "expected blocked_url before the connect attempt; got {stdout}"
+    );
+    let _ = std::fs::remove_file(&policy_path);
+}
+
+#[test]
+#[cfg(feature = "cdp")]
+fn browser_tabs_against_missing_chrome_returns_cdp_unavailable() {
+    // With --app pointing at a name we know is not running, attach must
+    // fail with cdp_unavailable (transport error), not new_page. There is
+    // no fallback.
+    let output = Command::new(bin())
+        .args(["--cdp", "--app", "Google Chrome", "browser", "tabs"])
+        .env("XDG_CACHE_HOME", cache_home())
+        .env("XDG_CONFIG_HOME", config_home())
+        .env("XDG_STATE_HOME", state_home())
+        .env("COMPUTER_USE_ADMIN_POLICY", missing_admin())
+        .env_remove("COMPUTER_USE_CONFIRM_CMD")
+        .output()
+        .expect("binary run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: Value = serde_json::from_str(&stdout).expect("json response");
+    assert_eq!(value["ok"], false, "stderr: {stdout}");
+    assert_eq!(
+        value["error"]["code"], "cdp_unavailable",
+        "expected cdp_unavailable (no chrome / no page target); got {stdout}"
+    );
 }

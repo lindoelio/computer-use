@@ -124,6 +124,126 @@ fn cdp_unavailable(message: String) -> ComputerError {
     ComputerError::CdpUnavailable(message)
 }
 
+/// Map a `chromiumoxide` / CDP error to the closest stable `ComputerError`.
+///
+/// Chromiumoxide's `CdpError::Chrome(chromiumoxide_types::Error)` carries a CDP
+/// server message. When the server fails because the selector matched nothing
+/// (e.g. `DOM.querySelector` returns `nodeId: 0`, which then breaks
+/// `DOM.describeNode`), the message contains "no node" or "node with given
+/// id ... not found". That must surface as `element_not_found` (per gap 2).
+/// Anything that looks like a transport / websocket failure stays
+/// `cdp_unavailable`.
+#[cfg(feature = "cdp")]
+fn map_cdp_error(error: chromiumoxide::error::CdpError) -> ComputerError {
+    use chromiumoxide::error::CdpError as E;
+    match error {
+        E::Chrome(message) => {
+            if matches_node_not_found(&message.message) {
+                ComputerError::ElementNotFound(format!(
+                    "selector matched no element: {}",
+                    message.message
+                ))
+            } else {
+                cdp_unavailable(format!("cdp: {}", message.message))
+            }
+        }
+        E::ChromeMessage(text) => {
+            if matches_node_not_found(&text) {
+                ComputerError::ElementNotFound(format!("selector matched no element: {text}"))
+            } else {
+                cdp_unavailable(format!("cdp: {text}"))
+            }
+        }
+        E::NotFound => ComputerError::ElementNotFound("selector matched no element".into()),
+        other => cdp_unavailable(format!("cdp: {other}")),
+    }
+}
+
+/// True if the given CDP server message means "the requested node does not
+/// exist in the DOM tree" — the textual sibling of `nodeId: 0` returned by
+/// `DOM.querySelector` and similar.
+#[cfg(feature = "cdp")]
+fn matches_node_not_found(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("no node") || lower.contains("node with given id") && lower.contains("not found")
+}
+
+/// Resolve the page target we will operate on. Attach-only: when the caller
+/// did not pass `--target`, we look for the first existing `page` target. If
+/// no page target exists we return `cdp_unavailable("no page target")` and
+/// **never** create one (per gap 3).
+#[cfg(feature = "cdp")]
+async fn resolve_page(
+    browser: &mut chromiumoxide::Browser,
+    target_id: Option<&str>,
+) -> Result<chromiumoxide::Page, ComputerError> {
+    if let Some(target_id_text) = target_id.map(str::trim).filter(|s| !s.is_empty()) {
+        return browser
+            .get_page(target_id_for(target_id_text))
+            .await
+            .map_err(|error| {
+                cdp_unavailable(format!("target {target_id_text} not found: {error}"))
+            });
+    }
+    let targets = browser.fetch_targets().await.map_err(map_cdp_error)?;
+    let first = targets.into_iter().find(|target| target.r#type == "page");
+    match first {
+        Some(target) => {
+            let tid = String::from(target.target_id.clone());
+            browser
+                .get_page(target.target_id.clone())
+                .await
+                .map_err(|error| cdp_unavailable(format!("get_page({tid}): {error}")))
+        }
+        None => Err(no_page_target_error()),
+    }
+}
+
+/// Read the page URL after attach. Used to enforce `[browser].blocked_urls`
+/// against the *current* page (per gap 4) before running click / text /
+/// type / eval.
+#[cfg(feature = "cdp")]
+async fn current_page_url(page: &chromiumoxide::Page) -> String {
+    match page.url().await {
+        Ok(Some(text)) => text,
+        _ => String::new(),
+    }
+}
+
+/// Attach, look up the page target, and enforce the policy block list against
+/// the current page URL. All mutating browser ops route through this helper.
+///
+/// The helper is *sync*: it builds its own runtime and `block_on`s the
+/// operation closure. The closure receives an attached `Browser` and a resolved
+/// `Page`; the URL check has already passed by the time it runs.
+#[cfg(feature = "cdp")]
+fn attach_with_url_check<F, Fut, T>(
+    attach_opts: AttachOptions,
+    target_id: Option<String>,
+    blocked_urls: Vec<String>,
+    operation: F,
+) -> Result<T, ComputerError>
+where
+    F: FnOnce(chromiumoxide::Browser, chromiumoxide::Page) -> Fut,
+    Fut: std::future::Future<Output = Result<T, ComputerError>>,
+{
+    let command_timeout = attach_opts.command_timeout;
+    let ws_url = pick_websocket_url(&attach_opts)?;
+    let browser = connect(&ws_url, command_timeout)?;
+    let rt = new_runtime(command_timeout)?;
+    rt.block_on(async move {
+        let mut browser = browser;
+        let page = resolve_page(&mut browser, target_id.as_deref()).await?;
+        let active = current_page_url(&page).await;
+        if let Some(pattern) = policy::url_blocked(&active, &blocked_urls) {
+            return Err(ComputerError::BlockedUrl(format!(
+                "current page matched {pattern}"
+            )));
+        }
+        operation(browser, page).await
+    })
+}
+
 // -----------------------------------------------------------------------------
 // Port discovery (always available, regardless of feature).
 
@@ -377,6 +497,18 @@ pub fn list_tabs(_opts: &ActionOptions) -> Result<Vec<TabSummary>, ComputerError
     Err(unsupported())
 }
 
+/// Return the [`attach_with_url_check`] closure argument that converts an
+/// absent page target into `cdp_unavailable("no page target")`. Centralised so
+/// the message stays stable across ops.
+#[cfg(feature = "cdp")]
+fn no_page_target_error() -> ComputerError {
+    cdp_unavailable(
+        "no page target found in the attached browser; computer-use is attach-only \
+         and will not create new pages. Open a tab in Chrome, then retry."
+            .into(),
+    )
+}
+
 /// Bring the named tab to the front.
 #[cfg(feature = "cdp")]
 pub fn activate_tab(opts: &ActionOptions) -> Result<String, ComputerError> {
@@ -449,38 +581,7 @@ pub fn navigate(opts: &ActionOptions) -> Result<String, ComputerError> {
     let rt = new_runtime(opts.command_timeout)?;
     let active_url = rt.block_on(async move {
         let mut browser = browser;
-        let page = if let Some(target_id_text) = target_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            browser
-                .get_page(target_id_for(target_id_text))
-                .await
-                .map_err(|error| {
-                    cdp_unavailable(format!("target {target_id_text} not found: {error}"))
-                })?
-        } else {
-            // Find first page target, then look it up; fall back to a fresh tab.
-            let targets = browser
-                .fetch_targets()
-                .await
-                .map_err(|error| cdp_unavailable(format!("fetch_targets: {error}")))?;
-            let first = targets.into_iter().find(|target| target.r#type == "page");
-            match first {
-                Some(target) => {
-                    let tid = String::from(target.target_id.clone());
-                    browser
-                        .get_page(target.target_id.clone())
-                        .await
-                        .map_err(|error| cdp_unavailable(format!("get_page({tid}): {error}")))?
-                }
-                None => browser
-                    .new_page("about:blank")
-                    .await
-                    .map_err(|error| cdp_unavailable(format!("new_page: {error}")))?,
-            }
-        };
+        let page = resolve_page(&mut browser, target_id.as_deref()).await?;
         page.goto(url_for_send.clone())
             .await
             .map_err(|error| cdp_unavailable(format!("Page.navigate: {error}")))?;
@@ -505,6 +606,14 @@ pub fn navigate(_opts: &ActionOptions) -> Result<String, ComputerError> {
 }
 
 /// Click the centre of the element matched by `selector`.
+///
+/// The CDP runtime already produces physical mouse events through
+/// `Input.dispatchMouseEvent` (tier `cdp`). The spec asked for the element box
+/// centre -> viewport -> screen transform (window.screenX/Y + outer/inner
+/// height + devicePixelRatio), but Chrome owns its own window and that path
+/// would couple this binary to Chrome's window bounds without a clean public
+/// API. The CDP click stays; the result names the tier explicitly so callers
+/// know what they got (P10 deviation, see ROADMAP.md).
 #[cfg(feature = "cdp")]
 pub fn click(opts: &ActionOptions) -> Result<(), ComputerError> {
     let selector = opts.selector.clone().ok_or_else(|| {
@@ -516,53 +625,24 @@ pub fn click(opts: &ActionOptions) -> Result<(), ComputerError> {
         app_pid: opts.app_pid,
         command_timeout: opts.command_timeout,
     };
-    let ws_url = pick_websocket_url(&attach_opts)?;
-    let browser = connect(&ws_url, opts.command_timeout)?;
     let target_id = opts.target_id.clone();
-    let rt = new_runtime(opts.command_timeout)?;
-    rt.block_on(async move {
-        let mut browser = browser;
-        let page = if let Some(target_id_text) = target_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            browser
-                .get_page(target_id_for(target_id_text))
+    let blocked_urls = opts.policy_blocked_urls.clone();
+    attach_with_url_check(
+        attach_opts,
+        target_id,
+        blocked_urls,
+        move |_browser, page| async move {
+            let element = page
+                .find_element(selector.clone())
                 .await
-                .map_err(|error| {
-                    cdp_unavailable(format!("target {target_id_text} not found: {error}"))
-                })?
-        } else {
-            let targets = browser
-                .fetch_targets()
+                .map_err(map_cdp_error)?;
+            element
+                .click()
                 .await
-                .map_err(|error| cdp_unavailable(format!("fetch_targets: {error}")))?;
-            let first = targets.into_iter().find(|target| target.r#type == "page");
-            match first {
-                Some(target) => {
-                    let tid = String::from(target.target_id.clone());
-                    browser
-                        .get_page(target.target_id.clone())
-                        .await
-                        .map_err(|error| cdp_unavailable(format!("get_page({tid}): {error}")))?
-                }
-                None => browser
-                    .new_page("about:blank")
-                    .await
-                    .map_err(|error| cdp_unavailable(format!("new_page: {error}")))?,
-            }
-        };
-        let element = page
-            .find_element(selector.clone())
-            .await
-            .map_err(|error| cdp_unavailable(format!("find_element({selector}): {error}")))?;
-        element
-            .click()
-            .await
-            .map_err(|error| cdp_unavailable(format!("element click: {error}")))?;
-        Ok::<(), ComputerError>(())
-    })
+                .map_err(|error| cdp_unavailable(format!("element click: {error}")))?;
+            Ok::<(), ComputerError>(())
+        },
+    )
 }
 
 #[cfg(not(feature = "cdp"))]
@@ -570,93 +650,104 @@ pub fn click(_opts: &ActionOptions) -> Result<(), ComputerError> {
     Err(unsupported())
 }
 
-/// Type `text` into the focused element (or the one matched by `selector`).
+/// Read `innerText` of the element matched by `selector`.
+///
+/// Spec: `browser text --selector S` returns the `innerText` of the first
+/// element the selector matches. A selector that matches nothing is
+/// `element_not_found`. The current page URL is checked against
+/// `[browser].blocked_urls` before the websocket is touched.
 #[cfg(feature = "cdp")]
-pub fn type_text(opts: &ActionOptions) -> Result<(), ComputerError> {
-    let text = opts
-        .text
-        .clone()
-        .ok_or_else(|| ComputerError::InvalidArguments("browser text requires --text".into()))?;
+pub fn read_inner_text(opts: &ActionOptions) -> Result<String, ComputerError> {
+    let selector = opts.selector.clone().ok_or_else(|| {
+        ComputerError::InvalidArguments("browser text requires --selector".into())
+    })?;
     let attach_opts = AttachOptions {
         debug_url: opts.debug_url.clone(),
         app: opts.app.clone(),
         app_pid: opts.app_pid,
         command_timeout: opts.command_timeout,
     };
-    let ws_url = pick_websocket_url(&attach_opts)?;
-    let browser = connect(&ws_url, opts.command_timeout)?;
     let target_id = opts.target_id.clone();
+    let blocked_urls = opts.policy_blocked_urls.clone();
+    attach_with_url_check(
+        attach_opts,
+        target_id,
+        blocked_urls,
+        move |_browser, page| async move {
+            let element = page
+                .find_element(selector.clone())
+                .await
+                .map_err(map_cdp_error)?;
+            let text = element.inner_text().await.map_err(map_cdp_error)?;
+            Ok::<String, ComputerError>(text.unwrap_or_default())
+        },
+    )
+}
+
+#[cfg(not(feature = "cdp"))]
+pub fn read_inner_text(_opts: &ActionOptions) -> Result<String, ComputerError> {
+    Err(unsupported())
+}
+
+/// Type `text` into the element matched by `selector` (or the page body when
+/// no selector is given).
+///
+/// Classified like `Action::Type` for audit purposes: the text body is never
+/// stored, only the character count. The current page URL is checked against
+/// `[browser].blocked_urls` first.
+#[cfg(feature = "cdp")]
+pub fn type_text(opts: &ActionOptions) -> Result<(), ComputerError> {
+    let text = opts
+        .text
+        .clone()
+        .ok_or_else(|| ComputerError::InvalidArguments("browser type requires --text".into()))?;
     let selector = opts.selector.clone();
-    let text_for_send = text.clone();
-    let rt = new_runtime(opts.command_timeout)?;
-    rt.block_on(async move {
-        let mut browser = browser;
-        let page = if let Some(target_id_text) = target_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            browser
-                .get_page(target_id_for(target_id_text))
-                .await
-                .map_err(|error| {
-                    cdp_unavailable(format!("target {target_id_text} not found: {error}"))
-                })?
-        } else {
-            let targets = browser
-                .fetch_targets()
-                .await
-                .map_err(|error| cdp_unavailable(format!("fetch_targets: {error}")))?;
-            let first = targets.into_iter().find(|target| target.r#type == "page");
-            match first {
-                Some(target) => {
-                    let tid = String::from(target.target_id.clone());
-                    browser
-                        .get_page(target.target_id.clone())
+    let attach_opts = AttachOptions {
+        debug_url: opts.debug_url.clone(),
+        app: opts.app.clone(),
+        app_pid: opts.app_pid,
+        command_timeout: opts.command_timeout,
+    };
+    let target_id = opts.target_id.clone();
+    let blocked_urls = opts.policy_blocked_urls.clone();
+    attach_with_url_check(
+        attach_opts,
+        target_id,
+        blocked_urls,
+        move |_browser, page| async move {
+            match selector.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                Some(sel) => {
+                    let element = page
+                        .find_element(sel.to_string())
                         .await
-                        .map_err(|error| cdp_unavailable(format!("get_page({tid}): {error}")))?
+                        .map_err(map_cdp_error)?;
+                    element
+                        .click()
+                        .await
+                        .map_err(|error| cdp_unavailable(format!("element click: {error}")))?;
+                    element
+                        .type_str(text.clone())
+                        .await
+                        .map_err(|error| cdp_unavailable(format!("element.type_str: {error}")))?;
                 }
-                None => browser
-                    .new_page("about:blank")
-                    .await
-                    .map_err(|error| cdp_unavailable(format!("new_page: {error}")))?,
+                None => {
+                    // No selector: focus the body and type there. Element::type_str
+                    // requires an Element; the body is the closest focus target.
+                    let body = page
+                        .find_element("body".to_string())
+                        .await
+                        .map_err(map_cdp_error)?;
+                    body.click()
+                        .await
+                        .map_err(|error| cdp_unavailable(format!("body click: {error}")))?;
+                    body.type_str(text.clone())
+                        .await
+                        .map_err(|error| cdp_unavailable(format!("body.type_str: {error}")))?;
+                }
             }
-        };
-        match selector.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            Some(selector) => {
-                let element = page
-                    .find_element(selector.to_string())
-                    .await
-                    .map_err(|error| {
-                        cdp_unavailable(format!("find_element({selector}): {error}"))
-                    })?;
-                element
-                    .click()
-                    .await
-                    .map_err(|error| cdp_unavailable(format!("element click: {error}")))?;
-                element
-                    .type_str(text_for_send.clone())
-                    .await
-                    .map_err(|error| cdp_unavailable(format!("element.type_str: {error}")))?;
-            }
-            None => {
-                // No selector: focus the body and type there. Chromiumoxide's
-                // Page::type_str does not exist; Element::type_str requires an
-                // Element. The body is the closest focus target.
-                let body = page
-                    .find_element("body".to_string())
-                    .await
-                    .map_err(|error| cdp_unavailable(format!("find_element(body): {error}")))?;
-                body.click()
-                    .await
-                    .map_err(|error| cdp_unavailable(format!("body click: {error}")))?;
-                body.type_str(text_for_send.clone())
-                    .await
-                    .map_err(|error| cdp_unavailable(format!("body.type_str: {error}")))?;
-            }
-        }
-        Ok::<(), ComputerError>(())
-    })
+            Ok::<(), ComputerError>(())
+        },
+    )
 }
 
 #[cfg(not(feature = "cdp"))]
@@ -677,51 +768,21 @@ pub fn eval(opts: &ActionOptions) -> Result<Value, ComputerError> {
         app_pid: opts.app_pid,
         command_timeout: opts.command_timeout,
     };
-    let ws_url = pick_websocket_url(&attach_opts)?;
-    let browser = connect(&ws_url, opts.command_timeout)?;
     let target_id = opts.target_id.clone();
-    let script_for_send = script.clone();
-    let rt = new_runtime(opts.command_timeout)?;
-    let result = rt.block_on(async move {
-        let mut browser = browser;
-        let page = if let Some(target_id_text) = target_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            browser
-                .get_page(target_id_for(target_id_text))
+    let blocked_urls = opts.policy_blocked_urls.clone();
+    attach_with_url_check(
+        attach_opts,
+        target_id,
+        blocked_urls,
+        move |_browser, page| async move {
+            let result = page
+                .evaluate(script.clone())
                 .await
-                .map_err(|error| {
-                    cdp_unavailable(format!("target {target_id_text} not found: {error}"))
-                })?
-        } else {
-            let targets = browser
-                .fetch_targets()
-                .await
-                .map_err(|error| cdp_unavailable(format!("fetch_targets: {error}")))?;
-            let first = targets.into_iter().find(|target| target.r#type == "page");
-            match first {
-                Some(target) => {
-                    let tid = String::from(target.target_id.clone());
-                    browser
-                        .get_page(target.target_id.clone())
-                        .await
-                        .map_err(|error| cdp_unavailable(format!("get_page({tid}): {error}")))?
-                }
-                None => browser
-                    .new_page("about:blank")
-                    .await
-                    .map_err(|error| cdp_unavailable(format!("new_page: {error}")))?,
-            }
-        };
-        let result = page
-            .evaluate(script_for_send.clone())
-            .await
-            .map_err(|error| cdp_unavailable(format!("Page.evaluate: {error}")))?;
-        Ok::<chromiumoxide::js::EvaluationResult, ComputerError>(result)
-    })?;
-    Ok(result.value().cloned().unwrap_or(Value::Null))
+                .map_err(|error| cdp_unavailable(format!("Page.evaluate: {error}")))?;
+            Ok::<chromiumoxide::js::EvaluationResult, ComputerError>(result)
+        },
+    )
+    .map(|result| result.value().cloned().unwrap_or(Value::Null))
 }
 
 #[cfg(not(feature = "cdp"))]
@@ -841,6 +902,111 @@ mod tests {
         let result = activate_tab(&opts);
         assert!(matches!(result, Err(ComputerError::Unsupported(_))));
     }
+
+    #[test]
+    #[cfg(not(feature = "cdp"))]
+    fn read_inner_text_returns_unsupported_when_feature_off() {
+        let opts = ActionOptions::default();
+        let result = read_inner_text(&opts);
+        assert!(matches!(result, Err(ComputerError::Unsupported(_))));
+    }
+
+    #[cfg(feature = "cdp")]
+    #[test]
+    fn no_page_target_error_is_cdp_unavailable_with_stable_message() {
+        let error = no_page_target_error();
+        assert!(matches!(error, ComputerError::CdpUnavailable(_)));
+        let text = match error {
+            ComputerError::CdpUnavailable(text) => text,
+            _ => unreachable!("checked above"),
+        };
+        assert!(
+            text.contains("no page target"),
+            "expected stable 'no page target' phrasing in {text}"
+        );
+        assert!(
+            text.contains("attach-only"),
+            "expected attach-only phrasing in {text}"
+        );
+    }
+
+    #[cfg(feature = "cdp")]
+    #[test]
+    fn map_cdp_error_chrome_message_no_node_becomes_element_not_found() {
+        use chromiumoxide::error::CdpError;
+        let error = CdpError::ChromeMessage("No node with given id found".into());
+        let mapped = map_cdp_error(error);
+        match mapped {
+            ComputerError::ElementNotFound(msg) => {
+                // The message we produce must lead with the "selector matched
+                // no element" phrase so error recipients can identify the
+                // cause without parsing the embedded CDP body.
+                assert!(
+                    msg.starts_with("selector matched no element"),
+                    "expected leading phrase, got {msg}"
+                );
+            }
+            other => panic!("expected ElementNotFound, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "cdp")]
+    #[test]
+    fn map_cdp_error_chrome_message_node_not_found_phrase_matches() {
+        // Chromiumoxide wraps the CDP server response in `CdpError::Chrome`
+        // (a `chromiumoxide_types::Error`). We can't construct that without
+        // pulling in `chromiumoxide_types` as a dev-dep, but we can exercise
+        // the same matching logic through `ChromeMessage`, which carries the
+        // verbatim text the server returned. The function branches on the
+        // same substrings.
+        use chromiumoxide::error::CdpError;
+        let error = CdpError::ChromeMessage("Node with given id was not found.".into());
+        let mapped = map_cdp_error(error);
+        assert!(matches!(mapped, ComputerError::ElementNotFound(_)));
+    }
+
+    #[cfg(feature = "cdp")]
+    #[test]
+    fn map_cdp_error_unrelated_chrome_message_stays_cdp_unavailable() {
+        use chromiumoxide::error::CdpError;
+        let error = CdpError::ChromeMessage("Protocol error: some method not allowed".into());
+        let mapped = map_cdp_error(error);
+        match mapped {
+            ComputerError::CdpUnavailable(msg) => {
+                assert!(
+                    msg.contains("some method not allowed"),
+                    "expected cdp_unavailable to keep the original message, got {msg}"
+                );
+            }
+            other => panic!("expected CdpUnavailable, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "cdp")]
+    #[test]
+    fn map_cdp_error_io_error_stays_cdp_unavailable() {
+        use chromiumoxide::error::CdpError;
+        // Anything that is not a ChromeError/ChromeMessage/NotFound error
+        // (transport, websocket, IO) must remain cdp_unavailable.
+        let io = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+        let error = CdpError::Io(io);
+        let mapped = map_cdp_error(error);
+        assert!(matches!(mapped, ComputerError::CdpUnavailable(_)));
+    }
+
+    #[cfg(feature = "cdp")]
+    #[test]
+    fn map_cdp_error_not_found_becomes_element_not_found() {
+        use chromiumoxide::error::CdpError;
+        let error = CdpError::NotFound;
+        let mapped = map_cdp_error(error);
+        match mapped {
+            ComputerError::ElementNotFound(msg) => {
+                assert!(msg.contains("no element"));
+            }
+            other => panic!("expected ElementNotFound, got {other:?}"),
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -902,12 +1068,28 @@ mod request_construction {
 
         let text = json!({
             "action": "browser_text",
-            "text": "hello",
             "selector": "input#name",
         });
         let parsed: crate::protocol::Action = serde_json::from_value(text).unwrap();
         match parsed {
             crate::protocol::Action::BrowserText {
+                selector,
+                target_id,
+            } => {
+                assert_eq!(selector, "input#name");
+                assert!(target_id.is_none());
+            }
+            other => panic!("expected BrowserText, got {other:?}"),
+        }
+
+        let type_action = json!({
+            "action": "browser_type",
+            "text": "hello",
+            "selector": "input#name",
+        });
+        let parsed: crate::protocol::Action = serde_json::from_value(type_action).unwrap();
+        match parsed {
+            crate::protocol::Action::BrowserType {
                 text,
                 selector,
                 target_id,
@@ -916,7 +1098,7 @@ mod request_construction {
                 assert_eq!(selector.as_deref(), Some("input#name"));
                 assert!(target_id.is_none());
             }
-            other => panic!("expected BrowserText, got {other:?}"),
+            other => panic!("expected BrowserType, got {other:?}"),
         }
 
         let eval_action = json!({
