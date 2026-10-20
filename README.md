@@ -350,3 +350,8 @@ Licensed under either of
 at your option.
 
 Copyright 2026 Lindoélio Lázaro.
+## Notes from live testing
+
+- **Element indices across CLI calls.** Indices from `tree` are cached per session. The default session is the current process, so separate one-shot invocations only share indices when you pass the same `--session <ID>` to `tree` and to the element action.
+- **`set_value` replaces the field.** `set-value` (and `type --element N` without an explicit `--tier`) writes the AX value, replacing the whole field contents. Pass `--tier event` to insert keystrokes at the focused caret instead.
+- **`type --tier event` needs keyboard focus.** Keystrokes posted to a pid are dropped if no element in that app has focus. `type` then returns ok with a `warning`; click the field (`click --tier event`) or pass `--element N` first.
