@@ -707,11 +707,19 @@ fn browser_navigate_blocks_url_before_connecting_with_temp_policy() {
 #[test]
 #[cfg(feature = "cdp")]
 fn browser_tabs_against_missing_chrome_returns_cdp_unavailable() {
-    // With --app pointing at a name we know is not running, attach must
+    // With --cdp-url pointing at an unreachable websocket, attach must
     // fail with cdp_unavailable (transport error), not new_page. There is
-    // no fallback.
+    // no fallback path. We do not use --app here because list_apps is
+    // macOS-only and would fail before we ever reach the CDP path on
+    // Linux / Windows runners.
     let output = Command::new(bin())
-        .args(["--cdp", "--app", "Google Chrome", "browser", "tabs"])
+        .args([
+            "--cdp",
+            "--cdp-url",
+            "ws://127.0.0.1:1",
+            "browser",
+            "tabs",
+        ])
         .env("XDG_CACHE_HOME", cache_home())
         .env("XDG_CONFIG_HOME", config_home())
         .env("XDG_STATE_HOME", state_home())
