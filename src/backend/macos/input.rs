@@ -452,9 +452,19 @@ fn run_events(job: &InputJob, synthetic: bool) -> Result<InputReport, ComputerEr
     }
     let before = cursor_xy();
     let source = private_source()?;
+    let mut warnings = Vec::new();
+    if let Some(warning) = type_focus_warning(matches!(job.kind, InputKind::Type { .. })) {
+        match app_has_focused_element(target.pid) {
+            HasFocus::Yes => {}
+            HasFocus::No => warnings.push(warning.to_string()),
+            // Permission or other transient failure: do not warn (the
+            // caller already has the same permission context for the rest
+            // of the run).
+            HasFocus::Unknown => {}
+        }
+    }
     dispatch_kind(&source, &target, &job.kind)?;
     let after = cursor_xy();
-    let mut warnings = Vec::new();
     let moved = match (before, after) {
         (Some((bx, by)), Some((ax, ay))) => crate::tier::cursor_moved(bx, by, ax, ay),
         _ => {
@@ -473,6 +483,45 @@ fn run_events(job: &InputJob, synthetic: bool) -> Result<InputReport, ComputerEr
         focus_restored: None,
         warnings,
     })
+}
+
+/// Result of asking macOS whether an app currently has an AXFocusedUIElement.
+#[cfg(not(test))]
+enum HasFocus {
+    Yes,
+    No,
+    Unknown,
+}
+
+/// Read AXFocusedUIElement from the AXUIElement for `pid`. A null/missing
+/// attribute means no element inside the app has keyboard focus — keystrokes
+/// would be dropped on the floor. The caller turns that into a warning rather
+/// than a hard failure because the user can still retype after refocusing.
+#[cfg(not(test))]
+fn app_has_focused_element(pid: i32) -> HasFocus {
+    let element = match super::ax::application(pid) {
+        Ok(element) => element,
+        Err(_) => return HasFocus::Unknown,
+    };
+    // `copy_cf` returns `Ok(None)` both when the attribute is missing and
+    // when the AX call returned a null CFType (the documented way macOS
+    // signals "no focused element"), so a missing value means no focus.
+    match super::ax::copy_cf(&element, "AXFocusedUIElement") {
+        Ok(Some(_)) => HasFocus::Yes,
+        Ok(None) => HasFocus::No,
+        Err(_) => HasFocus::Unknown,
+    }
+}
+
+/// Pure helper: return the warning a `type` call should emit when no element
+/// has keyboard focus. Returns `None` for non-Type jobs so callers can map
+/// over the result without a separate branch.
+fn type_focus_warning(is_type: bool) -> Option<&'static str> {
+    if is_type {
+        Some("no focused element; keystrokes may be dropped — click or pass --element first")
+    } else {
+        None
+    }
 }
 
 #[cfg(not(test))]
@@ -1161,4 +1210,34 @@ fn cursor_xy() -> Option<(f64, f64)> {
     let event = CGEvent::new(None)?;
     let point = CGEvent::location(Some(&event));
     Some((point.x, point.y))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::type_focus_warning;
+
+    #[test]
+    fn type_focus_warning_emits_for_a_type_job() {
+        // `type --app TextEdit --tier event` with no click first posted
+        // keystrokes that no element was listening to. The warning is the
+        // visible signal to the user (and to automation) that the action
+        // ran but the target app had no AXFocusedUIElement.
+        let warning = type_focus_warning(true).expect("type job must warn");
+        assert!(
+            warning.contains("no focused element"),
+            "warning text must name the cause: {warning:?}"
+        );
+        assert!(
+            warning.contains("--element"),
+            "warning must point at the mitigation: {warning:?}"
+        );
+    }
+
+    #[test]
+    fn type_focus_warning_skips_non_type_jobs() {
+        // Coordinate clicks and keystrokes against an element have their
+        // own focus model. Only Type is at risk of being silently dropped
+        // when no element has focus.
+        assert!(type_focus_warning(false).is_none());
+    }
 }
