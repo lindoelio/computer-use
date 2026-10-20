@@ -382,7 +382,6 @@ fn perform_activate_tier(
 /// `self`; we open a fresh connection per dispatch. XTest is fast enough
 /// for that overhead to be invisible.
 fn perform_event_tier(job: &InputJob) -> Result<InputReport, ComputerError> {
-    use crate::tier::InputKind;
     match event_route() {
         EventRoute::X11Test => x11_event_tier(job),
         #[cfg(feature = "portal")]
@@ -590,7 +589,6 @@ mod tests {
         assert_ne!(code, "unsupported", "got {error:?}");
     }
 
-    #[test]
     #[test]
     fn event_route_follows_the_session_and_the_feature() {
         let route = event_route();

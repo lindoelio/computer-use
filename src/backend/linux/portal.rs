@@ -329,11 +329,11 @@ pub(crate) fn map_failure(failure: &PortalFailure) -> ComputerError {
 }
 
 #[cfg(feature = "portal")]
-impl From<&ashpd::desktop::request::ResponseError> for PortalFailure {
-    fn from(error: &ashpd::desktop::request::ResponseError) -> Self {
+impl From<&ashpd::desktop::ResponseError> for PortalFailure {
+    fn from(error: &ashpd::desktop::ResponseError) -> Self {
         match error {
-            ashpd::desktop::request::ResponseError::Cancelled => PortalFailure::Cancelled,
-            ashpd::desktop::request::ResponseError::Other => PortalFailure::Denied,
+            ashpd::desktop::ResponseError::Cancelled => PortalFailure::Cancelled,
+            ashpd::desktop::ResponseError::Other => PortalFailure::Denied,
         }
     }
 }
@@ -403,7 +403,7 @@ pub(crate) fn capture_window(
             "window bounds are empty".into(),
         ));
     }
-    let mut raw = super::capture::crop_window(target.bounds)?;
+    let mut raw = crate::backend::capture::crop_window(target.bounds)?;
     raw.warnings.push(
         "built without the `portal` feature: cropped the desktop image, so covered pixels may be \
          wrong"
@@ -419,7 +419,7 @@ fn fallback_crop(
     target: &WindowTarget,
     cause: &ComputerError,
 ) -> Result<crate::types::RawCapture, ComputerError> {
-    let mut raw = super::capture::crop_window(target.bounds)?;
+    let mut raw = crate::backend::capture::crop_window(target.bounds)?;
     raw.warnings.push(format!(
         "the XDG ScreenCast portal could not deliver a window frame ({cause}); cropped the \
          desktop image instead, so covered pixels may be wrong"
@@ -447,6 +447,7 @@ async fn pull_one_frame(window: WindowBounds) -> Result<crate::types::RawCapture
     use ashpd::desktop::screencast::{
         CursorMode, Screencast, SelectSourcesOptions, SourceType, StartCastOptions, Streams,
     };
+    use ashpd::enumflags2::BitFlags;
 
     let screencast = Screencast::new().await.map_err(portal_error)?;
     let session = screencast
@@ -461,14 +462,15 @@ async fn pull_one_frame(window: WindowBounds) -> Result<crate::types::RawCapture
                 .set_cursor_mode(CursorMode::Embedded)
                 // Offer both so the user can pick the window itself; we prefer
                 // a window stream when the portal gives us one.
-                .set_sources(SourceType::Monitor | SourceType::Window)
+                .set_sources(Some(
+                    BitFlags::from(SourceType::Monitor) | BitFlags::from(SourceType::Window),
+                ))
                 .set_multiple(false)
                 .set_persist_mode(ashpd::desktop::PersistMode::DoNot),
         )
         .await
         .map_err(portal_error)?
         .response()
-        .await
         .map_err(portal_error)?;
 
     // Blocks until the user answers the dialog. No timeout is applied on
@@ -479,7 +481,6 @@ async fn pull_one_frame(window: WindowBounds) -> Result<crate::types::RawCapture
         .await
         .map_err(portal_error)?
         .response()
-        .await
         .map_err(portal_error)?;
 
     let described: Vec<StreamInfo> = streams
@@ -691,7 +692,7 @@ fn grab_pipewire_frame(
     }));
     let on_format = Rc::clone(&shared);
     let on_process = Rc::clone(&shared);
-    let quit_on_frame = Rc::clone(&mainloop);
+    let quit_on_frame = mainloop.clone();
 
     let _listener = stream
         .add_local_listener_with_user_data(())
@@ -879,7 +880,7 @@ pub(crate) fn perform_event_tier(
         ));
     }
 
-    crate::backend::linux::runtime::block_on(run_remote_desktop(&job.kind))
+    crate::backend::linux::runtime::block_on(run_remote_desktop(&job.kind))?
 }
 
 #[cfg(feature = "portal")]
@@ -895,6 +896,7 @@ async fn run_remote_desktop(
         },
         screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType},
     };
+    use ashpd::enumflags2::BitFlags;
 
     let remote = RemoteDesktop::new().await.map_err(portal_error)?;
     let session = remote
@@ -910,7 +912,6 @@ async fn run_remote_desktop(
         .await
         .map_err(portal_error)?
         .response()
-        .await
         .map_err(portal_error)?;
 
     // Absolute pointer motion is expressed in a stream's coordinate space, so
@@ -922,12 +923,11 @@ async fn run_remote_desktop(
             &session,
             SelectSourcesOptions::default()
                 .set_cursor_mode(CursorMode::Hidden)
-                .set_sources(SourceType::Monitor),
+                .set_sources(Some(BitFlags::from(SourceType::Monitor))),
         )
         .await
         .map_err(portal_error)?
         .response()
-        .await
         .map_err(portal_error)?;
 
     // Blocks on the user, exactly as the capture dialog does.
@@ -936,7 +936,6 @@ async fn run_remote_desktop(
         .await
         .map_err(portal_error)?
         .response()
-        .await
         .map_err(portal_error)?;
 
     if !response.devices().contains(DeviceType::Pointer) {
@@ -1229,7 +1228,7 @@ async fn try_eis(
     session: &ashpd::desktop::Session<RemoteDesktopProxy>,
 ) -> bool {
     use ashpd::desktop::remote_desktop::ConnectToEISOptions;
-    use reis::{ei::Context as EiContext, handshake::ContextType};
+    use reis::ei::{handshake::ContextType, Context as EiContext};
 
     // `ConnectToEIS` is versioned at 2. Compositors below it answer with an
     // error, which is an ordinary "not offered", not a failure.
@@ -1239,8 +1238,10 @@ async fn try_eis(
     else {
         return false;
     };
-    // The EIS socket is a `SOCK_STREAM` unix socket handed over by the portal.
-    let Ok(socket) = std::os::unix::net::UnixStream::from(fd) else {
+    // The EIS socket is a `SOCK_STREAM` unix socket handed over by the
+    // portal, as a `zvariant::OwnedFd`.
+    let owned: std::os::fd::OwnedFd = fd.into();
+    let Ok(socket) = std::os::unix::net::UnixStream::from(owned) else {
         return false;
     };
     let Ok(context) = EiContext::new(socket) else {
@@ -1256,11 +1257,6 @@ async fn try_eis(
 pub(crate) const EIS_UNAVAILABLE_NOTE: &str =
     "the compositor did not offer an EIS socket, so the portal's absolute pointer motion is used; \
      libei relative motion is unavailable";
-
-/// No live EIS path when the feature is off: the note still explains why.
-#[cfg(not(feature = "portal"))]
-pub(crate) const EIS_UNAVAILABLE_NOTE: &str =
-    "built without the `portal` feature, so the XDG RemoteDesktop and EIS input paths are off";
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1597,8 +1593,8 @@ mod tests {
         assert_eq!(keysym_for("super"), Some(0xffeb));
         assert_eq!(keysym_for("control"), Some(0xffe3));
         // Printable ASCII is its own keysym.
-        assert_eq!(keysym_for("a"), Some(i32::from('a')));
-        assert_eq!(keysym_for("7"), Some(i32::from('7')));
+        assert_eq!(keysym_for("a"), Some('a' as i32));
+        assert_eq!(keysym_for("7"), Some('7' as i32));
         assert_eq!(keysym_for(""), None);
         assert_eq!(keysym_for("nosuchkey"), None);
     }
