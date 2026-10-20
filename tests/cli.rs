@@ -226,10 +226,12 @@ fn element_commands_reject_bad_arguments_without_acting() {
 
 #[test]
 fn element_commands_are_unsupported_off_macos_and_windows() {
-    // Element actions are real on macOS (Accessibility) and on Windows since
-    // P12b wires `uiautomation` into the dispatcher. Linux is the only
-    // platform that still returns `unsupported` for them.
-    if cfg!(target_os = "macos") || cfg!(target_os = "windows") {
+    // Element actions are real on macOS (Accessibility), Windows (UIA,
+    // since P12b), and Linux (AT-SPI, since P13a). No platform returns
+    // `unsupported` anymore; the contract is that the call fails with
+    // some structured error (most commonly `app_not_found` or
+    // `execution_failed` on the Linux runner without an at-spi bus).
+    if cfg!(target_os = "macos") || cfg!(target_os = "windows") || cfg!(target_os = "linux") {
         return;
     }
     let output = run(&["focus", "--element", "0"]);
