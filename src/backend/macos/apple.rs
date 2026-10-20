@@ -37,15 +37,8 @@ pub(crate) fn run(
             "apple-event script is empty".into(),
         ));
     }
+    let argv: Vec<&str> = osascript_argv(script, language);
     let timeout = Duration::from_secs(APPLE_EVENT_TIMEOUT_SECS);
-    let mut argv: Vec<&str> = Vec::with_capacity(4);
-    argv.push("osascript");
-    if matches!(language, AppleEventLanguage::JavaScript) {
-        argv.push("-l");
-        argv.push("JavaScript");
-    }
-    argv.push("-e");
-    argv.push(script);
     let output = crate::backend::command::run_timeout("osascript", &argv, timeout)
         .map_err(ComputerError::ExecutionFailed)?;
     let exit_status = output.status.code().unwrap_or(-1);
@@ -65,6 +58,24 @@ pub(crate) fn run(
         stderr,
         exit_status,
     })
+}
+
+/// Build the argv for `osascript`.
+///
+/// `Command::new` already names the program; the first element of `args` must
+/// be the first *option*, not the program name. The previous version pushed
+/// `"osascript"` into `argv`, which made osascript see `["osascript", "-e",
+/// "<script>"]` and fail with "osascript: osascript: No such file or
+/// directory" (it tried to exec "osascript" as a relative script path).
+pub(crate) fn osascript_argv(script: &str, language: AppleEventLanguage) -> Vec<&str> {
+    let mut argv: Vec<&str> = Vec::with_capacity(4);
+    if matches!(language, AppleEventLanguage::JavaScript) {
+        argv.push("-l");
+        argv.push("JavaScript");
+    }
+    argv.push("-e");
+    argv.push(script);
+    argv
 }
 
 fn trim_one_line(bytes: &[u8]) -> String {
@@ -116,5 +127,43 @@ mod tests {
         let c = fnv1a64_hex(b"world");
         assert_ne!(a, c);
         assert_eq!(a.len(), 16);
+    }
+
+    #[test]
+    fn osascript_argv_applescript_starts_with_dash_e() {
+        // The bug was pushing "osascript" into argv; Command::new already
+        // names the program, so argv[0] must be the first option, not the
+        // program name. Without this guard, osascript sees "osascript -e
+        // <script>" and reports "osascript: osascript: No such file or
+        // directory".
+        let argv = osascript_argv("get name", AppleEventLanguage::AppleScript);
+        assert_eq!(argv, vec!["-e", "get name"]);
+        assert_ne!(argv.first().copied(), Some("osascript"));
+    }
+
+    #[test]
+    fn osascript_argv_javascript_includes_the_language_flag() {
+        let argv = osascript_argv(
+            "Application('Finder').getName()",
+            AppleEventLanguage::JavaScript,
+        );
+        assert_eq!(
+            argv,
+            vec!["-l", "JavaScript", "-e", "Application('Finder').getName()"]
+        );
+        assert_ne!(argv.first().copied(), Some("osascript"));
+        assert_eq!(argv[2], "-e");
+    }
+
+    #[test]
+    fn osascript_argv_keeps_a_long_script_as_a_single_argv_element() {
+        // osascript accepts the script as a single argv entry; the script
+        // must NOT be split on whitespace or wrapped in a file path. The
+        // live failure looked like osascript treating the script as a
+        // filename. Pin the contract here.
+        let script = "tell application id \"com.apple.TextEdit\" to get name";
+        let argv = osascript_argv(script, AppleEventLanguage::AppleScript);
+        assert_eq!(argv.len(), 2);
+        assert_eq!(argv[1], script);
     }
 }
