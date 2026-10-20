@@ -133,6 +133,8 @@ fn help_lists_commands() {
         "--allow-foreground",
         "--require-background",
         "--no-overlay",
+        "--display",
+        "isolation",
         "overlay",
     ] {
         assert!(stdout.contains(needle), "help missing {needle}:\n{stdout}");
@@ -741,5 +743,174 @@ fn browser_tabs_against_missing_chrome_returns_cdp_unavailable() {
     assert_eq!(
         value["error"]["code"], "cdp_unavailable",
         "expected cdp_unavailable (no chrome / no page target); got {stdout}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P14: isolation and the `--display` filter.
+//
+// None of these touch the desktop: `isolation` is pure, and `--display` is
+// refused with `invalid_arguments` before any capture happens.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn isolation_prints_the_matrix_on_every_platform() {
+    let output = run(&["--pretty", "isolation"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: Value = serde_json::from_str(&stdout).expect("json response");
+    assert_eq!(value["ok"], true, "stdout: {stdout}");
+
+    let platform = if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        "windows"
+    };
+    assert_eq!(value["platform"], platform);
+    assert_eq!(value["display_filter"], true);
+    assert_eq!(value["xvfb"], "linux only");
+    assert_eq!(value["vm"], "documented, not shipped");
+    assert_eq!(
+        value["xvfb_recipe"]["server_command"],
+        "Xvfb :99 -screen 0 1440x900x24"
+    );
+    assert_eq!(value["xvfb_recipe"]["starts_server"], false);
+
+    // The infeasible list is the documentation's, in JSON form.
+    for key in [
+        "macos_vm_per_agent",
+        "share_host_app_into_guest",
+        "hide_virtual_display_from_user",
+        "windows_virtual_display",
+        "nested_wayland_input_without_portal",
+    ] {
+        let reason = value["infeasible"][key]
+            .as_str()
+            .unwrap_or_else(|| panic!("infeasible.{key} missing from {stdout}"));
+        assert!(!reason.is_empty(), "{key} needs a reason");
+    }
+}
+
+#[test]
+fn an_unknown_display_id_is_refused_without_capturing() {
+    // The stub is not used here: this runs the real backend, but the id is
+    // rejected before any capture, so no permission is needed.
+    let output = run(&["--display", "99999", "screenshot"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: Value = serde_json::from_str(&stdout).expect("json response");
+    assert_eq!(value["ok"], false, "stdout: {stdout}");
+    assert_eq!(
+        value["error"]["code"], "invalid_arguments",
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn a_bad_display_value_is_refused() {
+    // A value that is neither a monitor id nor `virtual` is a syntax error on
+    // every command, including the one that lists the ids.
+    for spec in ["left", "-1", "1.5", ""] {
+        let output = run(&["--display", spec, "displays"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let value: Value =
+            serde_json::from_str(&stdout).unwrap_or_else(|_| panic!("{spec:?} → {stdout}"));
+        assert_eq!(value["ok"], false, "{spec:?} stdout: {stdout}");
+        assert_eq!(
+            value["error"]["code"], "invalid_arguments",
+            "{spec:?} stdout: {stdout}"
+        );
+    }
+    // Without the flag the same command answers normally.
+    let output = run(&["displays"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: Value = serde_json::from_str(&stdout).expect("json response");
+    assert_eq!(value["ok"], true, "stdout: {stdout}");
+}
+
+#[test]
+fn display_virtual_needs_an_explicit_exec_and_never_starts_a_server() {
+    let output = run(&["--pretty", "--display", "virtual"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: Value = serde_json::from_str(&stdout).expect("json response");
+
+    if cfg!(target_os = "linux") {
+        assert_eq!(value["ok"], true, "stdout: {stdout}");
+        assert_eq!(value["server_command"], "Xvfb :99 -screen 0 1440x900x24");
+        assert_eq!(value["display"], ":99");
+        assert_eq!(value["starts_server"], false);
+    } else {
+        assert_eq!(value["ok"], false, "stdout: {stdout}");
+        assert_eq!(
+            value["error"]["code"], "unsupported",
+            "only Linux has a supported recipe; stdout: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn exec_without_virtual_is_an_argument_error() {
+    let output = run(&["--exec", "true"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: Value = serde_json::from_str(&stdout).expect("json response");
+    assert_eq!(value["ok"], false, "stdout: {stdout}");
+    assert_eq!(
+        value["error"]["code"], "invalid_arguments",
+        "stdout: {stdout}"
+    );
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn display_virtual_exec_runs_inside_the_prepared_environment() {
+    // `env` prints its environment, so the exec really happened with DISPLAY set
+    // and the recipe's server is not needed for this assertion.
+    let output = run(&["--display", "virtual", "--exec", "--", "env"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.lines().any(|line| line == "DISPLAY=:99"),
+        "DISPLAY was not set for the exec'd command: {stdout}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn display_virtual_exec_reports_a_command_it_cannot_execute() {
+    // A real command name that is not on PATH: exec fails, and the error is
+    // structured rather than a panic or a silent success.
+    let output = run(&[
+        "--display",
+        "virtual",
+        "--exec",
+        "--",
+        "computer-use-no-such-binary",
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: Value = serde_json::from_str(&stdout).expect("json response");
+    assert_eq!(value["ok"], false, "stdout: {stdout}");
+    assert_eq!(
+        value["error"]["code"], "execution_failed",
+        "stdout: {stdout}"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn display_virtual_exec_without_a_command_is_an_argument_error() {
+    // clap refuses `--exec` with no value at parse time.
+    let output = run(&["--display", "virtual", "--exec"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: Value = serde_json::from_str(&stdout).expect("json response");
+    assert_eq!(value["ok"], false, "stdout: {stdout}");
+    assert_eq!(
+        value["error"]["code"], "invalid_arguments",
+        "stdout: {stdout}"
     );
 }

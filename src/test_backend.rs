@@ -110,6 +110,9 @@ pub struct StubBackend {
     pub clipboard_text: Mutex<Option<String>>,
     /// In-memory clipboard RGBA. Used when text is absent.
     pub clipboard_image: Mutex<Option<Vec<u8>>>,
+    /// Displays returned by `list_displays`. The default is one 800x600 screen
+    /// at the origin; the `--display` tests set a second monitor beside it.
+    pub displays: Vec<DisplayInfo>,
     /// Menu bar entries the stub returns from `menu_list`.
     pub menu_sections: Mutex<Vec<MenuNode>>,
     /// Menu click requests, recorded by `menu_click`.
@@ -192,6 +195,7 @@ impl Default for StubBackend {
             holds_ms: Mutex::new(Vec::new()),
             clipboard_text: Mutex::new(None),
             clipboard_image: Mutex::new(None),
+            displays: fixture_displays(),
             menu_sections: Mutex::new(Vec::new()),
             menu_clicks: Mutex::new(Vec::new()),
             apple_event_calls: Mutex::new(Vec::new()),
@@ -337,16 +341,7 @@ impl DesktopBackend for StubBackend {
     }
 
     fn list_displays(&self) -> Result<Vec<DisplayInfo>, ComputerError> {
-        Ok(vec![DisplayInfo {
-            id: 1,
-            name: "Stub".into(),
-            x: 0,
-            y: 0,
-            width: 800,
-            height: 600,
-            scale: 2.0,
-            is_primary: true,
-        }])
+        Ok(self.displays.clone())
     }
 
     fn frontmost(&self) -> FrontmostInfo {
@@ -1053,6 +1048,28 @@ impl DesktopBackend for StubBackend {
 }
 
 impl StubBackend {
+    /// Two monitors side by side: the default 800x600 screen at the origin and
+    /// a 640x480 one whose origin is `(800, 100)`. This is the display list the
+    /// `--display` filter tests run against.
+    pub fn with_two_displays() -> Self {
+        Self {
+            displays: vec![
+                fixture_displays().remove(0),
+                DisplayInfo {
+                    id: 2,
+                    name: "Stub Right".into(),
+                    x: 800,
+                    y: 100,
+                    width: 640,
+                    height: 480,
+                    scale: 1.0,
+                    is_primary: false,
+                },
+            ],
+            ..Self::default()
+        }
+    }
+
     fn all_apps(&self) -> Vec<AppInfo> {
         let mut apps = self.apps.clone();
         apps.extend(self.accessory_apps.iter().cloned());
@@ -1152,6 +1169,21 @@ impl StubBackend {
         let window_id = chosen.as_ref().map(|window| window.id).unwrap_or(0);
         Ok((info, window_id, title))
     }
+}
+
+/// The single screen the stub reports by default. P14 tests add a second one
+/// through [`StubBackend::with_displays`].
+fn fixture_displays() -> Vec<DisplayInfo> {
+    vec![DisplayInfo {
+        id: 1,
+        name: "Stub".into(),
+        x: 0,
+        y: 0,
+        width: 800,
+        height: 600,
+        scale: 2.0,
+        is_primary: true,
+    }]
 }
 
 fn fixture_apps() -> Vec<AppInfo> {

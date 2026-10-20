@@ -30,6 +30,7 @@ pub mod error;
 mod foreground;
 mod image_util;
 mod input_session;
+pub mod isolation;
 pub mod keys;
 pub mod menu_path;
 pub mod overlay;

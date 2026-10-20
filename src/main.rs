@@ -13,8 +13,8 @@ use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use computer_use::protocol::{handle_request_line_opts, AppleEventLanguage, LineOptions};
 use computer_use::{
-    parse_path, parse_region, Action, CallContext, ImageFormat, MouseButton, Response,
-    ScrollDirection,
+    parse_path, parse_region, Action, CallContext, ComputerError, ImageFormat, MouseButton,
+    Response, ScrollDirection,
 };
 
 /// Cross-platform desktop automation for agents.
@@ -123,6 +123,23 @@ struct Cli {
     /// accepted and resolved via `/json/version`.
     #[arg(long, global = true, value_name = "URL")]
     cdp_url: Option<String>,
+
+    /// Restrict capture and coordinate conversion to one monitor id from
+    /// `displays`. Points stay virtual-desktop points, and a point outside the
+    /// monitor is `invalid_arguments`.
+    ///
+    /// `--display virtual` is different: on Linux it prints the Xvfb recipe and
+    /// never captures. See `computer-use isolation`.
+    #[arg(long, global = true, value_name = "ID|VIRTUAL")]
+    display: Option<String>,
+
+    /// With `--display virtual`, replace this process with a command running
+    /// inside the prepared environment (`DISPLAY=:99`). Nothing is started
+    /// implicitly: Xvfb must already be running.
+    ///
+    /// Example: computer-use --display virtual --exec -- computer-use screenshot
+    #[arg(long, value_name = "CMD", num_args = 1.., allow_hyphen_values = true)]
+    exec: Option<Vec<String>>,
 
     #[command(subcommand)]
     command: Option<CliCommand>,
@@ -504,6 +521,15 @@ enum CliCommand {
     ///
     /// Example: computer-use displays
     Displays,
+
+    /// Report what this build can isolate and what it cannot.
+    ///
+    /// The matrix names the real pieces (`display_filter`, `xvfb`,
+    /// `cg_virtual_display`) and lists what 0.2.0 does not ship. It is the
+    /// machine-readable half of `docs/ISOLATION.md`.
+    ///
+    /// Example: computer-use isolation
+    Isolation,
 
     /// List running applications.
     ///
@@ -1009,6 +1035,26 @@ fn run() -> u8 {
             emit(&response, cli.pretty);
             code
         }
+        // `--display virtual` prepares an environment instead of dispatching an
+        // action, so it is answered before the normal command routing. On a
+        // platform without a supported recipe this is `unsupported`.
+        (_, _)
+            if cli.display.as_deref().is_some_and(|spec| {
+                spec.eq_ignore_ascii_case(computer_use::isolation::VIRTUAL_SELECTOR)
+            }) =>
+        {
+            virtual_display(&cli)
+        }
+        (_, _) if cli.exec.is_some() => {
+            emit(
+                &Response::failure(
+                    "invalid_arguments",
+                    "--exec only runs with `--display virtual` on Linux",
+                ),
+                cli.pretty,
+            );
+            2
+        }
         (Some(CliCommand::Serve), _) | (None, true) => serve(&cli),
         (Some(_), true) => {
             emit(
@@ -1062,6 +1108,7 @@ fn run() -> u8 {
                 no_overlay: cli.no_overlay,
                 cdp: cli.cdp,
                 cdp_url: cli.cdp_url.clone(),
+                display: cli.display.clone(),
                 ..CallContext::default()
             };
             match command_action(command, context) {
@@ -1071,6 +1118,45 @@ fn run() -> u8 {
                     1
                 }
             }
+        }
+    }
+}
+
+/// Answer `--display virtual`.
+///
+/// Prints the Xvfb recipe and, with `--exec`, replaces this process with the
+/// prepared command. Xvfb is never started here: an agent must not leave a
+/// stray X server behind or race a second one on `:99`.
+fn virtual_display(cli: &Cli) -> u8 {
+    // Linux only. Off Linux there is no supported recipe, and printing the
+    // Xvfb commands would be a worse answer than saying so.
+    if !computer_use::isolation::virtual_supported() {
+        emit(
+            &Response::from_error(ComputerError::Unsupported(format!(
+                "--display virtual needs an X server and only Linux has a supported recipe \
+                 (current platform: {}); see docs/ISOLATION.md",
+                computer_use::isolation::platform()
+            ))),
+            cli.pretty,
+        );
+        return 1;
+    }
+    match cli.exec.as_deref() {
+        Some(raw) => {
+            let command = computer_use::isolation::exec_arguments(raw);
+            match computer_use::isolation::exec_prepared(&command) {
+                Ok(never) => match never {},
+                Err(error) => {
+                    emit(&Response::from_error(error), cli.pretty);
+                    1
+                }
+            }
+        }
+        None => {
+            let mut body = computer_use::isolation::xvfb_recipe();
+            body["command"] = serde_json::json!("computer-use");
+            emit(&Response::success(body), cli.pretty);
+            0
         }
     }
 }
@@ -1214,6 +1300,7 @@ fn command_action(
             seconds: *seconds,
         },
         CliCommand::Displays => Action::Displays,
+        CliCommand::Isolation => Action::Isolation,
         CliCommand::ListApps { all } => Action::ListApps { all: *all },
         CliCommand::ListWindows => Action::ListWindows,
         CliCommand::Launch { app } => {

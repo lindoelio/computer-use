@@ -294,6 +294,8 @@ pub enum Action {
     },
     /// List displays without capturing pixels.
     Displays,
+    /// Report what this build can isolate and what it cannot.
+    Isolation,
     /// List running applications. `all` includes accessory and prohibited apps.
     ListApps {
         /// Include accessory and prohibited activation policies.
@@ -963,6 +965,18 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
             Response::from_error(error),
         );
     }
+    if let Err(error) = gate_display(backend, context, &action) {
+        return finish_action(
+            context,
+            label,
+            &policy::Subject::default(),
+            None,
+            "allow",
+            "default",
+            chars,
+            Response::from_error(error),
+        );
+    }
     let prepared = prepare_action(backend, &action, context);
     if let Some(response) = prepared.stop {
         return finish_action(
@@ -1084,6 +1098,7 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
         Action::SessionEnd => result_response(session_end(backend, context)),
         Action::Wait { ms, seconds } => result_response(wait(ms, seconds)),
         Action::Displays => result_response(displays(backend)),
+        Action::Isolation => result_response(isolation()),
         Action::ListApps { all } => result_response(list_apps(backend, all)),
         Action::ListWindows => result_response(list_windows(backend, context.app.as_deref())),
         Action::Launch => result_response(launch(backend, context.app.as_deref())),
@@ -1349,6 +1364,7 @@ fn action_label(action: &Action) -> &'static str {
         Action::GetState => "get_state",
         Action::Wait { .. } => "wait",
         Action::Displays => "displays",
+        Action::Isolation => "isolation",
         Action::ListApps { .. } => "list_apps",
         Action::ListWindows => "list_windows",
         Action::Launch => "launch",
@@ -1397,6 +1413,7 @@ fn policy_class(action: &Action) -> PolicyClass {
         Action::Wait { .. }
         | Action::Doctor { .. }
         | Action::Displays
+        | Action::Isolation
         | Action::ListApps { .. }
         | Action::ListWindows
         | Action::Pause
@@ -1904,6 +1921,7 @@ fn post_state_kind(action: &Action) -> PostKind {
         Action::GetState
         | Action::Wait { .. }
         | Action::Displays
+        | Action::Isolation
         | Action::ListApps { .. }
         | Action::ListWindows
         | Action::Doctor { .. }
@@ -2041,6 +2059,60 @@ fn remap_image_action(context: &CallContext, action: Action) -> Result<Action, C
             })
         }
         other => Ok(other),
+    }
+}
+
+/// Resolve `--display` once per action, then check every screen point it names.
+///
+/// Runs after [`remap_coordinates`], so `--coord image` has already become a
+/// screen point and the filter sees the same space the click will use. Points
+/// stay virtual-desktop points: `--display` narrows what may be addressed, it
+/// does not rebase them.
+fn gate_display(
+    backend: &dyn DesktopBackend,
+    context: &CallContext,
+    action: &Action,
+) -> Result<(), ComputerError> {
+    let Some(spec) = context.display.as_deref() else {
+        return Ok(());
+    };
+    // Syntax is checked for every action, so garbage never reaches the backend.
+    // `virtual` is a CLI-only keyword: a JSON request cannot exec a prepared
+    // X server, so it gets a structured `unsupported` instead of a silent
+    // whole-desktop capture.
+    crate::isolation::parse_selector(spec)?;
+    // `displays` and `isolation` report on filtering, so they do not consume it.
+    if matches!(action, Action::Isolation | Action::Displays) {
+        return Ok(());
+    }
+    let displays = backend.list_displays()?;
+    let target = crate::isolation::resolve(spec, &displays)?;
+    match action {
+        // A click without a point is element-targeted, so there is nothing to
+        // filter: the element already resolved inside its window.
+        Action::Click { x, y, .. }
+        | Action::DoubleClick { x, y, .. }
+        | Action::TripleClick { x, y, .. }
+        | Action::Scroll { x, y, .. } => match (x, y) {
+            (Some(x), Some(y)) => crate::isolation::ensure_point_inside(&target, *x, *y),
+            _ => Ok(()),
+        },
+        Action::Move { x, y } | Action::MouseDown { x, y, .. } | Action::MouseUp { x, y, .. } => {
+            crate::isolation::ensure_point_inside(&target, *x, *y)
+        }
+        Action::Drag { path, .. } => {
+            for point in path {
+                crate::isolation::ensure_point_inside(&target, point.x, point.y)?;
+            }
+            Ok(())
+        }
+        Action::Screenshot {
+            region: Some(region),
+            ..
+        } => crate::isolation::ensure_region_inside(&target, *region),
+        Action::Screenshot { .. } => Ok(()),
+        Action::Zoom { region, .. } => crate::isolation::ensure_region_inside(&target, *region),
+        _ => Ok(()),
     }
 }
 
@@ -2565,12 +2637,35 @@ fn screenshot(
             return Err(error);
         }
         let target = resolve_screenshot_window(backend, context)?;
+        // A window capture cannot be redirected onto another monitor, so a
+        // filtered request only works when the window already sits there.
+        if let Some(filter) = display_filter(backend, context)? {
+            if !crate::isolation::window_inside(&filter, target.bounds) {
+                return Err(ComputerError::InvalidArguments(format!(
+                    "window {}x{}+{}+{} is not inside display {} ({} covers {})",
+                    target.bounds.width,
+                    target.bounds.height,
+                    target.bounds.x,
+                    target.bounds.y,
+                    filter.display.id,
+                    filter.display.name,
+                    filter.bounds()
+                )));
+            }
+        }
         let captured = backend.capture_window(&target)?;
         match region {
             Some(region) if window_crop => crop_window_region(captured, region)?,
             _ => captured,
         }
     } else {
+        // Capture the chosen monitor only. `capture_region` maps the exact
+        // monitor rectangle onto one monitor capture, so the screenshot map
+        // origin is that monitor's origin and the image is its pixels.
+        let region = match display_filter(backend, context)? {
+            Some(filter) => Some(filter.region),
+            None => region,
+        };
         backend.capture_screen(region)?
     };
     let prepared = image_util::prepare_shot(
@@ -3445,6 +3540,25 @@ pub(crate) fn resolve_wait(ms: Option<u64>, seconds: Option<f64>) -> Result<u64,
 fn displays(backend: &dyn DesktopBackend) -> Result<Value, ComputerError> {
     let displays = backend.list_displays()?;
     Ok(json!({"displays": displays}))
+}
+
+/// Resolve `--display` for a capture. `None` means no filter.
+fn display_filter(
+    backend: &dyn DesktopBackend,
+    context: &CallContext,
+) -> Result<Option<crate::isolation::DisplayTarget>, ComputerError> {
+    match context.display.as_deref() {
+        None => Ok(None),
+        Some(spec) => Ok(Some(crate::isolation::resolve(
+            spec,
+            &backend.list_displays()?,
+        )?)),
+    }
+}
+
+/// Body of the `isolation` action: what this build can and cannot isolate.
+fn isolation() -> Result<Value, ComputerError> {
+    Ok(crate::isolation::matrix())
 }
 
 fn tree_query(context: &CallContext) -> TreeQuery {
@@ -6215,6 +6329,314 @@ mod tests {
         assert!(!response.ok);
         let value = response.to_value();
         assert_eq!(value["error"]["code"], "cdp_unavailable");
+    }
+
+    // -----------------------------------------------------------------------
+    // P14: the `--display` filter.
+    // -----------------------------------------------------------------------
+
+    fn filtered(spec: &str) -> CallContext {
+        CallContext {
+            display: Some(spec.into()),
+            ..CallContext::default()
+        }
+    }
+
+    fn code_of(response: &Response) -> String {
+        response.to_value()["error"]["code"]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
+    }
+
+    #[test]
+    fn display_filter_rejects_a_point_outside_the_chosen_monitor() {
+        // The stub reports 800x600 at the origin and 640x480 at (800, 100).
+        let backend = StubBackend::with_two_displays();
+        let context = filtered("2");
+
+        // On the second monitor: allowed, and the click really happened.
+        let response = dispatch_with_context(&backend, Action::Move { x: 900, y: 300 }, &context);
+        assert!(response.ok, "{response:?}");
+
+        // On the first monitor, so outside the filter: invalid_arguments, and
+        // nothing moved.
+        let before = backend.moves.load(Ordering::SeqCst);
+        for (x, y) in [(0, 0), (799, 599), (1440, 580), (800, 99), (900, 90)] {
+            let response = dispatch_with_context(&backend, Action::Move { x, y }, &context);
+            assert_eq!(code_of(&response), "invalid_arguments", "{x},{y}");
+            assert_eq!(backend.moves.load(Ordering::SeqCst), before);
+        }
+        let message = dispatch_with_context(&backend, Action::Move { x: 0, y: 0 }, &context)
+            .to_value()["error"]["message"]
+            .as_str()
+            .expect("message")
+            .to_string();
+        assert!(message.contains("640x480+800+100"), "{message}");
+    }
+
+    #[test]
+    fn display_filter_covers_click_move_drag_scroll_and_mouse_halves() {
+        let backend = StubBackend::with_two_displays();
+        let context = filtered("2");
+        let inside = Action::Click {
+            x: Some(900),
+            y: Some(300),
+            button: MouseButton::Left,
+            double: false,
+            count: 1,
+        };
+        let outside = Action::Click {
+            x: Some(10),
+            y: Some(10),
+            button: MouseButton::Left,
+            double: false,
+            count: 1,
+        };
+
+        assert!(dispatch_with_context(&backend, inside.clone(), &context).ok);
+        assert_eq!(
+            code_of(&dispatch_with_context(&backend, outside.clone(), &context)),
+            "invalid_arguments"
+        );
+        assert_eq!(
+            code_of(&dispatch_with_context(
+                &backend,
+                Action::DoubleClick {
+                    x: Some(10),
+                    y: Some(10),
+                    button: MouseButton::Left
+                },
+                &context
+            )),
+            "invalid_arguments"
+        );
+        assert_eq!(
+            code_of(&dispatch_with_context(
+                &backend,
+                Action::MouseDown {
+                    x: 10,
+                    y: 10,
+                    button: MouseButton::Left
+                },
+                &context
+            )),
+            "invalid_arguments"
+        );
+        assert_eq!(
+            code_of(&dispatch_with_context(
+                &backend,
+                Action::Scroll {
+                    x: Some(10),
+                    y: Some(10),
+                    dx: Some(0),
+                    dy: Some(1),
+                    direction: None,
+                    amount: None,
+                },
+                &context
+            )),
+            "invalid_arguments"
+        );
+        let path = vec![Point { x: 900, y: 300 }, Point { x: 10, y: 10 }];
+        assert_eq!(
+            code_of(&dispatch_with_context(
+                &backend,
+                Action::Drag {
+                    path,
+                    button: MouseButton::Left
+                },
+                &context
+            )),
+            "invalid_arguments"
+        );
+    }
+
+    #[test]
+    fn a_coordinate_action_without_a_point_passes_the_filter() {
+        // Element-targeted and wheel-only actions name no point, so the filter
+        // has nothing to reject. (A bare `click` with neither `element` nor
+        // `x`/`y` is refused earlier by `preflight_action`, not by this gate.)
+        let backend = StubBackend::with_two_displays();
+        let response = dispatch_with_context(
+            &backend,
+            Action::Scroll {
+                x: None,
+                y: None,
+                dx: Some(0),
+                dy: Some(2),
+                direction: None,
+                amount: None,
+            },
+            &filtered("2"),
+        );
+        assert!(response.ok, "{response:?}");
+        assert_eq!(backend.scrolls.lock().expect("scrolls").len(), 1);
+    }
+
+    #[test]
+    fn an_unknown_display_id_is_invalid_arguments() {
+        let backend = StubBackend::with_two_displays();
+        let response =
+            dispatch_with_context(&backend, Action::Move { x: 900, y: 300 }, &filtered("9"));
+        assert_eq!(code_of(&response), "invalid_arguments");
+
+        // `displays` and `isolation` do not consume the filter, so a valid id
+        // that no longer exists still lets them answer.
+        let response = dispatch_with_context(&backend, Action::Displays, &filtered("99999"));
+        assert!(response.ok, "{response:?}");
+        let response = dispatch_with_context(&backend, Action::Isolation, &filtered("99999"));
+        assert!(response.ok, "{response:?}");
+        assert_eq!(backend.list_displays().unwrap().len(), 2);
+
+        // Bad syntax is refused everywhere, `displays` included.
+        let response = dispatch_with_context(&backend, Action::Displays, &filtered("nope"));
+        assert_eq!(code_of(&response), "invalid_arguments");
+        // `virtual` is valid syntax, and `displays` does not consume the filter,
+        // so it answers normally. A command that *would* capture under that
+        // filter reports `unsupported` instead.
+        let response = dispatch_with_context(&backend, Action::Displays, &filtered("virtual"));
+        assert!(response.ok, "{response:?}");
+    }
+
+    #[test]
+    fn virtual_is_unsupported_over_the_json_path() {
+        // The JSON path cannot exec a prepared X server, so it says so instead
+        // of silently capturing the whole desktop.
+        let backend = StubBackend::default();
+        let response = dispatch_with_context(
+            &backend,
+            Action::Move { x: 10, y: 10 },
+            &filtered("virtual"),
+        );
+        assert_eq!(code_of(&response), "unsupported");
+
+        let response = dispatch_with_context(
+            &backend,
+            Action::Screenshot {
+                output: None,
+                region: None,
+                format: None,
+                max_width: None,
+                canvas: None,
+                base64: false,
+                marks: false,
+            },
+            &filtered("virtual"),
+        );
+        assert_eq!(code_of(&response), "unsupported");
+    }
+
+    #[test]
+    fn the_display_filter_never_leaks_into_displays_or_isolation() {
+        let backend = StubBackend::with_two_displays();
+        let context = filtered("9");
+        assert!(dispatch_with_context(&backend, Action::Displays, &context).ok);
+        assert!(dispatch_with_context(&backend, Action::Isolation, &context).ok);
+    }
+
+    #[test]
+    fn a_screenshot_region_must_fit_inside_the_filtered_monitor() {
+        let _cache = crate::cache::CacheEnv::acquire();
+        let backend = StubBackend::with_two_displays();
+        let context = filtered("2");
+        let inside = Action::Screenshot {
+            output: None,
+            region: Some(Region::new(800, 100, 640, 480).unwrap()),
+            format: None,
+            max_width: None,
+            canvas: None,
+            base64: false,
+            marks: false,
+        };
+        let response = dispatch_with_context(&backend, inside, &context);
+        assert!(response.ok, "{response:?}");
+
+        // The map origin is the monitor origin, not the desktop origin.
+        let map = response.to_value();
+        assert_eq!(map["origin"]["x"], 800);
+        assert_eq!(map["origin"]["y"], 100);
+        let _ = fs::remove_file(
+            map["path"]
+                .as_str()
+                .expect("path")
+                .parse::<std::path::PathBuf>()
+                .expect("path"),
+        );
+
+        let straddling = Action::Screenshot {
+            output: None,
+            region: Some(Region::new(700, 100, 200, 200).unwrap()),
+            format: None,
+            max_width: None,
+            canvas: None,
+            base64: false,
+            marks: false,
+        };
+        assert_eq!(
+            code_of(&dispatch_with_context(&backend, straddling, &context)),
+            "invalid_arguments"
+        );
+    }
+
+    #[test]
+    fn isolation_reports_the_matrix_and_the_infeasible_keys() {
+        let response = dispatch_with(&StubBackend::default(), Action::Isolation);
+        assert!(response.ok, "{response:?}");
+        let value = response.to_value();
+        assert_eq!(value["platform"], crate::isolation::platform());
+        assert_eq!(value["display_filter"], true);
+        assert_eq!(value["xvfb"], "linux only");
+        assert_eq!(value["vm"], "documented, not shipped");
+        assert_eq!(
+            value["xvfb_recipe"]["server_command"],
+            "Xvfb :99 -screen 0 1440x900x24"
+        );
+        for key in [
+            "macos_vm_per_agent",
+            "share_host_app_into_guest",
+            "hide_virtual_display_from_user",
+            "windows_virtual_display",
+            "nested_wayland_input_without_portal",
+        ] {
+            assert!(
+                value["infeasible"][key]
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty()),
+                "infeasible.{key} missing"
+            );
+        }
+    }
+
+    #[test]
+    fn isolation_is_read_only_and_ignores_the_state_flags() {
+        assert_eq!(action_label(&Action::Isolation), "isolation");
+        assert!(matches!(
+            post_state_kind(&Action::Isolation),
+            PostKind::ReadOnly
+        ));
+        let backend = StubBackend::default();
+        let response = dispatch_with_context(
+            &backend,
+            Action::Isolation,
+            &CallContext {
+                return_state: true,
+                include_screenshot: true,
+                ..CallContext::default()
+            },
+        );
+        assert!(response.ok);
+        assert!(response.to_value().get("state").is_none());
+    }
+
+    #[test]
+    fn the_isolation_action_parses_from_json() {
+        let request = parse_request(json!({"id": 7, "action": "isolation"})).unwrap();
+        assert_eq!(request.id, Some(json!(7)));
+        assert!(matches!(request.action, Action::Isolation));
+        // The shared `display` key is stripped, never decoded as an action field.
+        let request = parse_request(json!({"action": "isolation", "display": "1"})).unwrap();
+        assert_eq!(request.context.display.as_deref(), Some("1"));
     }
 }
 
