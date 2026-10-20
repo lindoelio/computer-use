@@ -1298,6 +1298,41 @@ The full CI matrix. P8 part B already runs `bash -n scripts/package-macos-app.sh
 | Signed helper `.app` so TCC sticks | Yes, a helper binary | `Computer Use.app`, signing optional in CI | DONE | P8. Bundle id `ai.lindoelio.computer-use`, `LSUIElement`, usage strings, and an empty hardened-runtime entitlements file. `scripts/package-macos-app.sh` ad-hoc signs when `MACOS_SIGN_IDENTITY` is unset and names the zip `computer-use-macos-arm64-app-unsigned.zip`. Developer ID (`codesign --deep --force --options runtime --timestamp --entitlements`) and notarization run only when the secrets in `docs/PACKAGING.md` exist. Those secrets are not configured. This phase did not notarize or create a tag. A bare binary does not get the bundle id. Symlink `Computer Use.app/Contents/MacOS/computer-use` into `~/.local/bin`. Live ad-hoc packaging of the release binary passed `codesign --verify --verbose` and `plutil -lint`. The bundled `doctor` reported `bundle_id` `ai.lindoelio.computer-use`. The crate tarball does not include `packaging/` or `scripts/` until P15. |
 | Virtual display / isolation | No | `--display`, Xvfb recipe, private CGVirtualDisplay marked experimental | DONE | P14. `--display <id>` resolves a monitor from `displays` and gates every screen point (`click`, `double-click`, `triple-click`, `move`, `scroll`, `drag`, `mouse-down`, `mouse-up`) plus `--region`/`--window` bounds; anything outside is `invalid_arguments`, and an unknown id is `invalid_arguments` naming the ids that do exist. Points stay virtual-desktop points — the filter narrows what may be addressed, it does not rebase. A filtered screen capture passes the monitor rectangle to the shared xcap path, so the screenshot map origin is the monitor origin on all three platforms. `--display virtual` prints the Xvfb recipe (`Xvfb :99 -screen 0 1440x900x24`) and, with `--exec -- <cmd...>`, execs that command with `DISPLAY=:99` set; **it never starts Xvfb**, because an agent must not leave a stray X server behind, and on macOS/Windows it is `unsupported`. The `virtual-display` feature resolves `CGVirtualDisplayDescriptorCreate` and `CGVirtualDisplayCreate` with `dlsym` against an explicitly `dlopen`ed CoreGraphics (the global namespace cannot see an unopened framework) and **stops there**: no display is ever created, because the descriptor is an Objective-C object needing private class setup this build does not do. `isolation` reports `experimental` only when both symbols resolved and `unsupported` otherwise — on this macOS 27 machine both are absent, so it honestly reports `unsupported`. The VM proxy and the five infeasible items are documented in `docs/ISOLATION.md` and mirrored in the `isolation` JSON, with a snapshot test binding the two together. |
 
+### vs Codex — honest summary, not marketing
+
+How this repository compares to OpenAI Codex Computer Use as it is publicly documented (model surface, not the harness). Each row says where we exceed, where we match, and where we fall short. There is no claim beyond what the code or the doc does.
+
+**Where we exceed the public Codex surface**
+
+- **Stdin/stdout protocol, no MCP server.** `--adapter openai` and `--adapter anthropic` translate the public OpenAI `computer` tool shape and the Anthropic `computer_20251124` shape into the native protocol and back. The native protocol (`Action`, `CallContext`, `ComputerError`) is the same one Codex describes, plus extras the harness does not have (`pause`/`resume`, the policy subsystem, the OpenAI/Anthropic adapters themselves, batched actions, CDP attach).
+- **Policy + sensitive-action confirms.** Built-in deny of terminals and password managers, user and admin policy files, `--confirm-cmd` hook, `policy_denied` / `confirm_required` / `confirm_denied` codes, and `paused` after local user input. Codex's public surface does not describe a policy subsystem; ours ships one and unit-tests it.
+- **Windows and Linux.** UIA control patterns + tier `activate` retry (P12a + P12b) and AT-SPI + RemoteDesktop portal (P13a + P13b). Codex does not document a Windows backend at all; their Linux story is unverified publicly.
+- **Per-window capture with the tree.** SCK `initWithDesktopIndependentWindow` on macOS, `windows-capture` on Windows, the portal on Linux — one frame, no stitching, with `capture_source` and `occluded` reporting.
+- **Cross-platform CDP attach.** `chromiumoxide` 0.9.1 behind `--features cdp`. Pinned Chromium is the model's choice, not ours.
+- **Isolation primitives.** `--display` filter, `--display virtual` (Xvfb recipe, never starts Xvfb), `--synthetic-focus` behind `--features skylight`, click-through overlay, parallel agents via `foreground.lock`. None of these are part of the public Codex contract.
+
+**Where we match Codex**
+
+- Numbered key-window AX tree per observation, with truncation, URL shortening, and secure-field redaction.
+- `--element` targeting with re-fetch + revalidate + `stale_element`.
+- Tier `event` posting via `CGEventPostToPid` (macOS only; field 42 marker, field 91 window id, field 40 target pid).
+- Tier `ax` accessibility actions and values, including `AXScrollToVisible`, `AXShowMenu`, the four page-scroll actions, and the increment/decrement family.
+- Tree diff and force-full flag with a per-session cache revision sequence.
+- 1440-default `max-width` with `image_to_screen` / `screen_to_image` in every image.
+- Blocked-URL `url_blocked` for Safari, Chrome, Chromium, Edge, Brave, Arc, and Firefox, plus `blocked_url` for the CDP path.
+
+**Where we fall short**
+
+- **Linux is CI-only, not live.** No Wayland compositor was available on the development machine. AT-SPI works on X11 with `DISPLAY`; RemoteDesktop portal works when `portal` is compiled in. `list_windows` / `list_apps` / `launch` / `activate` / `quit` are still `unsupported`, so `screenshot --app` cannot reach `capture_window` yet. `reis` 0.7 has no public `ei_device` API, so the EIS handshake reports availability only.
+- **Accessibility was off for this process on the development Mac.** The full live path (press, value, set-value, perform-action, scroll-into-view, hit-test, event posting, AX press via SkyLight) was not exercised against a real window because the TCC grant is missing in this profile. `doctor` reports it. The code paths and unit tests pass; the live capture frame did not.
+- **Windows is CI-only, not live.** UIA patterns, tier `activate`, and the per-window `windows-capture` path are wired and tested on the macOS harness with the mock backend, and CI compiles and unit-tests on `windows-latest`. No live Windows host ran in P15.
+- **CDP click uses `Input.dispatchMouseEvent`.** No transform — the click is in the page coordinate system. The deviation is documented in P10 and at the function; it is not silently screen-space.
+- **Windows CDP port discovery is best-effort `unsupported`.** `QueryFullProcessImageNameW` does not give us argv; pass `--cdp-url ws://host:port` on Windows.
+- **Linux OCR is `unsupported`** in 0.2.0. No Tesseract, no `asyc-tesseract` glue, no plugin.
+- **Private-API features are experimental, fail closed.** `--tier synthetic` / `--features skylight` and `--features virtual-display` use `dlsym` and never call the symbol on this machine. They are off unless the feature is compiled in and the caller passes the matching flag.
+- **Unsigned `.app` unless the secrets exist.** `Computer Use.app` is built and ad-hoc signed by `scripts/package-macos-app.sh`; Developer ID signing and notarization only run when the secrets in `docs/PACKAGING.md` exist on CI. They are not configured today.
+- **MCP server is intentionally absent.** `serve` is stdin's protocol, not a network one. There is no TCP listener in any release.
+
 ## Progress
 Update this table at the end of a phase. `commit` is the full hash on `main` of the commit that finished that phase. The planning row is this commit, so it cannot name its own hash. Do not mark a phase `DONE` until CI on that commit is green for the three OS jobs.
 

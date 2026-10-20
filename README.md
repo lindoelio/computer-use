@@ -1,6 +1,6 @@
 # computer-use
 
-Cross-platform desktop automation for agents: screenshots, mouse, keyboard, scroll, displays, and a best-effort accessibility snapshot. One binary prints a single JSON object for every action. The same actions are available as a Rust library.
+Cross-platform desktop automation for agents: screenshots, mouse, keyboard, scroll, displays, accessibility trees, OCR, CDP attach, isolation, and a permission doctor. One Rust binary on macOS, Linux, and Windows. The same actions are available as a Rust library.
 
 The [smart-computer-use](https://github.com/lindoelio/smart-computer-use) agent skill shells out to this binary.
 
@@ -10,11 +10,11 @@ The [smart-computer-use](https://github.com/lindoelio/smart-computer-use) agent 
 
 Download a build for your platform from [GitHub Releases](https://github.com/lindoelio/computer-use/releases):
 
-| Asset | Platform |
-| --- | --- |
-| `computer-use-linux-x64.tar.gz` | Linux x86_64 |
-| `computer-use-macos-arm64.tar.gz` | macOS Apple silicon |
-| `computer-use-windows-x64.zip` | Windows x86_64 |
+| Asset | Platform | Notes |
+| --- | --- | --- |
+| `computer-use-linux-x64.tar.gz` | Linux x86_64 | Built with `--features portal` (ScreenCast + RemoteDesktop + PipeWire). |
+| `computer-use-macos-arm64.tar.gz` | macOS Apple silicon | Default features. `Computer Use.app` is bundled as a separate zip when the helper is built (see `docs/PACKAGING.md`). |
+| `computer-use-windows-x64.zip` | Windows x86_64 | Default features. |
 
 Each archive contains the `computer-use` binary (`computer-use.exe` on Windows). A matching `<asset>.sha256` file and a combined `SHA256SUMS` file are attached to the release.
 
@@ -46,23 +46,11 @@ sha256sum -c computer-use-linux-x64.tar.gz.sha256
 cargo install computer-use
 ```
 
-Rust 1.81 or newer is required. On Linux, install the native libraries listed under [Permissions](#permissions) before building.
+Rust 1.91 is the supported minimum. On Linux, install the native libraries listed under [Permissions](#permissions) before building.
 
 ## Usage
 
-Every action writes one JSON object to stdout and a trailing newline.
-
-```json
-{"ok":true,"waited_ms":10}
-```
-
-```json
-{"ok":false,"error":{"code":"invalid_arguments","message":"wait requires --ms or --seconds"}}
-```
-
-A failed action exits with status 1. A bad command line (missing flags, unknown arguments) exits with status 2 and still prints JSON. `--help` and `--version` stay human-readable and exit 0.
-
-`--pretty` pretty-prints one-shot JSON. `serve` and `--json` always print compact JSON so each response stays on one line.
+Every action writes one JSON object to stdout and a trailing newline. A failed action exits with status 1 and a `{"ok":false,"error":{...}}` body. A bad command line (missing flags, unknown arguments) exits with status 2 and still prints JSON. `--help` and `--version` stay human-readable and exit 0.
 
 ```bash
 computer-use --help
@@ -71,126 +59,7 @@ computer-use wait --ms 10
 computer-use --pretty wait --ms 10
 ```
 
-### screenshot
-
-Capture the screen, or a logical region, and write a PNG or JPEG. The default path is under the system temp directory. Coordinates are logical points, the same space as `click` and `move`. On a Retina display the image pixel size can be `scale` times the logical size.
-
-```bash
-computer-use screenshot
-computer-use screenshot --output /tmp/screen.png --region 0,0,800,600
-computer-use screenshot --format jpeg --max-width 1280 --base64
-```
-
-`--format` accepts `png` (default), `jpeg`, or `jpg`. `--max-width N` scales the image down so its width is at most N pixels. `--base64` adds a standard (unwrapped) base64 `data` field.
-
-```json
-{"ok":true,"path":"/tmp/computer-use-123-456.png","width":800,"height":600,"scale":2.0,"format":"png"}
-```
-
-### click
-
-Move the pointer to a logical point and click. `--button` is `left` (default), `right`, or `middle`. `--double` clicks twice.
-
-```bash
-computer-use click --x 120 --y 240
-computer-use click --x 120 --y 240 --button right --double
-```
-
-### move
-
-Move the pointer without clicking.
-
-```bash
-computer-use move --x 400 --y 300
-```
-
-### type
-
-Type Unicode text into the focused control.
-
-```bash
-computer-use type --text "hello"
-```
-
-### key
-
-Press a key combination. The last segment is the key. Earlier segments are modifiers.
-
-| Token | Meaning |
-| --- | --- |
-| `cmd`, `command` | Command (macOS). Sent as the platform meta key. |
-| `meta`, `super` | Meta / Super |
-| `ctrl`, `control` | Control |
-| `alt`, `option` | Alt / Option |
-| `shift` | Shift |
-
-Named keys: `enter` / `return`, `tab`, `esc` / `escape`, `space`, `left` / `right` / `up` / `down` (and `arrow` aliases), `f1`–`f12`, `backspace`, `delete`, `home`, `end`, `pageup` / `pagedown` (and `page_up` / `page_down`). A single character is that character, case preserved (`shift+A`).
-
-```bash
-computer-use key --keys "cmd+shift+4"
-computer-use key --keys "ctrl+c"
-computer-use key --keys "alt+tab"
-```
-
-### scroll
-
-Scroll the mouse wheel. Positive `--dy` scrolls down. Positive `--dx` scrolls right. Pass `--x` and `--y` together to move the pointer first.
-
-Use `--dx` and `--dy`, or `--direction` (`up`, `down`, `left`, `right`) with `--amount` (default 1). Do not mix the two forms.
-
-```bash
-computer-use scroll --dy 3
-computer-use scroll --dx -2 --dy 1
-computer-use scroll --direction down --amount 3
-computer-use scroll --x 400 --y 300 --direction up --amount 2
-```
-
-### get-state
-
-Report screen size and displays, cursor position, the frontmost app and window, and a best-effort accessibility tree. The command does not panic when a subsystem is unavailable. Missing data is `null`, and `note` explains why. `get_state` is an alias.
-
-```bash
-computer-use get-state
-computer-use get_state
-```
-
-```json
-{
-  "ok": true,
-  "platform": "macos",
-  "displays": [{"id": 1, "name": "Built-in", "x": 0, "y": 0, "width": 1512, "height": 982, "scale": 2.0, "is_primary": true}],
-  "screen": {"id": 1, "name": "Built-in", "width": 1512, "height": 982, "scale": 2.0, "x": 0, "y": 0},
-  "cursor": {"x": 400, "y": 300},
-  "frontmost_app": "Finder",
-  "frontmost_window": "Desktop",
-  "accessibility": null,
-  "note": "accessibility permission is required"
-}
-```
-
-### wait
-
-Sleep, then return `waited_ms`. `--ms` and `--seconds` are added when both are set. At least one is required. Fractions are allowed for `--seconds`.
-
-```bash
-computer-use wait --ms 250
-computer-use wait --seconds 0.5
-computer-use wait --ms 100 --seconds 1
-```
-
-### displays
-
-List connected displays without capturing pixels.
-
-```bash
-computer-use displays
-```
-
-### JSON mode
-
-`serve` and `--json` read newline-delimited JSON from stdin and write one JSON response per line. This is a stdin protocol, not a TCP server. The process exits 0 on a clean end of input. It exits non-zero only when stdin or stdout fails. An individual action can still be `{"ok":false,...}`.
-
-`exec` runs one JSON action from an argument and honors `--pretty`.
+`serve` reads newline-delimited JSON from stdin and writes one JSON response per line. `--json` does the same. `exec` runs one JSON action from an argument and honors `--pretty`. There is no TCP server in any release.
 
 ```bash
 printf '%s\n' '{"id":1,"action":"wait","ms":10}' | computer-use serve
@@ -199,20 +68,196 @@ computer-use exec '{"action":"wait","ms":10}'
 computer-use --pretty exec '{"id":"a","action":"displays"}'
 ```
 
-Requests are objects with an `action` tag and optional `id`. The `id` is echoed on the response. Unknown fields that belong to the action are rejected.
+`--adapter native|openai|anthropic` rewrites the `exec` and stdin requests on the way in. The native protocol is what `Action` and the action-name list describe below; the adapter layers translate the OpenAI `computer` and Anthropic `computer_20251124` shapes into the native one and set `coord=image`. See `docs/CLI.md` for the full JSON schema and `--help` for the surface area.
 
-| `action` | Fields |
+### Default max-width
+
+`screenshot` (and `zoom`) scale the image down so its width is at most **1440 pixels** by default. Pass `--max-width 0` to keep the source width. `--max-width N` with any other positive integer caps the width at `N`. `--canvas WxH` letterboxes the result into `WxH` without scaling up. On a Retina display the image pixel size can be `scale` times the logical size.
+
+### Policy path
+
+`~/.config/computer-use/policy.toml` on every OS, including macOS and Windows. The admin file is `/etc/computer-use/policy.toml` on Linux and macOS, and `%ProgramData%\computer-use\policy.toml` on Windows. `--policy <PATH>` overrides the user file. A missing file is **default allow** plus the built-in deny list. `--policy check --app X` reports what the effective policy would decide without performing the action.
+
+### Feature flags
+
+| Flag | What it pulls in | Default on this binary |
+| --- | --- | --- |
+| (default) | Screenshots, mouse, keyboard, accessibility tree, OCR, isolation, the macOS helper `.app` plumbing. | always |
+| `cdp` | `chromiumoxide` 0.9.1 + a small `tokio`. Required for `computer-use --cdp browser ...`. | off |
+| `portal` | `ashpd` 0.13.13 ScreenCast + RemoteDesktop, `pipewire` 0.9, `reis` 0.7. Linux only. | on in the Linux release binary; off in the default CI build |
+| `skylight` | macOS private SkyLight focus path behind `--tier synthetic` / `--synthetic-focus`. | off |
+| `virtual-display` | macOS private `CGVirtualDisplayDescriptor` probe; probe-only, never creates a display. | off |
+
+`--features cdp`,`--features portal`,`--features skylight`,`--features virtual-display` build what the flag page describes. `--all-features` compiles everywhere (Linux builds also link PipeWire).
+
+### Top-level commands
+
+```
+screenshot          Capture the screen, a region, or one window, and write a PNG or JPEG file
+click               Move the pointer to a logical point and click, or press an element
+triple-click        Click three times. Alias of `click --count 3`
+press               Press an element from the current tree. `--count` may be 1, 2, or 3
+set-value           Set an element's value. Secure fields are refused
+select-text         Select a character range. Secure fields are refused
+perform-action      Perform an allowlisted accessibility action
+scroll-to           Scroll an element into view
+focus               Focus an element
+move                Move the pointer without clicking
+drag                Drag from the first point through the rest, then release
+mouse-down          Press a mouse button and leave it down until `mouse-up`
+mouse-up            Release a mouse button pressed by `mouse-down`
+type                Type Unicode text into the focused control
+key                 Press a key combination
+hold-key            Hold one key combination, then release it
+clipboard           Read or write the clipboard (`get`, `set`)
+zoom                Screenshot one region. With `--app`/`--window`, the region is window-local
+scroll              Scroll the mouse wheel
+get-state           Report displays, cursor, frontmost window, and a best-effort accessibility tree
+wait                Sleep, then return `waited_ms`
+displays            List connected displays without capturing pixels
+isolation           Report what this build can isolate and what it cannot
+list-apps           List running applications
+list-windows        List on-screen windows in z-order. Index 0 is front
+launch              Launch an application by name, bundle id, path, or pid
+activate            Bring an application forward
+quit                Ask an application to quit
+policy              Show whether policy allows an app. This does not perform an action
+pause               Pause mutating actions until `resume`
+resume              Clear the pause flag
+doctor              Report permissions, the TCC identity, and how to fix what is missing
+tree                Print the key window's accessibility tree
+ocr                 Run OCR on the most recent capture for `--app` or `--window`
+menu                Walk a running app's menu bar (macOS only)
+apple-event         Send an Apple event script via `osascript` (macOS only)
+shortcuts           Run a Shortcuts workflow by name (macOS only)
+dock                List or click Dock items (macOS only)
+spaces              Group on-screen windows by the screen that contains each window's center
+session             Session cache and accessibility teardown (`end`, `prune`)
+serve               Read newline-delimited JSON actions from stdin
+exec                Run one JSON action from an argument
+overlay             Local agent-cursor helper. This is not a network service
+browser             Chrome DevTools Protocol (CDP) subcommands. Requires `--cdp`
+help                Print this message or the help of the given subcommand(s)
+```
+
+### Permissions
+
+Input and capture need permission from the operating system. `get-state` still returns `ok: true` when a subsystem is denied: the missing field is `null` and `note` says why. `doctor` enumerates each required grant plus the TCC identity; the JSON result is the source of truth.
+
+#### macOS
+
+| Permission | What uses it | Where to grant |
+| --- | --- | --- |
+| **Screen Recording** | `screenshot`, `zoom`, the `capture` path in `get-state`, ScreenCaptureKit window capture | System Settings → Privacy & Security → Screen Recording |
+| **Accessibility** | The accessibility tree, hit-testing, `AXPress`, `set_value`, `select_text`, element `type`, `menu`, Apple events, `osascript` fallback | System Settings → Privacy & Security → Accessibility |
+| **Post Event** | Tier `event` (`CGEventPostToPid`), `CGEventCreate`, hit-test | System Settings → Privacy & Security → Accessibility |
+| **Input Monitoring** | The P6 kill-switch tap | System Settings → Privacy & Security → Input Monitoring |
+
+The bundle id is `ai.lindoelio.computer-use` when the binary is run from `Computer Use.app` (`scripts/package-macos-app.sh` builds it). A bare binary does **not** have a stable bundle id — the TCC grant is for the signed bundle. The `--prompt` flag on `doctor` calls the macOS request APIs without changing anything in this process otherwise; `--open-settings` opens the first missing pane.
+
+#### Windows
+
+Run the process in a session that can send input (an interactive desktop, not Session 0).
+
+- Apps and windows come from `EnumWindows`, `GetWindowTextW`, `GetWindowThreadProcessId`, and `QueryFullProcessImageNameW` (`windows` 0.62). There is no PowerShell anywhere in the binary.
+- The accessibility tree is the UI Automation control-view walker (`uiautomation` 0.25.1). `tree` reports `source: "uia"`, `--app pid:NNN` is a deterministic selector, and `GetForegroundWindow` is never used to resolve a window the caller already named.
+- Element actions run through UIA control patterns (`Invoke`, `Value`, `Text`, `ScrollItem`, `ExpandCollapse`) in the background — tier `ax`, no cursor motion. `IsPassword` controls refuse `set_value` and `type --element`. When a pattern is missing, or its single call fails (some Win32 apps ignore `Invoke` until they are in front), the action is retried as tier `activate`: `SetForegroundWindow` plus enigo input, under the same `foreground.lock` as every other foreground path, with a `foreground required` warning on the result. `--require-background` refuses that fallback, and the P6 policy allowlist still applies.
+- Per-window capture is one `Windows.Graphics.Capture` frame from the resolved `HWND` (`windows-capture` 2.0.1). If graphics capture cannot produce a frame, the desktop image is cropped instead and reported as `capture_source: "xcap"`, so covered pixels may be wrong.
+- OCR is `Windows.Media.Ocr.OcrEngine` for the user-profile languages. If no recognizer language pack is installed, `ocr` returns `execution_failed` naming Settings → Apps → Optional features.
+- `doctor` reports `accessibility` (did `UIAutomation::new` succeed), plus best-effort `uiaccess` and `integrity` read from the process token with `OpenProcessToken` / `GetTokenInformation`. Neither is a required grant.
+
+A corporate policy that blocks UI Automation or simulated input surfaces as `execution_failed` or a null field.
+
+#### Linux
+
+The binary talks to X11 through `libxdo` (enigo) and captures through `xcap` (XCB, RandR, D-Bus). On a Wayland session, the `portal` feature is needed for capture (ScreenCast) and event-tier input (RemoteDesktop). Install the build packages on Debian/Ubuntu:
+
+```bash
+sudo apt-get install -y pkg-config libxdo-dev libx11-dev libxcb1-dev \
+  libxrandr-dev libdbus-1-dev libxkbcommon-dev libatspi2.0-dev \
+  libpipewire-0.3-dev libclang-dev clang
+```
+
+`xdotool` on `PATH` improves the frontmost-window lookup. The accessibility tree is `AT-SPI` (default features). Tier `event` is X11 XTest on plain X11 and the RemoteDesktop portal on Wayland when the `portal` feature is compiled in. Without `portal`, Wayland tier `event` is `unsupported`. Grant the session access to the X display (`DISPLAY` set, and the same user that owns the session).
+
+The release binary is built with `--features portal`, which links `libpipewire-0.3` at build time and pulls one frame off the portal's PipeWire stream. Linux OCR is `unsupported` in 0.2.0.
+
+## Input tiers
+
+`--tier` selects the input path. Auto (the default) is platform-tuned:
+
+- **macOS**: `ax` for presses and value changes; `event` then `activate` for coordinates, `type` without `--element`, `key`, and `scroll`. `synthetic` is never automatic.
+- **Windows**: `ax` (UIA control patterns); falls back to `activate` (`SetForegroundWindow` + enigo) under `foreground.lock` when a pattern is missing or fails. Auto is `activate` for free-text `type`, `key`, and `scroll`.
+- **Linux**: `ax` (AT-SPI) when present; `event` (XTest on X11, RemoteDesktop portal on Wayland) for coordinates; `activate` (enigo) as the foreground fallback.
+
+| `--tier` | What it does |
 | --- | --- |
-| `screenshot` | `output`, `region` (`"x,y,w,h"` or `{x,y,width,height}`), `format` (`png` or `jpeg`), `max_width`, `base64` |
-| `click` | `x`, `y`, `button` (`left`, `right`, `middle`), `double` |
-| `double_click` | `x`, `y`, `button` |
-| `move` | `x`, `y`. Alias: `move_mouse` |
-| `type` | `text` |
-| `key` | `keys` |
-| `scroll` | `x`, `y`, `dx` (alias `scroll_x`), `dy` (alias `scroll_y`), `direction`, `amount` |
-| `get_state` | none. Alias: `get-state` |
-| `wait` | `ms`, `seconds` |
-| `displays` | none |
+| `ax` | Accessibility action or value. Does not activate the app. |
+| `event` | Post events to the target process. Does not move the system cursor. macOS posts to the target pid via `CGEventPostToPid`. Linux uses XTest on X11 and the RemoteDesktop portal on Wayland. |
+| `synthetic` | Private SkyLight front-process call, then post events. Requires `--features skylight` and `--tier synthetic` (or `--synthetic-focus`). |
+| `activate` | Activate the target, run foreground input, then restore the previous app. Takes `foreground.lock`. |
+
+`--require-background` refuses `activate` and turns cursor motion into `execution_failed`. `--allow-foreground` skips the lock. `--no-overlay` skips the agent-cursor helper socket. The agent cursor overlay (`overlay serve`) is macOS-only; a missing helper adds `overlay helper not running` and the action still succeeds.
+
+## JSON actions
+
+The `Action` enum in `src/protocol.rs` is the protocol. `id` is echoed on the response. Unknown fields that belong to the action are rejected. Global flags (`app`, `window`, `element`, `diff`, `full`, `return_state`, `include_screenshot`, `coord`, `session`, `tier`, `adapter`, `display`, `require_visible`, `policy`, `confirm_cmd`, `allow_foreground`, `require_background`, `no_overlay`, `cdp`, `cdp_url`) are siblings of `action` and stripped before the action is decoded.
+
+| `action` | Fields | Notes |
+| --- | --- | --- |
+| `screenshot` | `output`/`path`, `region` (`"x,y,w,h"` or `{x,y,width,height}`), `format` (`png`/`jpeg`/`jpg`), `max_width`, `canvas` (`"WxH"`), `base64`, `marks` | Default `max_width` is 1440. `0` keeps the source width. `marks` stamps tree indices (`n`) on a window target or OCR indices (`oN`) when the tree is empty. |
+| `click` | `x`, `y`, `button` (`left`/`right`/`middle`/`back`/`forward`), `double`, `count` | `count` is 1, 2, or 3. `double: true` means `count: 2` when omitted. With `--element`/`element` the screen coordinates are ignored. |
+| `double_click` | `x`, `y`, `button` | Alias: `click --double`. |
+| `triple_click` | `x`, `y`, `button` | Alias: `click --count 3`. |
+| `move` | `x`, `y` | Alias: `move_mouse`. |
+| `press` | `count` (1–3), `button` | AXPress for left, AXShowMenu for right when advertised. |
+| `type` | `text` | Uses `AXValue` when `--element` is set and settable. |
+| `key` | `keys` | Combo such as `cmd+shift+4`. |
+| `scroll` | `x`, `y`, `dx`/`scroll_x`, `dy`/`scroll_y`, `direction`, `amount` | Positive `dy` is down; positive `dx` is right. `direction` + `amount` is a separate form; do not mix. |
+| `drag` | `path` (array of points or `x,y,x,y` string), `button` | At least two points. Tier `event` posts mouse-dragged events to the pid; tier `activate` uses enigo. |
+| `mouse_down` | `x`, `y`, `button` | Held until `mouse-up` or process exit. |
+| `mouse_up` | `x`, `y`, `button` | Releases the press from `mouse_down`. |
+| `hold_key` | `keys`, `ms` (≤ 30000) | One combination. Space-separated sequences are refused. |
+| `zoom` | `region` (required), `output`/`path`, `format`, `max_width`, `canvas`, `base64` | Window-local coordinates when `--app`/`--window` is set. |
+| `clipboard_get` | none | Text wins; `kind: "empty"` is reported. An image is written to the session cache and `kind: "image"` is reported with a `path`. |
+| `clipboard_set` | `text`, `image` (PNG path) | Requires a confirm hook. Empty `text` is `invalid_arguments`. |
+| `focus` | none | Sets `AXFocused` on the `--element`. |
+| `set_value` | `value` | Refused for secure fields (`policy_denied`; the value is never read). |
+| `select_text` | `start`, `end` | Refused for secure fields. |
+| `perform_action` | `name` | Allowlist (`AXPress`, `AXShowMenu`, `AXIncrement`, `AXDecrement`, `AXConfirm`, `AXCancel`, `AXRaise`, `AXScrollToVisible`, the four page-scroll actions). |
+| `scroll_to` | none | Aliases: `scroll-to`, `scroll_to_visible`, `scroll-to-visible`. |
+| `get_state` | none | Alias: `get-state`. |
+| `cursor_position` | none | Reads the pointer. The Anthropic adapter maps `cursor_position` here. |
+| `wait` | `ms`, `seconds` | Summed when both are set. Fractions are allowed in `seconds`. |
+| `displays` | none | List displays without capturing pixels. |
+| `isolation` | none | Pure report: what this build can isolate. |
+| `list_apps` | `all` | `all: true` includes accessory and prohibited apps. |
+| `list_windows` | none | z-order; index 0 is front. |
+| `launch` | `app` (sibling) | Launch via `NSWorkspace` on macOS; otherwise `unsupported`. |
+| `activate` | `app`, `window` | `--window` is checked first. |
+| `quit` | `force` | `--force` is a confirm-gated terminate. |
+| `policy_check` | `app` (sibling) | Reports `allow`/`deny` without performing the action. |
+| `pause` / `resume` | none | Cross-process kill switch. macOS only (CGEventTap). |
+| `doctor` | `prompt` (alias `request`), `open_settings`, `x11` | Envelope `ok: true` even when a permission is missing. |
+| `tree` | none | Numbered accessibility tree for the key window. |
+| `ocr` | `force` | Re-run OCR even when `--app` already produced it. |
+| `session_end` | none | Restore Electron accessibility flags this process changed. |
+| `session_prune` | `dry_run`, `ttl_secs` | Remove empty session directories and stale ones. Default TTL is 24h. |
+| `menu_list` | `app` (override), `depth` | macOS only. Walks `AXMenuBar → AXMenuBarItem → AXMenu`. |
+| `menu_click` | `app` (override), `path` (`"File > Save"`) | macOS only. `AXPress`es the leaf. |
+| `apple_event` | `app` (override), `script`, `language` (`applescript`/`javascript`) | macOS only. Runs `osascript`. The script body is never logged. |
+| `shortcuts_run` | `name` | macOS only. Invokes `shortcuts run <name>`. |
+| `dock_list` | none | macOS only. Lists Dock items. |
+| `dock_click` | `title` | macOS only. Case-insensitive title match. |
+| `spaces` | none | Groups on-screen windows by screen. Mission Control moves are not attempted. |
+| `batch` | `actions`, `stop_on_error` | One resolved target, one revision sequence. Each step re-validates. Nested batch is `invalid_arguments`. |
+| `browser_tabs` | none | `cdp` feature. |
+| `browser_activate` | `target_id` | `cdp` feature. |
+| `browser_navigate` | `url`, `target_id` | `cdp` feature. URL is checked against `[browser].blocked_urls`. |
+| `browser_click` | `selector`, `target_id` | `cdp` feature. CSS selector, clicked via `Input.dispatchMouseEvent`. |
+| `browser_text` | `selector`, `target_id` | `cdp` feature. Returns the matched element's `innerText`. |
+| `browser_type` | `text`, `selector` (optional), `target_id` | `cdp` feature. Selector or page body. |
+| `browser_eval` | `script`, `target_id` | `cdp` feature. The script body is never logged verbatim; only its length and a stable `DefaultHasher` hash. |
 
 ```json
 {"id":1,"action":"click","x":10,"y":20,"button":"left"}
@@ -222,7 +267,30 @@ Requests are objects with an `action` tag and optional `id`. The `id` is echoed 
 {"action":"get_state"}
 ```
 
-Error `code` values are `invalid_arguments`, `execution_failed`, `io_error`, and `unsupported`.
+The `--adapter openai` and `--adapter anthropic` translations cover click, double_click, scroll, type, keypress, move, wait, screenshot, cursor_position, back, forward, drag, mouse_down, mouse_up, triple_click, left_click_drag, hold_key, and zoom.
+
+### Error codes
+
+The JSON `error.code` is one of the strings below. `ComputerError::code()` is the stable contract.
+
+| Code | When |
+| --- | --- |
+| `invalid_arguments` | Bad CLI flags or malformed JSON. |
+| `execution_failed` | Framework error that is not in this table. |
+| `io_error` | stdin/stdout/filesystem failure. |
+| `unsupported` | Off-platform or feature-off. |
+| `app_not_found` | Name, bundle id, or pid matched nothing running, and launch was not requested. |
+| `window_not_found` | App resolved, window did not. |
+| `element_not_found` | Index missing in the cached or fresh tree, or there is no session cache. |
+| `stale_element` | The path's role, identifier, or frame (beyond 2 points) changed, or the cached pid, window, or revision header does not match. Action not performed. Body includes the new tree. |
+| `permission_required` | Accessibility or Screen Recording is off. The `doctor` `fix` object names the Settings pane. |
+| `policy_denied` | Built-in or configured deny. |
+| `confirm_required` | Sensitive action and no confirm hook is configured. |
+| `confirm_denied` | Hook exited non-zero or timed out. |
+| `blocked_url` | Browser URL matched the block list. |
+| `paused` | Local user input tripped the kill switch. |
+| `cdp_unavailable` | Feature off, or Chrome has no debugging port. |
+| `display_unavailable` | The screen is locked, the display is asleep, or no display or shareable window is available. Checked before `window_not_found`; no xcap crop fallback. |
 
 ## Library
 
@@ -236,57 +304,41 @@ let response = dispatch(Action::Wait {
 assert!(response.ok);
 ```
 
-`DesktopBackend` (also exported as `Backend`) is the platform trait. `create_desktop_backend()` returns the backend for the current operating system. `dispatch` and `dispatch_with` share the path used by the CLI. `Action` and the JSON request parser use serde with `tag = "action"`. Errors use `thiserror` (`ComputerError`).
-
-## Permissions
-
-Input and capture need permission from the operating system. `get-state` still returns `ok: true` when a subsystem is denied: the missing field is `null` and `note` says why. The process does not prompt for macOS permission on startup (`open_prompt_to_get_permissions` is off). Grant permission in System Settings before you call click, type, key, or screenshot.
-
-### macOS
-
-- **Screen Recording** — System Settings → Privacy & Security → Screen Recording. Required for `screenshot` and display capture inside `get-state`.
-- **Accessibility** — System Settings → Privacy & Security → Accessibility. Required for mouse, keyboard, and the accessibility tree (`osascript` / System Events).
-
-### Windows
-
-Run the process in a session that can send input (an interactive desktop, not Session 0).
-
-- **Apps and windows** come from Win32 `EnumWindows`, `GetWindowTextW`, `GetWindowThreadProcessId`, and `QueryFullProcessImageNameW`. There is no PowerShell anywhere in the binary.
-- **The accessibility tree** is the UI Automation control-view walker (`uiautomation` 0.25.1). `tree` reports `source: "uia"`, `--app pid:NNN` is a deterministic selector, and `GetForegroundWindow` is never used to resolve a window the caller already named.
-- **Element actions** run through UIA control patterns (`Invoke`, `Value`, `Text`, `ScrollItem`, `ExpandCollapse`) in the background — tier `ax`, no cursor motion. `IsPassword` controls refuse `set_value` and `type --element`. When a pattern is missing, or its single call fails (some Win32 apps ignore `Invoke` until they are in front), the action is retried as tier `activate`: `SetForegroundWindow` plus enigo input, under the same `foreground.lock` as every other foreground path, with a `foreground required` warning on the result. `--require-background` refuses that fallback, and the P6 policy allowlist still applies.
-- **Per-window capture** is one `Windows.Graphics.Capture` frame from the resolved `HWND` (`windows-capture` 2.0.1). If graphics capture cannot produce a frame, the desktop image is cropped instead and reported as `capture_source: "xcap"`, so covered pixels may be wrong.
-- **OCR** is `Windows.Media.Ocr.OcrEngine` for the user-profile languages. If no recognizer language pack is installed, `ocr` returns `execution_failed` naming Settings → Apps → Optional features. `screenshot --marks` draws the tree frames or the OCR boxes.
-- **`doctor`** reports `accessibility` (did `UIAutomation::new` succeed), plus best-effort `uiaccess` and `integrity` read from the process token with `OpenProcessToken` / `GetTokenInformation`. Neither is a required grant.
-
-A corporate policy that blocks UI Automation or simulated input surfaces as `execution_failed` or a null field.
-
-### Linux
-
-The binary talks to X11 through `libxdo` (enigo) and captures through `xcap` (XCB, RandR, D-Bus). Wayland sessions are not a supported target. Install build packages on Debian/Ubuntu:
-
-```bash
-sudo apt-get install -y pkg-config libxdo-dev libx11-dev libxcb1-dev \
-  libxrandr-dev libdbus-1-dev libxkbcommon-dev
-```
-
-`xdotool` on `PATH` improves the frontmost-window lookup. The accessibility tree is `null` with a note (AT-SPI is not wired). Grant the session access to the X display (`DISPLAY` set, and the same user that owns the session).
+`DesktopBackend` (also exported as `Backend`) is the platform trait. `create_desktop_backend()` returns the backend for the current operating system. `dispatch` and `dispatch_with` share the path used by the CLI. `Action` and the JSON request parser use serde with `tag = "action"`. Errors use `thiserror` (`ComputerError`). The full surface (`CallContext`, `LineOptions`, `handle_request_line_opts`) is documented in `docs/CLI.md` and lives in `src/protocol.rs`.
 
 ## Coordinates
 
-Click, move, scroll, and screenshot regions use **logical** points. A display's `width`, `height`, `x`, and `y` are logical. `scale` is physical pixels divided by logical width (often `2.0` on Retina). A screenshot's `width` and `height` are image pixels, which can be larger than the logical region.
+Click, move, scroll, and screenshot regions use **logical** points. A display's `width`, `height`, `x`, and `y` are logical. `scale` is physical pixels divided by logical width (often `2.0` on Retina). A screenshot's `width` and `height` are image pixels, which can be larger than the logical region. The map lives at `${XDG_CACHE_HOME:-~/.cache}/computer-use/sessions/<session>/screenshot-map.json` (macOS and Linux) or `%LOCALAPPDATA%\computer-use\cache\sessions\<session>\screenshot-map.json` (Windows), mode 0600.
 
-Scroll signs follow the platform wheel: positive `dy` is down, positive `dx` is right.
+`--coord image` (or `coord=image`) interprets `x`/`y` as image pixels of the most recent screenshot; the map remaps them to screen points. The OpenAI and Anthropic adapters set `coord=image` automatically and require a stored map.
+
+`--display <id>` resolves a monitor from `displays` and gates every screen point, `--region`, and `--window` against it. Points outside the monitor are `invalid_arguments`. The filtered capture reuses the shared `backend::capture` path, so the map origin is the monitor origin. `--display virtual` is Linux-only; it prints the Xvfb recipe and never captures.
+
+## Isolation
+
+`isolation` is a pure report: `{platform, display_filter, cdp, virtual_display, set_of_marks}`. macOS reports `virtual_display: "experimental"` only when both `CGVirtualDisplayDescriptorCreate` and `CGVirtualDisplayCreate` resolved; otherwise `unsupported`. The build never creates a virtual display — see `docs/ISOLATION.md` for the reason and the VM proxy design.
 
 ## Development
 
 ```bash
 cargo fmt --all
 cargo build
-cargo test
-cargo clippy --all-targets -- -D warnings
+cargo test --all-targets
+cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-Tests do not move the pointer, capture the screen, or require Screen Recording or Accessibility.
+Tests do not move the pointer, capture the screen, or require Screen Recording or Accessibility. macOS-only tests behind `#[cfg(target_os = "macos")]` are skipped on Linux and Windows runners. The CI matrix is Ubuntu (default + `--features portal`), macOS (default, with `bash -n`/`shellcheck` on `scripts/package-macos-app.sh` and an ad-hoc bundle check on the debug binary), and Windows (default).
+
+`~/.grok-prompts/linux-check.sh` runs the same checks inside `rust:1-bookworm` when Docker is available; otherwise CI is the gate.
+
+## Documentation
+
+- [`docs/CLI.md`](docs/CLI.md) — every command, flag, JSON action, and error code, generated from `--help` and the protocol enums.
+- [`docs/ROADMAP.md`](docs/ROADMAP.md) — the phase plan, the progress table, and the parity audit.
+- [`docs/ISOLATION.md`](docs/ISOLATION.md) — display filter, Xvfb recipe, virtual-display limitations.
+- [`docs/PACKAGING.md`](docs/PACKAGING.md) — macOS `.app` packaging, signing, notarization.
+- [`docs/SKYLIGHT.md`](docs/SKYLIGHT.md) — synthetic-focus design notes.
+- [`docs/policy.example.toml`](docs/policy.example.toml) — policy file reference.
 
 ## License
 
