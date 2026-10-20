@@ -371,6 +371,42 @@ pub trait DesktopBackend: Send + Sync {
         }
     }
 
+    /// Walk the latest tree and return rectangles in image pixels plus the
+    /// label to draw (`n` for tree index). The screenshot command uses
+    /// these for the `--marks` overlay.
+    ///
+    /// Empty results are not an error; the dispatcher decides whether to
+    /// fall back to OCR or to leave the image unmarked. Non-macOS platforms
+    /// always return `Ok(Vec::new())`; OCR for those platforms is `Unsupported`.
+    fn marks_for_tree(
+        &self,
+        _query: &TreeQuery,
+        _map: &crate::image_util::ScreenshotMap,
+    ) -> Result<Vec<crate::vision::MarkBox>, ComputerError> {
+        Ok(Vec::new())
+    }
+
+    /// Run OCR on one captured image and return the redacted, screen-remapped
+    /// blocks. `image` is the prepared shot's pixels.
+    fn recognize_text(
+        &self,
+        _image: &image::RgbaImage,
+        _map: &crate::image_util::ScreenshotMap,
+    ) -> Result<crate::vision::OcrResult, ComputerError> {
+        Err(unsupported("ocr"))
+    }
+
+    /// Image-pixel rectangles of every secure element in the latest tree.
+    /// The OCR dispatcher drops recognized text whose block falls inside
+    /// any of these rectangles. The default returns an empty list, which
+    /// matches every non-macOS platform and the mock backend.
+    fn secure_ocr_frames(
+        &self,
+        _query: &TreeQuery,
+    ) -> Result<Vec<crate::vision::ocr::ImageRect>, ComputerError> {
+        Ok(Vec::new())
+    }
+
     /// Read the clipboard. The default uses the system pasteboard outside tests.
     ///
     /// The stub overrides this and never touches the real pasteboard.
@@ -682,6 +718,35 @@ macro_rules! impl_platform_backend {
             #[cfg(target_os = "macos")]
             fn spaces(&self) -> Result<crate::window_groups::SpacesReport, ComputerError> {
                 Ok(macos::spaces::report())
+            }
+
+            // P11: marks overlay reuses the latest tree; OCR runs Apple
+            // Vision. macOS overrides the trait defaults; Linux and Windows
+            // keep the empty/unsupported ones.
+            #[cfg(target_os = "macos")]
+            fn marks_for_tree(
+                &self,
+                query: &TreeQuery,
+                map: &crate::image_util::ScreenshotMap,
+            ) -> Result<Vec<crate::vision::MarkBox>, ComputerError> {
+                macos::marks_for_tree(query, map)
+            }
+
+            #[cfg(target_os = "macos")]
+            fn recognize_text(
+                &self,
+                image: &image::RgbaImage,
+                map: &crate::image_util::ScreenshotMap,
+            ) -> Result<crate::vision::OcrResult, ComputerError> {
+                macos::recognize_text(image, map)
+            }
+
+            #[cfg(target_os = "macos")]
+            fn secure_ocr_frames(
+                &self,
+                query: &TreeQuery,
+            ) -> Result<Vec<crate::vision::ocr::ImageRect>, ComputerError> {
+                macos::secure_ocr_frames(query)
             }
         }
     };

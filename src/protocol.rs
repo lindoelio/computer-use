@@ -34,6 +34,7 @@ use crate::types::{
     parse_path, region_inside, Frame, ImageFormat, Modifier, MouseButton, Point, Region,
     ScrollDirection,
 };
+use crate::vision::{OcrBlock, OcrResult};
 
 const MAX_WAIT_MS: u128 = 24 * 60 * 60 * 1000;
 
@@ -81,6 +82,11 @@ pub enum Action {
         /// Include standard base64 bytes in `data`.
         #[serde(default, skip_serializing_if = "is_false")]
         base64: bool,
+        /// Stamp numbered element rectangles on the image. tree indices
+        /// (`n`) on a window target; OCR indices (`on`) when a tree cannot
+        /// be read. `--marks` from the CLI turns this on.
+        #[serde(default, skip_serializing_if = "is_false")]
+        marks: bool,
     },
     /// Move to a point and click, or press an element when `element` is set.
     Click {
@@ -486,6 +492,14 @@ pub enum Action {
         /// Restrict to one tab. Optional.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target_id: Option<String>,
+    },
+    /// Run OCR on the most recent capture for `--app`/window target. macOS
+    /// only. Linux returns `unsupported`; Windows is a stub until P12.
+    #[serde(rename = "ocr")]
+    Ocr {
+        /// Re-run OCR even when `--app` already produced it. Defaults to false.
+        #[serde(default, skip_serializing_if = "is_false")]
+        force: bool,
     },
 }
 
@@ -981,6 +995,7 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
             max_width,
             canvas,
             base64,
+            marks,
         } => result_response(screenshot(
             backend,
             context,
@@ -992,6 +1007,7 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
                 canvas,
                 include_base64: base64,
                 window_crop: false,
+                marks,
             },
         )),
         Action::Zoom {
@@ -1012,6 +1028,7 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
                 canvas,
                 include_base64: base64,
                 window_crop: true,
+                marks: false,
             },
         )),
         Action::Click {
@@ -1058,6 +1075,7 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
         } => scroll(backend, context, (x, y), (dx, dy), direction, amount),
         Action::GetState => result_response(Ok(collect_state_for(backend, &tree_query(context)))),
         Action::Tree => result_response(tree_action(backend, context)),
+        Action::Ocr { force } => result_response(ocr_action(backend, context, force)),
         Action::SessionEnd => result_response(session_end(backend, context)),
         Action::Wait { ms, seconds } => result_response(wait(ms, seconds)),
         Action::Displays => result_response(displays(backend)),
@@ -1352,6 +1370,7 @@ fn action_label(action: &Action) -> &'static str {
         Action::BrowserText { .. } => "browser_text",
         Action::BrowserType { .. } => "browser_type",
         Action::BrowserEval { .. } => "browser_eval",
+        Action::Ocr { .. } => "ocr",
     }
 }
 
@@ -1388,7 +1407,8 @@ fn policy_class(action: &Action) -> PolicyClass {
         | Action::Spaces { .. }
         | Action::BrowserTabs { .. }
         | Action::BrowserText { .. }
-        | Action::BrowserActivate { .. } => PolicyClass::Observe,
+        | Action::BrowserActivate { .. }
+        | Action::Ocr { .. } => PolicyClass::Observe,
         Action::Quit { .. } => PolicyClass::Quit,
         Action::Key { .. } | Action::HoldKey { .. } => PolicyClass::Key,
         Action::ClipboardGet => PolicyClass::Benign,
@@ -1467,6 +1487,7 @@ fn prepare_action(
         Action::Screenshot { .. } | Action::Zoom { .. } | Action::Tree | Action::GetState => {
             policy::PolicyAction::Observe
         }
+        Action::Ocr { .. } => policy::PolicyAction::Observe,
         Action::ClipboardSet { .. } => policy::PolicyAction::ClipboardSet,
         _ => match class {
             PolicyClass::Always => policy::PolicyAction::Always,
@@ -1871,7 +1892,8 @@ fn post_state_kind(action: &Action) -> PostKind {
         | Action::BrowserText { .. }
         | Action::BrowserType { .. }
         | Action::BrowserEval { .. }
-        | Action::BrowserActivate { .. } => PostKind::Mutating,
+        | Action::BrowserActivate { .. }
+        | Action::Ocr { .. } => PostKind::Mutating,
         Action::GetState
         | Action::Wait { .. }
         | Action::Displays
@@ -1977,6 +1999,7 @@ fn remap_image_action(context: &CallContext, action: Action) -> Result<Action, C
             max_width,
             canvas,
             base64,
+            marks,
         } => {
             let region = match region {
                 Some(region) => Some(remap_region(context, region)?),
@@ -1989,6 +2012,7 @@ fn remap_image_action(context: &CallContext, action: Action) -> Result<Action, C
                 max_width,
                 canvas,
                 base64,
+                marks,
             })
         }
         Action::Zoom {
@@ -2334,6 +2358,7 @@ fn attach_post_state(
                     canvas: None,
                     include_base64: false,
                     window_crop: false,
+                    marks: false,
                 },
             )
         };
@@ -2497,6 +2522,8 @@ struct ScreenshotArgs {
     /// When set, a window target crops `region` in window-local points.
     /// Screenshot still refuses a region together with a window.
     window_crop: bool,
+    /// Stamp numbered element rectangles on the image before encoding.
+    marks: bool,
 }
 
 fn screenshot(
@@ -2512,6 +2539,7 @@ fn screenshot(
         canvas,
         include_base64,
         window_crop,
+        marks,
     } = args;
     let targeted = context.app.is_some() || context.window.is_some();
     if region.is_some() && targeted && !window_crop {
@@ -2550,7 +2578,11 @@ fn screenshot(
             canvas,
         },
     )?;
-    let encoded = image_util::encode_rgba(&prepared.image, format)?;
+    let mut image = prepared.image;
+    if marks {
+        apply_marks(&mut image, &prepared.map, context, backend)?;
+    }
+    let encoded = image_util::encode_rgba(&image, format)?;
     let path = match output {
         Some(path) => PathBuf::from(path),
         None => default_screenshot_path(format),
@@ -3417,6 +3449,151 @@ fn tree_query(context: &CallContext) -> TreeQuery {
     }
 }
 
+/// OCR result for a window capture. The dispatcher returns one block list per
+/// recognized line. macOS reuses `VNRecognizeTextRequest`. Linux/Windows are
+/// structured `Unsupported`.
+fn ocr_action(
+    backend: &dyn DesktopBackend,
+    context: &CallContext,
+    _force: bool,
+) -> Result<Value, ComputerError> {
+    let targeted = context.app.is_some() || context.window.is_some();
+    if !targeted {
+        return Err(ComputerError::InvalidArguments(
+            "ocr requires --app or --window".into(),
+        ));
+    }
+    let prepared = latest_prepared_ocr_capture(backend, context)?;
+    let OcrResult { blocks, note } = backend.recognize_text(&prepared.image, &prepared.map)?;
+    let redacted = redact_secure_ocr_blocks(blocks, backend, context)?;
+    let blocks_json: Vec<Value> = redacted
+        .iter()
+        .map(|block| {
+            let image_rect = crate::vision::ocr::ImageRect {
+                x: block.x,
+                y: block.y,
+                width: block.width,
+                height: block.height,
+            };
+            let screen = image_rect.to_screen(&prepared.map);
+            let screen_json = match screen {
+                Some((x, y)) => json!({
+                    "x": x.round() as i64,
+                    "y": y.round() as i64,
+                }),
+                None => Value::Null,
+            };
+            json!({
+                "text": block.text,
+                "x": block.x,
+                "y": block.y,
+                "width": block.width,
+                "height": block.height,
+                "confidence": block.confidence,
+                "screen": screen_json,
+            })
+        })
+        .collect();
+    let mut body = json!({
+        "action": "ocr",
+        "blocks": blocks_json,
+    });
+    if let Some(note) = note {
+        body["note"] = json!(note);
+    }
+    Ok(body)
+}
+
+/// Drop blocks that fall inside any secure element's frame. Re-uses the
+/// vision redaction helper so the rule lives in one place. The dispatcher
+/// is conservative: when the secure frame list is empty (the typical
+/// Linux/Windows case or a tree-unavailable snapshot), every block is kept.
+fn redact_secure_ocr_blocks(
+    blocks: Vec<OcrBlock>,
+    backend: &dyn DesktopBackend,
+    context: &CallContext,
+) -> Result<Vec<OcrBlock>, ComputerError> {
+    // We do not walk the UiNode tree directly; the backend's secure-frame
+    // extraction lives in a `secure_ocr_frames()` method which returns
+    // image-pixel rectangles for secure elements. The default is empty.
+    let secure_frames = backend.secure_ocr_frames(&tree_query(context))?;
+    Ok(crate::vision::redact_blocks(blocks, secure_frames))
+}
+
+/// One OCR-ready capture: the prepared shot pixels plus its screenshot map.
+struct OcrPreparedCapture {
+    image: image::RgbaImage,
+    map: crate::image_util::ScreenshotMap,
+}
+
+/// Re-run the same capture the screenshot command uses so OCR has the same
+/// letterboxed source. Failures here are returned to the caller, never
+/// swallowed.
+fn latest_prepared_ocr_capture(
+    backend: &dyn DesktopBackend,
+    context: &CallContext,
+) -> Result<OcrPreparedCapture, ComputerError> {
+    let targeted = context.app.is_some() || context.window.is_some();
+    if targeted {
+        if let Some(error) = backend.display_block() {
+            return Err(error);
+        }
+        let target = resolve_screenshot_window(backend, context)?;
+        let captured = backend.capture_window(&target)?;
+        let prepared = image_util::prepare_shot(
+            captured.frame.image(),
+            image_util::ShotFit {
+                scale: captured.frame.scale(),
+                origin_x: captured.origin_x,
+                origin_y: captured.origin_y,
+                logical_width: captured.logical_width,
+                logical_height: captured.logical_height,
+                max_width: image_util::DEFAULT_SCREENSHOT_MAX_WIDTH,
+                canvas: None,
+            },
+        )?;
+        Ok(OcrPreparedCapture {
+            image: prepared.image,
+            map: prepared.map,
+        })
+    } else {
+        // Full screen capture for OCR (rare, but allowed by the protocol).
+        let raw = backend.capture_screen(None)?;
+        let prepared = image_util::prepare_shot(
+            raw.frame.image(),
+            image_util::ShotFit {
+                scale: raw.frame.scale(),
+                origin_x: raw.origin_x,
+                origin_y: raw.origin_y,
+                logical_width: raw.logical_width,
+                logical_height: raw.logical_height,
+                max_width: image_util::DEFAULT_SCREENSHOT_MAX_WIDTH,
+                canvas: None,
+            },
+        )?;
+        Ok(OcrPreparedCapture {
+            image: prepared.image,
+            map: prepared.map,
+        })
+    }
+}
+
+/// Draw tree index marks on `image`. Returns the count of marks applied.
+/// When the tree is empty, returns 0 and adds a note rather than failing.
+fn apply_marks(
+    image: &mut image::RgbaImage,
+    map: &crate::image_util::ScreenshotMap,
+    context: &CallContext,
+    backend: &dyn DesktopBackend,
+) -> Result<usize, ComputerError> {
+    let boxes = backend.marks_for_tree(&tree_query(context), map)?;
+    if boxes.is_empty() {
+        return Ok(0);
+    }
+    crate::vision::draw_marks(image, &boxes);
+    Ok(boxes.len())
+}
+
 fn tree_action(
     backend: &dyn DesktopBackend,
     context: &CallContext,
@@ -3435,6 +3612,14 @@ fn tree_action(
     }
     if let Some(legacy) = report.legacy.as_deref() {
         body["accessibility_legacy"] = serde_json::from_str(legacy).unwrap_or(Value::Null);
+    }
+    let tree_was_empty = report.full_text.trim().is_empty();
+    if tree_was_empty {
+        // P11: surface the OCR fallback when the tree produced nothing, and
+        // a window target was selected. The agent decides whether to run it.
+        if context.app.is_some() || context.window.is_some() {
+            body["ocr_fallback_available"] = json!(true);
+        }
     }
     Ok(body)
 }
@@ -3918,6 +4103,7 @@ mod tests {
                 max_width: Some(1),
                 canvas: None,
                 base64: true,
+                marks: false,
             },
         );
         assert!(shot.ok, "{shot:?}");
@@ -3979,6 +4165,7 @@ mod tests {
             max_width,
             canvas: canvas.map(str::to_string),
             base64: false,
+            marks: false,
         }
     }
 
@@ -4102,6 +4289,7 @@ mod tests {
                 max_width: Some(0),
                 canvas: None,
                 base64: false,
+                marks: false,
             },
             &CallContext {
                 app: Some("Notes".into()),
@@ -5800,6 +5988,7 @@ mod tests {
                 max_width: None,
                 canvas: None,
                 base64: false,
+                marks: false,
             },
             &CallContext {
                 app: Some("Notes".into()),

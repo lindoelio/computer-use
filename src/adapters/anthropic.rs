@@ -69,6 +69,7 @@ fn screenshot(region: Option<Region>) -> Action {
         max_width: None,
         canvas: None,
         base64: false,
+        marks: false,
     }
 }
 

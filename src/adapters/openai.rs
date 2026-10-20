@@ -51,6 +51,7 @@ fn screenshot() -> Action {
         max_width: None,
         canvas: None,
         base64: false,
+        marks: false,
     }
 }
 

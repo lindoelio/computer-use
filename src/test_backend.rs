@@ -1005,6 +1005,35 @@ impl DesktopBackend for StubBackend {
         self.releases.lock().expect("releases").extend(held);
         Ok(())
     }
+
+    // P11: OCR + marks hooks on the stub. The mock backend never reads
+    // pixels, so OCR is `unsupported` and marks return an empty list. Real
+    // platform backends override these to call macOS Vision and re-walk
+    // the UI tree.
+    fn recognize_text(
+        &self,
+        _image: &image::RgbaImage,
+        _map: &crate::image_util::ScreenshotMap,
+    ) -> Result<crate::vision::OcrResult, ComputerError> {
+        Err(ComputerError::Unsupported(
+            "ocr is not available in the mock backend".into(),
+        ))
+    }
+
+    fn secure_ocr_frames(
+        &self,
+        _query: &TreeQuery,
+    ) -> Result<Vec<crate::vision::ocr::ImageRect>, ComputerError> {
+        Ok(Vec::new())
+    }
+
+    fn marks_for_tree(
+        &self,
+        _query: &TreeQuery,
+        _map: &crate::image_util::ScreenshotMap,
+    ) -> Result<Vec<crate::vision::MarkBox>, ComputerError> {
+        Ok(Vec::new())
+    }
 }
 
 impl StubBackend {

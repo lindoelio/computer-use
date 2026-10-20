@@ -158,6 +158,12 @@ objc2-screen-capture-kit = { version = "0.3.2", default-features = false, featur
     "objc2-core-graphics",
     "objc2-core-media",
 ] }
+# P11: VNRecognizeTextRequest (accurate + language correction) for OCR.
+objc2-vision = { version = "0.3.2", default-features = false, features = [
+    "VNRecognizeTextRequest",
+    "VNRequestHandler",
+    "VNObservation",
+] }
 
 [profile.release]
 lto = "thin"

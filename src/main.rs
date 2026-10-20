@@ -176,6 +176,8 @@ enum CliCommand {
     /// `--app` and `--window` capture that window. Without them, the capture is
     /// the full desktop or `--region`. The default max width is 1440.
     /// `--max-width 0` keeps the source width. `--canvas 1440x900` letterboxes.
+    /// `--marks` writes numbered rectangles for the latest tree (or OCR) so the
+    /// agent can reference elements by index.
     ///
     /// Example: computer-use screenshot --app Notes --window 0 --max-width 1440
     Screenshot {
@@ -202,6 +204,10 @@ enum CliCommand {
         /// Add a standard base64 `data` field to the JSON result.
         #[arg(long)]
         base64: bool,
+
+        /// Stamp numbered element rectangles on the image (tree indices or OCR `oN`).
+        #[arg(long)]
+        marks: bool,
     },
 
     /// Move the pointer to a logical point and click, or press an element.
@@ -594,6 +600,20 @@ enum CliCommand {
     ///
     /// Example: computer-use tree --app Notes --window 0
     Tree,
+
+    /// Run OCR on the most recent capture for `--app` or `--window`.
+    ///
+    /// macOS only. Returns `unsupported` on Linux and Windows (P12). When
+    /// Screen Recording is denied the response is `permission_required`.
+    /// The recognized text is **never** logged; it lives in the JSON
+    /// response body only.
+    ///
+    /// Example: computer-use ocr --app Notes
+    Ocr {
+        /// Re-run OCR even when the latest screenshot map is recent.
+        #[arg(long)]
+        force: bool,
+    },
 
     /// Walk a running app's menu bar. macOS only.
     ///
@@ -1061,6 +1081,7 @@ fn command_action(
             max_width,
             canvas,
             base64,
+            marks,
         } => Action::Screenshot {
             output: match output {
                 Some(path) => Some(
@@ -1080,6 +1101,7 @@ fn command_action(
             max_width: *max_width,
             canvas: canvas.clone(),
             base64: *base64,
+            marks: *marks,
         },
         CliCommand::Click {
             x,
@@ -1258,6 +1280,7 @@ fn command_action(
             open_settings: *open_settings,
         },
         CliCommand::Tree => Action::Tree,
+        CliCommand::Ocr { force } => Action::Ocr { force: *force },
         CliCommand::Menu { command } => match command {
             MenuCommand::List { app, depth } => {
                 if let Some(positional) = app {

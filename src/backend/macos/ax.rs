@@ -610,6 +610,107 @@ fn build_tree(query: &TreeQuery) -> Result<TreeReport, WalkError> {
     finish_report(query, &live)
 }
 
+/// Walk the tree a second time and return just the root `UiNode` plus the
+/// resolved app for set-of-marks rendering. P11 keeps this separate from
+/// the public `tree` because that one returns a `TreeReport` for the agent;
+/// marks need the framed `UiNode` tree so we can place numbers on the
+/// screenshot.
+pub(crate) fn root_node(query: &TreeQuery) -> Result<UiNode, ComputerError> {
+    let live = read_live(query, false).map_err(|error| error.into_computer())?;
+    Ok(live.root)
+}
+
+/// Image-pixel rectangles of every secure element in the latest tree. The
+/// OCR dispatcher drops blocks whose rect is inside one of these.
+pub(crate) fn secure_frames(query: &TreeQuery) -> Result<Vec<NodeFrame>, ComputerError> {
+    let root = root_node(query)?;
+    Ok(secure_frames_in(&root))
+}
+
+fn secure_frames_in(root: &UiNode) -> Vec<NodeFrame> {
+    let mut frames = Vec::new();
+    walk_secure(root, &mut frames);
+    frames
+}
+
+fn walk_secure(node: &UiNode, frames: &mut Vec<NodeFrame>) {
+    if crate::tree::node_is_secure(node) {
+        if let Some(frame) = node.frame {
+            frames.push(frame);
+        }
+    }
+    for child in &node.children {
+        walk_secure(child, frames);
+    }
+}
+
+/// Walk the tree once and return one MarkBox per node with a frame.
+///
+/// The map is used to convert the node's screen-frame into image pixels.
+pub(crate) fn marks_for_tree(
+    query: &TreeQuery,
+    map: &crate::image_util::ScreenshotMap,
+) -> Result<Vec<crate::vision::MarkBox>, ComputerError> {
+    let root = root_node(query)?;
+    let mut out: Vec<crate::vision::MarkBox> = Vec::new();
+    let mut index = 0_u32;
+    walk_marks(&root, map, &mut index, &mut out);
+    Ok(out)
+}
+
+fn walk_marks(
+    node: &UiNode,
+    map: &crate::image_util::ScreenshotMap,
+    cursor: &mut u32,
+    out: &mut Vec<crate::vision::MarkBox>,
+) {
+    let label = cursor.to_string();
+    *cursor = cursor.saturating_add(1);
+    let Some(frame) = node.frame else {
+        return;
+    };
+    if let Some(rect) = ui_frame_to_image_rect(frame, map) {
+        out.push(crate::vision::MarkBox { rect, label });
+    }
+    for child in &node.children {
+        walk_marks(child, map, cursor, out);
+    }
+}
+
+/// Map a `UiNode`'s screen-frame in points to image pixels using the
+/// screenshot map. Returns `None` when the rect falls entirely off-canvas.
+fn ui_frame_to_image_rect(
+    frame: NodeFrame,
+    map: &crate::image_util::ScreenshotMap,
+) -> Option<crate::vision::marks::ImageRect> {
+    let content_w = f64::from(map.content_width.max(1));
+    let content_h = f64::from(map.content_height.max(1));
+    let pad_x = map.pad.x as f64;
+    let pad_y = map.pad.y as f64;
+    let ix =
+        pad_x + ((frame.x - map.origin.x as f64) * content_w / f64::from(map.logical_width.max(1)));
+    let iy = pad_y
+        + ((frame.y - map.origin.y as f64) * content_h / f64::from(map.logical_height.max(1)));
+    let iw = (frame.width * content_w / f64::from(map.logical_width.max(1))).max(1.0);
+    let ih = (frame.height * content_h / f64::from(map.logical_height.max(1))).max(1.0);
+    let i = ix.round() as i32;
+    let j = iy.round() as i32;
+    let w = iw.round().max(1.0) as u32;
+    let h = ih.round().max(1.0) as u32;
+    if i < 0 || j < 0 {
+        return None;
+    }
+    if (i as f64) + (w as f64) > content_w + pad_x + 1.0 {
+        return None;
+    }
+    Some(crate::vision::marks::ImageRect {
+        x: i,
+        y: j,
+        width: w,
+        height: h,
+    })
+}
+
 fn read_live(query: &TreeQuery, retain_nodes: bool) -> Result<LiveWindow, WalkError> {
     ensure_trusted()?;
     let app = resolve_target(query)?;
