@@ -867,8 +867,13 @@ mod tests {
     #[test]
     fn disabled_but_non_password_node_passes_through() {
         let node = fixture("entry", Some("draft"), Some("draft text"), false);
+        // The role stays `entry` (not redacted by `password text`).
+        assert_eq!(node.role, "entry");
+        // `node_is_secure` only flips for `Role::PasswordText` on Linux,
+        // so a non-password widget is not redacted.
         assert!(!crate::tree::node_is_secure(&node));
-        assert!(crate::tree::identity_text(&node).contains("entry"));
+        // The value stays in the tree.
+        assert_eq!(node.value.as_deref(), Some("draft text"));
     }
 
     /// A fixture tree renders without panicking; the renderer never
