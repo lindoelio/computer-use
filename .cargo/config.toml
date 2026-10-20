@@ -1,0 +1,11 @@
+# Cargo workspace configuration. Lives in `.cargo/config.toml` so it does not
+# leak into downstream crates.
+#
+# The `cdp` feature pulls in `chromiumoxide_cdp`, a build-time-generated
+# crate of ~110K lines of Rust. The Windows MSVC linker defaults to a 1MB
+# thread stack, which overflows during binary startup on `windows-latest`.
+# Bump it to 8MB (the Linux/macOS default) so the subprocesses spawned by
+# the CLI integration tests do not crash before producing JSON.
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/STACK:8388608"]
