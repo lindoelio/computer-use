@@ -42,7 +42,12 @@ default = []
 cdp = ["dep:chromiumoxide", "dep:tokio", "dep:futures"]
 skylight = []
 virtual-display = ["skylight"]
-portal = []
+# P13b: XDG Desktop Portal ScreenCast (capture) + RemoteDesktop (input) on
+# Wayland. Off by default because `pipewire` links `libpipewire-0.3` and needs
+# bindgen (libclang) at build time; on in the Linux release binary.
+# The three crates are Linux-gated optional dependencies, so `--all-features`
+# on macOS and Windows compiles without them.
+portal = ["dep:ashpd", "dep:pipewire", "dep:reis"]
 
 [dependencies]
 base64 = "0.22"
@@ -91,6 +96,25 @@ arboard = { version = "3.7.0", default-features = false, features = ["image-data
 atspi = { version = "0.30.0", default-features = false, features = ["connection", "proxies"] }
 x11rb = { version = "0.13", default-features = false, features = ["allow-unsafe-code", "xtest"] }
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "time"] }
+# P13b: the `portal` feature. `ashpd` speaks the XDG Desktop Portal D-Bus
+# interfaces (`screencast` for the capture dialog, `remote_desktop` for input);
+# `pipewire` consumes the ScreenCast stream and pulls one video frame; `reis`
+# is the optional libei client for relative motion. All three are optional so
+# `--all-features` on macOS and Windows does not build them, and so a default
+# `cargo test` on Linux needs no PipeWire at all.
+#
+# `pipewire` pulls `pipewire-sys` and `libspa-sys`, which run bindgen against
+# the system headers; CI therefore installs `libpipewire-0.3-dev` plus
+# `libclang-dev`/`clang` on ubuntu.
+ashpd = { version = "0.13.13", default-features = false, optional = true, features = [
+    "screencast",
+    "remote_desktop",
+    "tokio",
+] }
+pipewire = { version = "0.9", optional = true }
+reis = { version = "0.7", default-features = false, optional = true, features = [
+    "tokio",
+] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"

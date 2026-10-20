@@ -1146,10 +1146,20 @@ Screen capture, feature `portal`:
 - Open the PipeWire remote with `pipewire` 0.9 and pull one video frame into RGBA.
 - The portal will show a system dialog the first time. Document that the agent cannot click that dialog for itself. `permission_required` is the error when the user cancels.
 
+Source selection is decided in `portal::plan_source`, a pure function over a `StreamInfo` list, so the preference order is unit-tested without a portal daemon. A window stream wins outright; failing that the monitor whose logical rect contains the window centre is chosen and cropped, with the crop clamped to the monitor so a partly off-screen window crops to the visible part. A monitor with no reported geometry is kept only as a last resort — without an extent there is no correct crop, and silently returning the wrong pixels is worse than a `window_not_found`. Frames arrive in device pixels while portal geometry is logical, so `crop_to_stream` runs in logical points and `crop_pixels` applies `frame_scale(logical_width, pixel_width)` and clamps to the buffer.
+
+Capture fallbacks follow the P4 rule: a **cancelled dialog is `permission_required` and never falls back**, because a fallback would report a capture the user deliberately withheld. Only technical failures — no portal daemon (`unsupported`), no frame within 5 s, an unsupported pixel format — fall back to the xcap desktop crop, which sets `occluded: true` and carries a warning naming the cause.
+
+PipeWire is driven directly: the portal's `OpenPipeWireRemote` fd is handed to `ContextRc::connect_fd_rc`, so no PipeWire socket path is involved and nothing outside the session is reachable. The stream is linked to the portal's node with the `target.object` property rather than the `TARGET_OBJECT` constant, which would pull the `v0_3_44` PipeWire feature. `param_changed` records the negotiated `VideoInfoRaw` and `process` copies the first buffer, swizzling the BGRA/BGRx/xBGR/ABGR formats a screen cast actually uses; anything else falls back rather than returning wrongly-ordered pixels. A 5 s timer quits the main loop so a locked session cannot hang the CLI.
+
 Input:
 
 - Tier `ax` is the AT-SPI action.
 - Tier `event` on Wayland is `ashpd` `RemoteDesktop` (pointer and keyboard) when the session is granted. If the portal returns an EIS socket, a `reis` 0.7 client may send relative motion. `reis` is incomplete: a failed handshake falls through and does not panic.
+
+Routing is decided by `event_route`, a pure three-way `EventRoute` (`X11Test` / `Portal` / `Unsupported`) keyed on the session and the feature. `portal::perform_event_tier` selects pointer + keyboard, attaches a monitor ScreenCast source to the same portal session for the coordinate space `NotifyPointerMotionAbsolute` needs, and refuses `--require-background` because the portal moves the real pointer. Pointer buttons use **evdev** codes (`BTN_LEFT` = 0x110), not X11 button numbers, and keys use X11 keysyms rather than XTest keycodes; an unmapped key name is `unsupported`, never a silently dropped keystroke. `drag`, button hold, hold-key and free-text typing are not sent through this tier and return `unsupported` rather than a partial event.
+
+The EIS probe asks the already-granted session for a `ConnectToEIS` socket and runs the `reis` handshake. **Every** failure — no socket, a refused versioned call, a failed handshake — returns "not offered", the action still completes on the portal's absolute motion, and a warning says so. `reis` 0.7 exposes no public API to create an `ei_device`, so relative motion is never dispatched; the handshake is used to report availability honestly rather than to pretend an EIS path exists.
 - Tier `event` on X11 (`DISPLAY` set and `WAYLAND_DISPLAY` unset, or `--x11`) uses `x11rb` 0.14 feature `xtest`: `xtest::fake_input` for motion, button, and key. This does not include a background-per-window path. Say so in the response with `tier: "x11"`.
 - Tier `activate` remains enigo, which already uses libxdo on X11. On Wayland, enigo is not a supported tier. Return `unsupported` rather than sending the event nowhere.
 
@@ -1170,8 +1180,9 @@ Same commands. `computer-use doctor` on Linux fills `accessibility` from the bus
 - Role and password redaction on fixture AT-SPI nodes through `tree.rs`. P13a pins the rule to `Role::PasswordText` only — `state_is_sensitive_only` is kept as a dead helper to mark the old rule obsolete.
 - Element-action dispatch is unit-tested for: (i) `ElementAction::routes_to_atspi` (the Linux dispatcher no longer answers `unsupported`); (ii) `proxy_at` signature stability; (iii) redaction-by-role lock. The live paths run through AT-SPI on Linux CI.
 - XTest request encoding is tested by inspecting the `x11rb` request bytes built for a motion, without a display. P13a adds `perform_event_tier_wires_xtest_fake_input` and `perform_activate_tier_is_enigo_on_linux` as dispatcher-level tests; the former proves `tier = event` routes through `xtest::fake_input` (the connection step fails `DisplayUnavailable`/`ExecutionFailed`, never a generic `unsupported`), the latter pins `TierName::Activate -> perform_activate_tier`.
-- Portal is not contacted in CI. `cargo check --features portal` on Ubuntu with `libpipewire-0.3-dev` is the compile check.
-- Default `cargo test` on Ubuntu still passes without PipeWire.
+- Portal is not contacted in CI. `cargo check --features portal --all-targets` on Ubuntu with `libpipewire-0.3-dev` (plus `libclang-dev`/`clang`, because `pipewire-sys` and `libspa-sys` run bindgen) is the compile check. The three crates are Linux-gated optional dependencies, so `--all-features` on macOS and Windows still compiles without them.
+- Default `cargo test` on Ubuntu still passes without PipeWire. The portal unit tests live in `backend::linux::portal` and need no daemon and no PipeWire: crop and remap math (`crop_to_stream`, `frame_scale`, `crop_pixels` including the clamping and degenerate cases), source selection (`plan_source` preferring a window stream, choosing and cropping the containing monitor, refusing a window off every monitor, and the unknown-geometry last resort), error mapping (`map_failure`, plus `is_terminal` proving a cancelled dialog is never downgraded to a fallback), and `crop_image` byte-exact extraction.
+- Under `--all-features` the same module also pins `evdev_button` codes, the `keysym_for` table, and `doctor`'s `portal` field against `portal::compiled()`.
 
 ## P14 — Isolation
 Honest scope. This phase ships the parts that are real and writes down the parts that are not.

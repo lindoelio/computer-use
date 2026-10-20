@@ -136,7 +136,11 @@ pub trait DesktopBackend: Send + Sync {
         {
             macos::capture_window(target)
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
+        {
+            linux::capture_window(target)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             let _ = target.pid;
             let _ = target.window_id;
@@ -365,7 +369,20 @@ pub trait DesktopBackend: Send + Sync {
         {
             crate::tier::Capabilities { event: true }
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(all(target_os = "linux", feature = "portal"))]
+        {
+            // With the portal compiled in, a Wayland session has a route to
+            // background pointer and keyboard input through RemoteDesktop.
+            crate::tier::Capabilities { event: true }
+        }
+        #[cfg(all(target_os = "linux", not(feature = "portal")))]
+        {
+            // Without the portal there is still XTest on a plain X11 session.
+            crate::tier::Capabilities {
+                event: linux::x11_event_capable(false),
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             crate::tier::Capabilities { event: false }
         }

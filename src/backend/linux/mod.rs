@@ -12,6 +12,10 @@
 //!   `crate::element::gate` revalidation macOS / Windows use; secure
 //!   `Role::PasswordText` nodes refuse `set_value`, `select_text`, and
 //!   `type --element`.
+//! - **XDG portals** (`portal.rs`) — `screencast` capture and
+//!   `remote_desktop` input, behind the `portal` feature. Wayland never hands
+//!   a client pixels and never lets it move the pointer, so both go through a
+//!   compositor dialog the user has to click; the agent cannot click it.
 //! - **X11 XTest** (`x11.rs`) — `fake_input` for the `event` input tier on
 //!   plain X11 (no Wayland). On Wayland without the `portal` feature the
 //!   tier is `unsupported`; tier `activate` is enigo everywhere, mirroring
@@ -26,6 +30,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 pub mod atspi;
+pub mod portal;
 pub mod runtime;
 pub mod x11;
 
@@ -160,9 +165,8 @@ pub(crate) fn element_action(request: &ElementRequest) -> Result<ElementOutcome,
 }
 
 pub(crate) fn doctor(options: DoctorOptions) -> Result<DoctorReport, ComputerError> {
-    let mut notes = vec![
-        "P13a: AT-SPI tree + Linux actions + XTest event tier + portal-but-inactive".to_string(),
-    ];
+    let mut notes =
+        vec!["P13b: AT-SPI tree + Linux actions + XTest event tier + XDG portals".to_string()];
     let display = env_nonempty("DISPLAY");
     let wayland = env_nonempty("WAYLAND_DISPLAY");
     let session = doctor::session_kind(display.as_deref(), wayland.as_deref());
@@ -177,19 +181,29 @@ pub(crate) fn doctor(options: DoctorOptions) -> Result<DoctorReport, ComputerErr
         notes.push(format!(
             "XTest event tier reachable on {session:?} (synchronous X11, not per-window)",
         ));
-    } else if let Some(kind) = session {
-        notes.push(format!(
-            "XTest event tier is unsupported on {kind} (Wayland); use tier `activate` until part B adds portals"
-        ));
     }
-    notes.push(format!(
-        "portal feature compiled = {} (P13b will enable ScreenCast/RemoteDesktop)",
-        cfg!(feature = "portal")
-    ));
+    match event_route() {
+        EventRoute::X11Test => notes.push("event tier: X11 XTest".to_string()),
+        EventRoute::Portal => notes.push(
+            "event tier: XDG RemoteDesktop portal (opens a system dialog the user must click)"
+                .to_string(),
+        ),
+        EventRoute::Unsupported => notes.push(format!(
+            "event tier is unsupported on {session:?} (Wayland): built without the `portal` feature"
+        )),
+    }
+    if portal::compiled() {
+        notes.push(
+            "portal feature compiled: ScreenCast capture and RemoteDesktop input are available; \
+             both open a system dialog the agent cannot click for you"
+                .to_string(),
+        );
+    }
     let report = doctor::assemble(DoctorInput {
         path: doctor::current_executable(),
         session: session.map(str::to_string),
         atspi_bus,
+        portal: Some(portal::compiled()),
         notes,
         prompt_ignored: options.prompt,
         open_settings_ignored: options.open_settings,
@@ -251,12 +265,58 @@ pub(crate) fn perform_input(job: &InputJob) -> Result<InputReport, ComputerError
         TierName::Event => perform_event_tier(job),
         // Synthetic (skylight) is intentionally absent on Linux; the tier
         // planner hides it. AX clicks are routed through `activate` on
-        // Linux because pure-AT-SPI background clicks need a session bus
-        // — `portals` (part B) lift this.
+        // Linux because pure-AT-SPI background clicks need a session bus.
         TierName::Synthetic => Err(unsupported("tier synthetic")),
         TierName::Ax => Err(unsupported("tier ax for coordinate and keyboard input")),
         TierName::Activate => perform_activate_tier(job),
     }
+}
+
+/// Capture one window on Linux.
+///
+/// With the `portal` feature this goes through the XDG ScreenCast dialog;
+/// without it, and on any portal failure that is not a user refusal, it crops
+/// the desktop image the way P13a did.
+pub(crate) fn capture_window(
+    target: &crate::backend::WindowTarget,
+) -> Result<crate::types::RawCapture, ComputerError> {
+    portal::capture_window(target)
+}
+
+/// Where the `event` tier should be sent on Linux.
+///
+/// X11 keeps XTest. Wayland has no such API, so the RemoteDesktop portal is
+/// the only route — and only when `portal` is compiled in. Anything else is
+/// [`ComputerError::Unsupported`], which lets the planner fall through to
+/// `activate` honestly instead of pretending the click landed.
+#[cfg(feature = "portal")]
+fn event_route() -> EventRoute {
+    if portal::wayland_session() {
+        EventRoute::Portal
+    } else {
+        EventRoute::X11Test
+    }
+}
+
+/// No `portal` feature: only X11 can host the event tier.
+#[cfg(not(feature = "portal"))]
+fn event_route() -> EventRoute {
+    if portal::wayland_session() {
+        EventRoute::Unsupported
+    } else {
+        EventRoute::X11Test
+    }
+}
+
+/// Which backend the `event` tier uses on this session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventRoute {
+    /// Plain X11: XTest.
+    X11Test,
+    /// Wayland with `portal` compiled in: the RemoteDesktop portal.
+    Portal,
+    /// Wayland without `portal`: nothing can do this.
+    Unsupported,
 }
 
 /// Direct call into the `input::*` enigo path used for tier `activate` on
@@ -322,6 +382,19 @@ fn perform_activate_tier(
 /// `self`; we open a fresh connection per dispatch. XTest is fast enough
 /// for that overhead to be invisible.
 fn perform_event_tier(job: &InputJob) -> Result<InputReport, ComputerError> {
+    use crate::tier::InputKind;
+    match event_route() {
+        EventRoute::X11Test => x11_event_tier(job),
+        #[cfg(feature = "portal")]
+        EventRoute::Portal => portal::perform_event_tier(job),
+        EventRoute::Unsupported => Err(unsupported(
+            "tier event on Wayland needs the `portal` feature; this build does not have it",
+        )),
+    }
+}
+
+/// The X11 XTest path, reached only when the session really is X11.
+fn x11_event_tier(job: &InputJob) -> Result<InputReport, ComputerError> {
     use crate::tier::InputKind;
     let connection = x11::connect()?;
     let (root, _w, _h) = read_setup(&connection)?;
@@ -518,6 +591,39 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn event_route_follows_the_session_and_the_feature() {
+        let route = event_route();
+        if portal::wayland_session() {
+            // Wayland: only the portal can post events, and only when built.
+            assert_eq!(
+                route,
+                if cfg!(feature = "portal") {
+                    EventRoute::Portal
+                } else {
+                    EventRoute::Unsupported
+                }
+            );
+        } else {
+            // X11 (or no display at all) always keeps XTest.
+            assert_eq!(route, EventRoute::X11Test);
+        }
+    }
+
+    #[test]
+    fn the_event_route_is_exhaustive_so_a_new_arm_cannot_be_forgotten() {
+        let all = [
+            EventRoute::X11Test,
+            EventRoute::Portal,
+            EventRoute::Unsupported,
+        ];
+        // Each route is distinct and printable, so a caller can never get two
+        // of them to the same branch by accident.
+        assert_eq!(all.len(), 3);
+        assert_ne!(EventRoute::X11Test, EventRoute::Portal);
+        assert_ne!(EventRoute::Portal, EventRoute::Unsupported);
+    }
+
     fn doctor_uses_the_shared_shape() {
         let report = doctor(DoctorOptions::default()).unwrap();
         let value = serde_json::to_value(&report).unwrap();
@@ -535,10 +641,13 @@ mod tests {
         assert!(value["identity"].is_object());
         assert!(value["session"].is_string() || value["session"].is_null());
         assert!(value["atspi_bus"].is_boolean() || value["atspi_bus"].is_null());
+        // P13b: `portal` reports compile-time capability, never a runtime probe.
+        assert!(value["portal"].is_boolean() || value["portal"].is_null());
+        assert_eq!(value["portal"], serde_json::json!(portal::compiled()));
         assert!(value["uiaccess"].is_null());
         assert!(value["integrity"].is_null());
         let note = value["note"].as_str().unwrap();
-        assert!(note.contains("P13a"), "{note}");
+        assert!(note.contains("P13b"), "{note}");
         assert!(report.permissions_ok);
         assert!(report.missing.is_empty());
     }

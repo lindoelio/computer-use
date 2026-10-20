@@ -269,6 +269,9 @@ pub struct DoctorReport {
     pub session: Option<String>,
     /// Linux AT-SPI bus address is present. Not a connection. Null when not checked.
     pub atspi_bus: Option<bool>,
+    /// Linux XDG portal support is compiled in. Compile-time capability, not a
+    /// running portal. Null when not checked.
+    pub portal: Option<bool>,
     /// Windows UIAccess on this process. Best effort. Null when not read.
     pub uiaccess: Option<bool>,
     /// Windows integrity label. Best effort. Null when not read.
@@ -311,6 +314,7 @@ impl DoctorReport {
             fixes: Vec::new(),
             session: None,
             atspi_bus: None,
+            portal: None,
             uiaccess: None,
             integrity: None,
             text: String::new(),

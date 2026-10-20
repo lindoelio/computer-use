@@ -79,6 +79,8 @@ pub struct DoctorInput {
     pub session: Option<String>,
     /// Linux AT-SPI bus address present.
     pub atspi_bus: Option<bool>,
+    /// Linux XDG portal feature compiled in.
+    pub portal: Option<bool>,
     /// Windows UIAccess.
     pub uiaccess: Option<bool>,
     /// Windows integrity label.
@@ -193,6 +195,7 @@ pub fn assemble(input: DoctorInput) -> DoctorReport {
         fixes,
         session: input.session.clone(),
         atspi_bus: input.atspi_bus,
+        portal: input.portal,
         uiaccess: input.uiaccess,
         integrity: input.integrity.clone(),
         text: String::new(),
@@ -563,6 +566,12 @@ fn render_text(report: &DoctorReport) -> String {
             if atspi { "present" } else { "absent" }
         ));
     }
+    if let Some(portal) = report.portal {
+        lines.push(format!(
+            "portal: {}",
+            if portal { "compiled" } else { "absent" }
+        ));
+    }
     if let Some(uiaccess) = report.uiaccess {
         lines.push(format!("uiaccess: {}", if uiaccess { "yes" } else { "no" }));
     }
@@ -823,6 +832,7 @@ mod tests {
                 "fixes": ["System Settings → Privacy & Security → Accessibility → enable Terminal"],
                 "session": null,
                 "atspi_bus": null,
+                "portal": null,
                 "uiaccess": null,
                 "integrity": null
             })

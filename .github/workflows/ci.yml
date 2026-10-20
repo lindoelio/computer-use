@@ -35,7 +35,11 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libxdo-dev libx11-dev libxcb1-dev libxrandr-dev libdbus-1-dev libxkbcommon-dev libatspi2.0-dev shellcheck
+          # P13b: libpipewire-0.3-dev is the `portal` feature's system library;
+          # pipewire-sys and libspa-sys run bindgen against its headers, so
+          # libclang-dev/clang must be present whenever `--all-features` turns
+          # the feature on below.
+          sudo apt-get install -y pkg-config libxdo-dev libx11-dev libxcb1-dev libxrandr-dev libdbus-1-dev libxkbcommon-dev libatspi2.0-dev libpipewire-0.3-dev libclang-dev clang shellcheck
       - name: Check packaging script
         shell: bash
         run: |
@@ -46,6 +50,12 @@ jobs:
           fi
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Check the portal feature builds
+        # `--all-features` only builds `portal` on Linux (the deps are
+        # Linux-gated), so this is the explicit P13b compile gate. It links
+        # PipeWire and never contacts a portal daemon.
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo check --features portal --all-targets
       - name: Test
         run: cargo test --all-targets --all-features
       - name: Package ad-hoc Computer Use.app
