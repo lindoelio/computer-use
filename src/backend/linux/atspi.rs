@@ -96,11 +96,11 @@ pub(crate) fn build_tree(query: &TreeQuery) -> Result<TreeReport, ComputerError>
     });
     match outcome {
         Ok(Ok(Ok(live))) => Ok(tree_report_from(&live)),
-        Ok(Ok(Err(_elapsed))) => Err(ComputerError::ExecutionFailed(format!(
+        Ok(Ok(Err(error))) => Err(error),
+        Ok(Err(_elapsed)) => Err(ComputerError::ExecutionFailed(format!(
             "AT-SPI walk exceeded {}s budget",
             ATSPI_CALL_BUDGET.as_secs()
         ))),
-        Ok(Err(error)) => Err(error),
         Err(error) => Err(error),
     }
 }
@@ -187,14 +187,13 @@ pub(crate) fn element_action(request: &ElementRequest) -> Result<ElementOutcome,
     })?;
 
     let result = match joined {
-        Ok(Ok(Ok(value))) => value,
-        Ok(Ok(Err(_elapsed))) => {
+        Ok(Ok(value)) => value,
+        Ok(Err(_elapsed)) => {
             return Err(ElementError::new(ComputerError::ExecutionFailed(format!(
                 "AT-SPI element action exceeded {}s budget",
                 ATSPI_CALL_BUDGET.as_secs()
             ))));
         }
-        Ok(Err(error)) => return Err(error),
         Err(error) => return Err(error),
     };
     let (via, refreshed, cached, revalidation_warning) = result;
@@ -385,34 +384,61 @@ async fn walk_live(
 async fn proxy_at<'a>(
     connection: &'a AccessibilityConnection,
     root: ObjectRefOwned,
-    path: &[usize],
+    path: &'a [usize],
 ) -> Result<AccessibleProxy<'a>, ComputerError> {
+    // We can't keep `AccessibleProxy` borrowed across a `Vec::push` of
+    // `ObjectRefOwned`, so we re-build the proxy each iteration. The
+    // visited `ObjectRefOwned`s outlive the returned proxy because they
+    // live in this stack-allocated `Vec` until the function returns.
     let mut visited: Vec<ObjectRefOwned> = vec![root];
-    // Build the root proxy up front; the loop then descends `path` from
-    // it. The first iteration handles the empty path case too: `current`
-    // is set after the loop body runs even when `path` is empty, then
-    // we re-handle the root proxy below.
-    let mut current = visited[0]
-        .as_accessible_proxy(connection.connection())
-        .await
-        .map_err(atspi_error)?;
+    let mut current = None;
     for &child_index in path {
-        let child_refs = current.get_children().await.map_err(atspi_error)?;
+        // Pick the proxy to read children from: the previous iteration's
+        // proxy when there was one, otherwise the application root.
+        let proxy_ref: AccessibleProxy<'_> = if let Some(prev) = current.as_ref() {
+            // Re-issue the proxy from the last visited node so the
+            // `AccessibleProxy` borrow is fresh and we can mutate
+            // `visited` again.
+            let last = visited
+                .last()
+                .expect("visited never empty after first iteration");
+            last.as_accessible_proxy(connection.connection())
+                .await
+                .map_err(atspi_error)?
+        } else {
+            visited[0]
+                .as_accessible_proxy(connection.connection())
+                .await
+                .map_err(atspi_error)?
+        };
+        let child_refs = proxy_ref.get_children().await.map_err(atspi_error)?;
         let Some(child_ref) = child_refs.into_iter().nth(child_index) else {
             return Err(ComputerError::ElementNotFound(format!(
                 "path index {child_index} did not resolve to an AT-SPI child"
             )));
         };
         visited.push(child_ref);
-        let proxy = visited
+        // Now build the proxy for the newly-pushed node. This is the
+        // one we return at the end.
+        let new_proxy = visited
             .last()
             .expect("just pushed")
             .as_accessible_proxy(connection.connection())
             .await
             .map_err(atspi_error)?;
-        current = proxy;
+        // The intermediate proxy (`proxy_ref`) is dropped here because
+        // it borrows from a `Vec` slot we are about to mutate; the new
+        // proxy borrows from the new last slot.
+        drop(proxy_ref);
+        current = Some(new_proxy);
     }
-    Ok(current)
+    match current {
+        Some(proxy) => Ok(proxy),
+        None => visited[0]
+            .as_accessible_proxy(connection.connection())
+            .await
+            .map_err(atspi_error),
+    }
 }
 
 /// Drive one element op through the matching AT-SPI interface. Returns
