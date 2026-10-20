@@ -42,6 +42,7 @@ jobs:
             libxrandr-dev libdbus-1-dev libxkbcommon-dev libatspi2.0-dev \
             libpipewire-0.3-dev libclang-dev clang
       - name: Build
+        shell: bash
         run: |
           if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
             cargo build --release --target ${{ matrix.target }} --features portal
