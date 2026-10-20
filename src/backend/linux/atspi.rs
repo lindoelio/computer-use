@@ -91,22 +91,18 @@ pub(crate) fn ping() -> bool {
 
 /// Public entry point for the dispatcher.
 pub(crate) fn build_tree(query: &TreeQuery) -> Result<TreeReport, ComputerError> {
-    let outcome = runtime::block_on(async {
-        tokio::time::timeout(ATSPI_CALL_BUDGET, walk_live(query, false, false)).await
-    });
+    let outcome: Result<Result<LiveWalk, tokio::time::error::Elapsed>, ComputerError> =
+        runtime::block_on(async {
+            tokio::time::timeout(ATSPI_CALL_BUDGET, walk_live(query, false, false)).await
+        });
     match outcome {
         Ok(Ok(live)) => Ok(tree_report_from(&live)),
-        Ok(Err(error)) => Err(error),
-        Err(_elapsed) => Err(ComputerError::ExecutionFailed(format!(
+        Ok(Err(_elapsed)) => Err(ComputerError::ExecutionFailed(format!(
             "AT-SPI walk exceeded {}s budget",
             ATSPI_CALL_BUDGET.as_secs()
         ))),
+        Err(error) => Err(error),
     }
-}
-
-/// Reduce a live walk into the public `TreeReport` shape.
-fn walk_live_to_report(live: LiveWalk) -> TreeReport {
-    tree_report_from(&live)
 }
 
 /// Borrow a live walk and produce the dispatcher's `TreeReport`.
@@ -191,13 +187,14 @@ pub(crate) fn element_action(request: &ElementRequest) -> Result<ElementOutcome,
     })?;
 
     let result = match joined {
-        Ok(value) => value,
-        Err(_elapsed) => {
+        Ok(Ok(value)) => value,
+        Ok(Err(_elapsed)) => {
             return Err(ElementError::new(ComputerError::ExecutionFailed(format!(
                 "AT-SPI element action exceeded {}s budget",
                 ATSPI_CALL_BUDGET.as_secs()
             ))));
         }
+        Err(error) => return Err(error),
     };
     let (via, refreshed, cached, revalidation_warning) = result;
     let mut warnings = Vec::new();
@@ -391,29 +388,36 @@ async fn proxy_at<'a>(
     path: &[usize],
 ) -> Result<AccessibleProxy<'a>, ComputerError> {
     let mut visited: Vec<ObjectRefOwned> = vec![root];
-    // Hold the live intermediate proxies inside the loop body only, then
-    // drop them at the end of each iteration. The `Vec<ObjectRefOwned>`
-    // keeps the underlying bus references anchored for the final call.
-    let mut current = visited[0]
-        .as_accessible_proxy(connection.connection())
-        .await
-        .map_err(atspi_error)?;
+    let mut current: Option<AccessibleProxy<'a>> = None;
     for &child_index in path {
-        let child_refs = current.get_children().await.map_err(atspi_error)?;
+        let child_refs = if let Some(proxy) = current.as_ref() {
+            proxy.get_children().await.map_err(atspi_error)?
+        } else {
+            visited[0].get_children().await.map_err(atspi_error)?
+        };
         let Some(child_ref) = child_refs.into_iter().nth(child_index) else {
             return Err(ComputerError::ElementNotFound(format!(
                 "path index {child_index} did not resolve to an AT-SPI child"
             )));
         };
         visited.push(child_ref);
-        current = visited
+        let proxy = visited
             .last()
             .expect("just pushed")
             .as_accessible_proxy(connection.connection())
             .await
             .map_err(atspi_error)?;
+        current = Some(proxy);
     }
-    Ok(current)
+    // Final proxy: either built by the loop, or the application root
+    // when the path was empty.
+    match current {
+        Some(proxy) => Ok(proxy),
+        None => visited[0]
+            .as_accessible_proxy(connection.connection())
+            .await
+            .map_err(atspi_error),
+    }
 }
 
 /// Drive one element op through the matching AT-SPI interface. Returns
@@ -920,10 +924,12 @@ mod tests {
     #[test]
     fn proxy_at_signature_is_stable() {
         // The function exists, takes a connection by reference and a
-        // path slice, and returns an AccessibleProxy.
+        // path slice, and returns an AccessibleProxy. The `ObjectRefOwned`
+        // is owned so the resolved proxy can borrow from the visited
+        // stack; see `proxy_at` for the lifetime story.
         let _: fn(
             &AccessibilityConnection,
-            &ObjectRefOwned,
+            ObjectRefOwned,
             &[usize],
         ) -> std::pin::Pin<
             Box<
