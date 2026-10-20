@@ -401,19 +401,8 @@ fn repo_root() -> std::path::PathBuf {
 }
 
 fn locate_binary() -> std::path::PathBuf {
-    let root = repo_root();
-    let target = root.join("target").join("debug").join("computer-use");
-    if target.exists() {
-        return target;
-    }
-    let target = root.join("target").join("debug").join("computer-use.exe");
-    if target.exists() {
-        return target;
-    }
-    panic!(
-        "computer-use binary not found at {}; run `cargo build` first",
-        target.display()
-    );
+    // Cargo builds the bin for integration tests and honours CARGO_TARGET_DIR.
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_computer-use"))
 }
 
 /// Snapshot of the `Action` variant names that the protocol accepts. We
