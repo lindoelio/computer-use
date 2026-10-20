@@ -90,7 +90,7 @@ arboard = "3.7.0"
 arboard = { version = "3.7.0", default-features = false, features = ["image-data"] }
 atspi = { version = "0.30.0", default-features = false, features = ["connection", "proxies"] }
 x11rb = { version = "0.13", default-features = false, features = ["allow-unsafe-code", "xtest"] }
-tokio = { version = "1", default-features = false, features = ["rt", "macros"] }
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "time"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"

@@ -35,7 +35,7 @@ type RuntimeCell = Result<tokio::runtime::Runtime, RuntimeBuildError>;
 static RUNTIME: OnceLock<RuntimeCell> = OnceLock::new();
 
 /// Why the runtime could not be built.
-#[derive(Debug, Error, Clone)]
+#[derive(Debug, Error)]
 pub enum RuntimeBuildError {
     /// `tokio::runtime::Builder::build()` failed. The cause is reported.
     #[error("failed to build current-thread tokio runtime: {0}")]
@@ -53,15 +53,7 @@ where
     F::Output: Send + 'static,
 {
     let runtime = get_or_build_runtime()?;
-    match runtime.block_on(future) {
-        Ok(value) => Ok(value),
-        // `block_on` itself does not return `Err`; this branch is defensive
-        // against future runtime changes and would only fire when someone
-        // manages to make the inner future panic.
-        Err(_panic) => Err(ComputerError::ExecutionFailed(
-            "linux tokio runtime rejected the future".into(),
-        )),
-    }
+    Ok(runtime.block_on(future))
 }
 
 /// Borrow the process runtime handle. Builds it on first call.

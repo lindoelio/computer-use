@@ -31,11 +31,13 @@ use crate::doctor::{self, DoctorInput, DoctorOptions};
 use crate::element::{ElementError, ElementOutcome, ElementRequest};
 use crate::error::ComputerError;
 use crate::target::{AppInfo, DoctorReport, LaunchResult, QuitResult, WindowList};
+use crate::tier::{InputJob, InputReport, TierName};
 use crate::tree::TreeQuery;
 use crate::types::FrontmostInfo;
 
 use super::command::{run_timeout, stderr_snippet};
 use super::unsupported;
+use x11rb::connection::Connection as X11Connection;
 
 /// Linux desktop backend. Methods are implemented in this module.
 #[derive(Debug, Default, Clone, Copy)]
@@ -98,7 +100,7 @@ pub(crate) fn inspect_accessibility(app_name: Option<&str>) -> Result<String, Co
         session: None,
     };
     let report = atspi::build_tree(&query)?;
-    Ok(report.text)
+    Ok(report.full_text)
 }
 
 pub(crate) fn list_apps(_all: bool) -> Result<Vec<AppInfo>, ComputerError> {
@@ -219,12 +221,14 @@ fn atspi_presence() -> (Option<bool>, Option<String>) {
 
 /// Bridge for `DoctorOptions::x11`: the `--x11` CLI flag flows through the
 /// dispatcher; tests want to bypass env-detection, so we expose a probe.
+#[allow(dead_code)]
 pub(crate) fn x11_event_capable(use_x11_override: bool) -> bool {
     x11::event_capable(use_x11_override)
 }
 
 /// Tier name to report back when we dispatched via XTest. Exposed here so
 /// the dispatcher can render the tier tag in its JSON output.
+#[allow(dead_code)]
 pub(crate) fn x11_tier_name() -> &'static str {
     x11::TIER_NAME
 }
@@ -235,10 +239,7 @@ pub(crate) fn x11_tier_name() -> &'static str {
 /// without `portal` returns `unsupported` for `tier event`; the tier
 /// planner routes the request through `activate` instead, never this
 /// function.
-pub(crate) fn perform_input(
-    job: &crate::tier::InputJob,
-) -> Result<crate::tier::InputReport, ComputerError> {
-    use crate::tier::{InputKind, InputReport, TierName};
+pub(crate) fn perform_input(job: &InputJob) -> Result<InputReport, ComputerError> {
     match job.tier {
         TierName::Event => perform_event_tier(job),
         // Synthetic (skylight) is intentionally absent on Linux; the tier
@@ -313,14 +314,10 @@ fn perform_activate_tier(
 /// The macro path emits a `Box<dyn DesktopBackend>` so we cannot borrow
 /// `self`; we open a fresh connection per dispatch. XTest is fast enough
 /// for that overhead to be invisible.
-fn perform_event_tier(job: &crate::tier::InputJob) -> Result<InputReport, ComputerError> {
+fn perform_event_tier(job: &InputJob) -> Result<InputReport, ComputerError> {
     use crate::tier::InputKind;
-    let connection = match x11::connect() {
-        Ok(connection) => connection,
-        Err(error) => return Err(error),
-    };
-    let (setup, _screen) = read_setup(&connection)?;
-    let root = setup.roots[0].root;
+    let connection = x11::connect()?;
+    let (root, _w, _h) = read_setup(&connection)?;
     let report = match &job.kind {
         InputKind::Move { x, y } => {
             x11::motion_notify(
@@ -411,20 +408,16 @@ fn perform_event_tier(job: &crate::tier::InputJob) -> Result<InputReport, Comput
 }
 
 fn read_setup(
-    connection: &x11rb::RustConnection,
-) -> Result<
-    (
-        x11rb::protocol::xproto::Setup,
-        &x11rb::protocol::xproto::Screen,
-    ),
-    ComputerError,
-> {
+    connection: &x11rb::rust_connection::RustConnection,
+) -> Result<(x11rb::protocol::xproto::Window, u16, u16), ComputerError> {
+    // The X server keeps one `Setup` per connection and exposes a single
+    // root window per screen. P13a only consumes screen `0`'s root.
     let setup = connection.setup();
     let screen = setup
         .roots
         .first()
         .ok_or_else(|| ComputerError::DisplayUnavailable("X server has no screens".into()))?;
-    Ok((setup.clone(), screen))
+    Ok((screen.root, screen.width_in_pixels, screen.height_in_pixels))
 }
 
 fn map_mouse_button(button: crate::types::MouseButton) -> u8 {
@@ -470,6 +463,7 @@ fn keycode_for_canonical(name: &str) -> Result<u8, ComputerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::DesktopBackend;
 
     #[test]
     fn tree_uses_atspi_symbol() {
