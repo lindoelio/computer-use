@@ -766,6 +766,113 @@ mod tests {
     }
 
     #[test]
+    fn screen_rect_maps_a_platform_frame_into_image_pixels() {
+        // 1:1 map: a frame at the origin is the same rectangle in both spaces.
+        let map = map_for(800, 600, 0, 0, 800, 600);
+        assert_eq!(
+            screen_rect_to_image(&map, 100.0, 50.0, 200.0, 30.0),
+            Some((100, 50, 200, 30))
+        );
+    }
+
+    #[test]
+    fn screen_rect_honours_a_non_zero_origin() {
+        let map = map_for(800, 600, 120, 40, 800, 600);
+        assert_eq!(
+            screen_rect_to_image(&map, 120.0, 40.0, 10.0, 10.0),
+            Some((0, 0, 10, 10))
+        );
+        assert_eq!(
+            screen_rect_to_image(&map, 220.0, 140.0, 10.0, 10.0),
+            Some((100, 100, 10, 10))
+        );
+    }
+
+    #[test]
+    fn screen_rect_honours_a_downscaled_capture() {
+        // A 2x Retina frame halved into the image: half the screen size.
+        let map = map_for(1440, 900, 0, 0, 800, 500);
+        let (x, y, w, h) =
+            screen_rect_to_image(&map, 200.0, 100.0, 100.0, 50.0).expect("on canvas");
+        assert!((x - 360).abs() <= 1, "{x}");
+        assert!((y - 180).abs() <= 1, "{y}");
+        assert!((i64::from(w) - 180).abs() <= 1, "{w}");
+        assert!((i64::from(h) - 90).abs() <= 1, "{h}");
+    }
+
+    #[test]
+    fn screen_rect_offsets_by_the_canvas_letterbox_pad() {
+        // A 400x300 logical capture letterboxed into a 1000x900 canvas: the
+        // aspect is kept, so the drawn content is 1000x750 with pad (0, 75).
+        let mut map = map_for(1000, 900, 0, 0, 400, 300);
+        map.content_width = 1000;
+        map.content_height = 750;
+        map.pad = MapPoint { x: 0, y: 75 };
+        // x = 100 -> 0 + 100 * 1000/400 = 250
+        // y = 150 -> 75 + 150 * 750/300 = 450
+        // w = 20 -> 20 * 1000/400 = 50, h = 10 -> 10 * 750/300 = 25
+        assert_eq!(
+            screen_rect_to_image(&map, 100.0, 150.0, 20.0, 10.0),
+            Some((250, 450, 50, 25))
+        );
+        // The first drawn pixel column sits at the pad, not at zero.
+        assert_eq!(
+            screen_rect_to_image(&map, 0.0, 0.0, 400.0, 300.0),
+            Some((0, 75, 1000, 750))
+        );
+    }
+
+    #[test]
+    fn screen_rect_off_canvas_returns_none() {
+        let map = map_for(800, 600, 0, 0, 800, 600);
+        // Entirely left/above the capture.
+        assert_eq!(screen_rect_to_image(&map, -50.0, 10.0, 20.0, 10.0), None);
+        assert_eq!(screen_rect_to_image(&map, 10.0, -50.0, 20.0, 10.0), None);
+        // Past the far edge.
+        assert_eq!(screen_rect_to_image(&map, 900.0, 10.0, 20.0, 10.0), None);
+        // Overhanging the bottom-right corner past the one-pixel tolerance.
+        assert_eq!(screen_rect_to_image(&map, 795.0, 595.0, 100.0, 100.0), None);
+    }
+
+    #[test]
+    fn screen_rect_never_returns_a_zero_sized_box() {
+        let map = map_for(800, 600, 0, 0, 800, 600);
+        let (_, _, w, h) = screen_rect_to_image(&map, 100.0, 100.0, 0.0, 0.0).unwrap();
+        assert_eq!((w, h), (1, 1));
+    }
+
+    /// A 1:1 screenshot map for a capture whose logical size is
+    /// `logical_width` x `logical_height` at `origin`.
+    fn map_for(
+        width: u32,
+        height: u32,
+        origin_x: i32,
+        origin_y: i32,
+        logical_width: u32,
+        logical_height: u32,
+    ) -> ScreenshotMap {
+        ScreenshotMap {
+            width,
+            height,
+            scale: 1.0,
+            logical_width,
+            logical_height,
+            origin: MapPoint {
+                x: origin_x,
+                y: origin_y,
+            },
+            fit: "none".into(),
+            pad: MapPoint { x: 0, y: 0 },
+            content_width: width,
+            content_height: height,
+            map: MapFormulas {
+                image_to_screen: IMAGE_TO_SCREEN.into(),
+                screen_to_image: SCREEN_TO_IMAGE.into(),
+            },
+        }
+    }
+
+    #[test]
     fn max_width_scales_height_and_zero_keeps_source_width() {
         let frame = frame_solid(4, 2);
         let encoded = encode_image(&frame, ImageFormat::Png, Some(2)).unwrap();
