@@ -152,11 +152,13 @@ Items tested by code and CI but not exercised live for this release.
 
 ### Cut from 0.2.0
 
-Nothing was cut from the parity contract. The 0.2.0 surface still covers every row in the table. Five rows are `PARTIAL` rather than `DONE`, because each implementation can fail closed on a window that does not advertise the platform interface, not because the parity contract is unmet:
+Nothing was cut from the parity contract. The 0.2.0 surface still covers every row in the table. Seven rows are `PARTIAL` rather than `DONE`, because each implementation can fail closed on a window that does not advertise the platform interface, not because the parity contract is unmet:
 
 - `Scroll into view before the action` and `select_text` via selected range — `execution_failed` on a window that does not expose `ScrollItemPattern` (Windows) or `Component` (Linux), and `TextPattern` / `Text` respectively.
+- `CDP for Chrome` — `browser click` resolves the CSS selector and clicks the element centre via chromiumoxide's CDP `Input.dispatchMouseEvent` in page coordinates, not the spec'd screen-space transform. Windows debug-port discovery is best-effort `unsupported` (`QueryFullProcessImageNameW` does not give us argv); pass `--cdp-url ws://host:port` on Windows.
+- `OCR and set-of-marks` — Linux has no OCR backend in 0.2.0 (`unsupported` — no Tesseract, no `asyc-tesseract` glue, no plugin); the macOS Vision path is verified only by the bitmap-font unit test, not end-to-end on a real window. Windows Media OCR is unit-tested only.
 - `Synthetic focus enforcer (SkyLight / CPS)` — wired behind `--features skylight`, but the default release binary is built **without** `--features skylight`, so the symbol call path is never invoked on this Mac or in CI.
-- `Linux` — `list_windows` / `list_apps` / `launch` / `activate` / `quit` are still `unsupported`, so `screenshot --app` cannot reach `capture_window` yet.
+- `Linux` — `list_windows` / `list_apps` / `launch` / `activate` / `quit` are still `unsupported`, so `screenshot --app` cannot reach `capture_window` yet. OpenAI's public docs describe a Codex Computer Use backend on Windows (foreground-only with an app allowlist); they do not describe a Linux backend, so the Codex column for the `Linux` row is now `Not documented`.
 - `Virtual display / isolation` — the macOS `CGVirtualDisplay*` path is probe-only (no display is ever created); the Linux path is a recipe (no Xvfb is started); there is no live sandbox on this Mac.
 
 The honest tally is in the parity table.
