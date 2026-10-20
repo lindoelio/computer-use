@@ -798,25 +798,11 @@ fn isolation_prints_the_matrix_on_every_platform() {
 }
 
 #[test]
-fn an_unknown_display_id_is_refused_without_capturing() {
-    // The stub is not used here: this runs the real backend, but the id is
-    // rejected before any capture, so no permission is needed.
-    let output = run(&["--display", "99999", "screenshot"]);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let value: Value = serde_json::from_str(&stdout).expect("json response");
-    assert_eq!(value["ok"], false, "stdout: {stdout}");
-    assert_eq!(
-        value["error"]["code"], "invalid_arguments",
-        "stdout: {stdout}"
-    );
-}
-
-#[test]
-fn a_bad_display_value_is_refused() {
-    // A value that is neither a monitor id nor `virtual` is a syntax error on
-    // every command, including the one that lists the ids.
+fn a_bad_display_value_is_refused_before_the_backend_is_touched() {
+    // Syntax is pure, so this fails the same way on a runner with no display
+    // server at all — which is exactly what ubuntu-latest is.
     for spec in ["left", "-1", "1.5", ""] {
-        let output = run(&["--display", spec, "displays"]);
+        let output = run(&["--display", spec, "move", "--x", "10", "--y", "10"]);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let value: Value =
             serde_json::from_str(&stdout).unwrap_or_else(|_| panic!("{spec:?} → {stdout}"));
@@ -826,11 +812,32 @@ fn a_bad_display_value_is_refused() {
             "{spec:?} stdout: {stdout}"
         );
     }
-    // Without the flag the same command answers normally.
-    let output = run(&["displays"]);
+}
+
+#[test]
+fn an_unknown_display_id_never_captures() {
+    // Whether the id can be resolved depends on the machine: a CI runner has no
+    // enumerable display, so the lookup itself fails first. What must hold on
+    // every platform is that the action stops there and never captures, and that
+    // the resolution itself is `invalid_arguments` — which the stub test in
+    // `protocol::tests` proves exactly, with a fake display list.
+    let output = run(&["--display", "99999", "screenshot"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let value: Value = serde_json::from_str(&stdout).expect("json response");
-    assert_eq!(value["ok"], true, "stdout: {stdout}");
+    assert_eq!(value["ok"], false, "stdout: {stdout}");
+    let code = value["error"]["code"].as_str().expect("code");
+    let message = value["error"]["message"].as_str().expect("message");
+    if code == "invalid_arguments" {
+        assert!(
+            message.contains("display 99999 was not found"),
+            "stdout: {stdout}"
+        );
+    } else {
+        // The platform could not enumerate displays at all.
+        assert_eq!(code, "execution_failed", "stdout: {stdout}");
+    }
+    // No screenshot was written, so there is no map and no path in the body.
+    assert!(value.get("path").is_none(), "stdout: {stdout}");
 }
 
 #[test]
