@@ -713,13 +713,7 @@ fn browser_tabs_against_missing_chrome_returns_cdp_unavailable() {
     // macOS-only and would fail before we ever reach the CDP path on
     // Linux / Windows runners.
     let output = Command::new(bin())
-        .args([
-            "--cdp",
-            "--cdp-url",
-            "ws://127.0.0.1:1",
-            "browser",
-            "tabs",
-        ])
+        .args(["--cdp", "--cdp-url", "ws://127.0.0.1:1", "browser", "tabs"])
         .env("XDG_CACHE_HOME", cache_home())
         .env("XDG_CONFIG_HOME", config_home())
         .env("XDG_STATE_HOME", state_home())
