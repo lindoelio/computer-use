@@ -1154,6 +1154,12 @@ pub(crate) fn evdev_button(button: crate::types::MouseButton) -> i32 {
 #[cfg(feature = "portal")]
 pub(crate) fn keysym_for(name: &str) -> Option<i32> {
     let lower = name.trim().to_ascii_lowercase();
+    // Escape hatch for a keysym with no name here: `xk_1b` or `xk_0x1b`.
+    // `from_str_radix`, because `parse` rejects hex digits outright.
+    if let Some(rest) = lower.strip_prefix("xk_") {
+        let rest = rest.strip_prefix("0x").unwrap_or(rest);
+        return i32::from_str_radix(rest, 16).ok();
+    }
     let sym = match lower.as_str() {
         "return" | "enter" => 0xff0d,
         "escape" | "esc" => 0xff1b,
@@ -1580,17 +1586,50 @@ mod tests {
     #[cfg(feature = "portal")]
     #[test]
     fn keysyms_cover_the_names_the_agent_emits() {
-        assert_eq!(keysym_for("return"), Some(0xff0d));
-        assert_eq!(keysym_for("Return"), Some(0xff0d));
-        assert_eq!(keysym_for("escape"), Some(0xff1b));
-        assert_eq!(keysym_for("left"), Some(0xff51));
-        assert_eq!(keysym_for("page_down"), Some(0xff55));
-        assert_eq!(keysym_for("f5"), Some(0xffc2));
-        assert_eq!(keysym_for("super"), Some(0xffeb));
-        assert_eq!(keysym_for("control"), Some(0xffe3));
-        // Printable ASCII is its own keysym.
+        // The whole named table, so a transposed pair cannot pass. Note
+        // Page_Up is 0xff55 and Page_Down is 0xff56; they are adjacent and
+        // easy to swap.
+        let table = [
+            ("return", 0xff0d),
+            ("enter", 0xff0d),
+            ("escape", 0xff1b),
+            ("tab", 0xff09),
+            ("space", 0x0020),
+            ("backspace", 0xff08),
+            ("delete", 0xffff),
+            ("home", 0xff50),
+            ("end", 0xff57),
+            ("pageup", 0xff55),
+            ("page_down", 0xff56),
+            ("left", 0xff51),
+            ("right", 0xff53),
+            ("up", 0xff52),
+            ("down", 0xff54),
+            ("insert", 0xff63),
+            ("f1", 0xffbe),
+            ("f12", 0xffc9),
+            ("shift", 0xffe1),
+            ("control", 0xffe3),
+            ("alt", 0xffe9),
+            ("super", 0xffeb),
+        ];
+        for (name, sym) in table {
+            assert_eq!(keysym_for(name), Some(sym), "keysym for {name:?}");
+        }
+        // Modifiers use the same names the CLI prints.
+        assert_eq!(keysym_for("command"), Some(0xffeb));
+        assert_eq!(keysym_for("meta"), Some(0xffeb));
+        // Printable ASCII is its own keysym, and names are case-folded:
+        // an upper-case letter is the lower-case keysym plus the `shift`
+        // modifier, which is how the portal expects a capital to be typed.
         assert_eq!(keysym_for("a"), Some('a' as i32));
+        assert_eq!(keysym_for("A"), Some('a' as i32));
+        assert_eq!(keysym_for("Z"), Some('z' as i32));
         assert_eq!(keysym_for("7"), Some('7' as i32));
+        // An explicit `xk_` escape hatch passes the number straight through.
+        assert_eq!(keysym_for("xk_0x1234"), Some(0x1234));
+        assert_eq!(keysym_for("xk_1b"), Some(0x1b));
+        assert_eq!(keysym_for("xk_zz"), None);
         assert_eq!(keysym_for(""), None);
         assert_eq!(keysym_for("nosuchkey"), None);
     }
