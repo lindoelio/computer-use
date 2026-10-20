@@ -773,7 +773,7 @@ fn reduce_tree(
     path: &mut Vec<usize>,
     out_interfaces: &mut HashMap<Vec<usize>, atspi::InterfaceSet>,
 ) -> UiNode {
-    out_interfaces.insert(path.clone(), rendered.interfaces.clone());
+    out_interfaces.insert(path.clone(), rendered.interfaces);
     let mut children = Vec::with_capacity(rendered.rendered_children.len());
     for (idx, child) in rendered.rendered_children.iter().enumerate() {
         path.push(idx);
@@ -930,11 +930,11 @@ mod tests {
     /// proxy resolution consumes them.
     #[test]
     fn proxy_at_signature_is_stable() {
-        // `proxy_at` is an async function. The signature carries two
-        // independent lifetimes — one for the connection, one for the
-        // path slice. The return type is the connection's lifetime.
-        let _: for<'a, 'b> fn(&'a AccessibilityConnection, ObjectRefOwned, &'b [usize]) -> _ =
-            proxy_at;
+        // `proxy_at` is an async function. The signature uses a single
+        // lifetime for the connection and the path slice (both must
+        // outlive the returned `AccessibleProxy`). Pinning the type
+        // here catches a regression that drops one.
+        let _: for<'a> fn(&'a AccessibilityConnection, ObjectRefOwned, &'a [usize]) -> _ = proxy_at;
     }
 
     /// The Linux `via` tag for element actions is `"atspi"`; the
