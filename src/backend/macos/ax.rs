@@ -1484,7 +1484,7 @@ fn push_sheet(sheets: &mut Vec<NodeFrame>, frame: NodeFrame) {
     }
 }
 
-fn ensure_trusted() -> Result<(), WalkError> {
+pub(crate) fn ensure_trusted() -> Result<(), WalkError> {
     if trusted() {
         Ok(())
     } else {
@@ -1550,6 +1550,65 @@ pub(crate) fn copy_cf(
 
 pub(crate) fn copy_string(element: &AXUIElement, name: &str) -> Result<Option<String>, AttrError> {
     Ok(copy_cf(element, name)?.as_deref().and_then(cf_text))
+}
+
+/// Read a numeric attribute such as a scroll bar's `AXValue`.
+///
+/// `Ok(None)` is a missing attribute or a non-numeric value, which the scroll
+/// verifier treats as "this bar cannot be measured", not as a zero.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn copy_f64(element: &AXUIElement, name: &str) -> Result<Option<f64>, AttrError> {
+    Ok(copy_cf(element, name)?
+        .as_deref()
+        .and_then(|value| value.downcast_ref::<CFNumber>())
+        .and_then(|number| number.as_f64()))
+}
+
+/// Write a numeric attribute. Used for the scroll bar's `AXValue`.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn set_f64(element: &AXUIElement, name: &str, value: f64) -> Result<(), WalkError> {
+    let number = CFNumber::new_cgfloat(value);
+    let reference: &CFNumber = &number;
+    // SAFETY: CFNumber is a CFType that lives to the end of this call. element is
+    // live, and the attribute name is a CFString we own for this call.
+    let error = unsafe {
+        element.set_attribute_value(
+            &CFString::from_str(name),
+            &*(reference as *const CFNumber).cast::<CFType>(),
+        )
+    };
+    match classify(error) {
+        CopyClass::Ok | CopyClass::Missing => Ok(()),
+        CopyClass::Permission => Err(WalkError::Permission(permission_subject())),
+        CopyClass::Timeout => Err(WalkError::Timeout),
+        CopyClass::Failed => Err(WalkError::failed(None, 0)),
+    }
+}
+
+/// Width and height of an `AXSize` attribute. Used for the scroll area and
+/// its scroll bar when estimating the visible fraction.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn ax_size_of(element: &AXUIElement) -> Option<(f64, f64)> {
+    ax_size(&*copy_cf(element, "AXSize").ok().flatten()?)
+}
+
+/// The `AXParent` of `element`, or `None` at the root.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn parent(element: &AXUIElement) -> Option<CFRetained<AXUIElement>> {
+    copy_cf(element, "AXParent")
+        .ok()
+        .flatten()
+        .and_then(|value| value.downcast::<AXUIElement>().ok())
+}
+
+/// Children of `element` as live elements, up to `limit`.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn children(
+    element: &AXUIElement,
+    limit: usize,
+    deadline: Instant,
+) -> Result<Vec<CFRetained<AXUIElement>>, AttrError> {
+    copy_child_elements(element, limit, deadline).map(|(elements, _)| elements)
 }
 
 pub(crate) fn copy_bool(element: &AXUIElement, name: &str) -> Result<Option<bool>, AttrError> {
@@ -2000,7 +2059,7 @@ impl WalkError {
         }
     }
 
-    fn into_computer(self) -> ComputerError {
+    pub(crate) fn into_computer(self) -> ComputerError {
         match self {
             Self::Permission(message) => ComputerError::PermissionRequired(message),
             Self::Timeout => ComputerError::ExecutionFailed("messaging timeout".into()),

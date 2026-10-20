@@ -326,6 +326,27 @@ Options:
       --amount <N>        Wheel steps. Default: 1.
 ```
 
+On macOS a posted wheel event is verified, not trusted: `CGEventPostToPid`
+returns without error whether or not the app acted on it, and a non-frontmost
+app does not act on it. The response therefore carries `via`, `scrolled`,
+`before`, and `after`:
+
+| Field | Meaning |
+| --- | --- |
+| `via` | `event` when the posted wheel event moved the scroll bar, `ax_scrollbar` when `AXValue` had to be written instead. |
+| `scrolled` | `true` only when a scroll-bar value actually changed. |
+| `before` / `after` | The scroll-bar value (0.0–1.0) on the primary axis — vertical when `--dy` is set, otherwise horizontal. `null` when no bar could be read. |
+
+A bar that was already at its limit in the requested direction returns `ok`
+with `scrolled: false` and a warning naming the edge. A scroll that cannot be
+verified at all — no `AXScrollArea` under the point or in the window — is
+`execution_failed`, never a silent success. `--tier ax` runs the scroll-bar
+path directly and posts no event.
+
+The step is an approximation: AX does not report how much of a document is on
+screen, so one wheel line moves roughly a third of the scroll bar. Pass an
+explicit `--amount` when you need a specific distance.
+
 ### `get-state`
 
 ```

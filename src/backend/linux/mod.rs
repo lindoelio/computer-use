@@ -374,6 +374,7 @@ fn perform_activate_tier(
         cursor_moved: true,
         focus_restored: None,
         warnings: Vec::new(),
+        scroll: None,
     })
 }
 
@@ -413,6 +414,7 @@ fn x11_event_tier(job: &InputJob) -> Result<InputReport, ComputerError> {
                 cursor_moved: true,
                 focus_restored: None,
                 warnings: Vec::new(),
+                scroll: None,
             }
         }
         InputKind::Click {
@@ -444,6 +446,7 @@ fn x11_event_tier(job: &InputJob) -> Result<InputReport, ComputerError> {
                 cursor_moved: true,
                 focus_restored: None,
                 warnings: Vec::new(),
+                scroll: None,
             }
         }
         InputKind::Scroll { dx, dy, .. } => {
@@ -465,6 +468,7 @@ fn x11_event_tier(job: &InputJob) -> Result<InputReport, ComputerError> {
                 cursor_moved: false,
                 focus_restored: None,
                 warnings: Vec::new(),
+                scroll: None,
             }
         }
         InputKind::Type { text } => {

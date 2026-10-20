@@ -36,6 +36,7 @@ pub mod menu_path;
 pub mod overlay;
 pub mod policy;
 pub mod protocol;
+pub mod scroll;
 pub mod shortcuts;
 pub mod state;
 pub mod target;

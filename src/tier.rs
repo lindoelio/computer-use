@@ -144,6 +144,29 @@ pub fn fallback_to_activate(lock_held: bool, require_background: bool) -> bool {
     !lock_held && !require_background
 }
 
+/// Plan for one concrete action.
+///
+/// This is [`plan`] with one exception: a caller who names tier `ax` for a
+/// scroll gets the accessibility scroll-bar path, because a scroll has a real
+/// accessibility action. Every other coordinate or keyboard action still
+/// refuses `ax`, so the "pass `--element`" message stays accurate for them.
+pub fn plan_input(
+    requested: RequestedTier,
+    kind: &InputKind,
+    caps: Capabilities,
+    skylight: bool,
+) -> Result<Vec<TierName>, ComputerError> {
+    if matches!(requested, RequestedTier::Named(TierName::Ax)) && is_scroll(kind) {
+        return Ok(vec![TierName::Ax]);
+    }
+    plan(requested, InputClass::Background, caps, skylight)
+}
+
+/// True when this action is a wheel scroll.
+pub fn is_scroll(kind: &InputKind) -> bool {
+    matches!(kind, InputKind::Scroll { .. })
+}
+
 /// Screen point minus the window origin. Both are top-left logical points.
 #[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
 pub fn window_local_point(
@@ -321,7 +344,10 @@ pub enum InputKind {
 }
 
 /// Result of one tier attempt.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `scroll` carries `f64` scroll-bar values, so this is `PartialEq` and not
+/// `Eq`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct InputReport {
     /// Tier that ran.
     pub tier: &'static str,
@@ -331,6 +357,13 @@ pub struct InputReport {
     pub focus_restored: Option<bool>,
     /// Non-fatal notes.
     pub warnings: Vec<String>,
+    /// `Some` for a scroll, and `None` for every other input kind.
+    ///
+    /// A posted event is not proof of a scroll: macOS drops a scroll wheel
+    /// posted to a non-frontmost pid. The scroll tier verifies the scroll bar
+    /// and reports what actually moved. Backends whose scroll is not verified
+    /// leave this `None` and keep their existing response shape.
+    pub scroll: Option<crate::scroll::Outcome>,
 }
 
 /// Screen point for the agent cursor, when this action has one.
@@ -430,6 +463,99 @@ mod tests {
         assert!(fallback_to_activate(false, false));
         assert!(!fallback_to_activate(true, false));
         assert!(!fallback_to_activate(false, true));
+    }
+
+    #[test]
+    fn a_named_ax_tier_runs_only_for_a_scroll() {
+        let caps = Capabilities { event: true };
+        let scroll = InputKind::Scroll {
+            x: None,
+            y: None,
+            dx: 0,
+            dy: 3,
+        };
+        assert_eq!(
+            plan_input(RequestedTier::Named(TierName::Ax), &scroll, caps, false).unwrap(),
+            vec![TierName::Ax]
+        );
+        // Every other coordinate or keyboard action still refuses it, so the
+        // "pass --element" message stays true for them.
+        let click = InputKind::Click {
+            x: 1,
+            y: 2,
+            button: crate::types::MouseButton::Left,
+            count: 1,
+        };
+        let error =
+            plan_input(RequestedTier::Named(TierName::Ax), &click, caps, false).unwrap_err();
+        assert_eq!(error.code(), "unsupported");
+        assert!(error.to_string().contains("--element"));
+        let key = InputKind::Key {
+            strokes: vec![KeyStroke {
+                modifiers: Vec::new(),
+                key: "a".into(),
+            }],
+        };
+        assert_eq!(
+            plan_input(RequestedTier::Named(TierName::Ax), &key, caps, false)
+                .unwrap_err()
+                .code(),
+            "unsupported"
+        );
+        assert!(is_scroll(&scroll));
+        assert!(!is_scroll(&click));
+    }
+
+    #[test]
+    fn scroll_keeps_the_auto_plan_and_the_other_named_tiers() {
+        let caps = Capabilities { event: true };
+        let scroll = InputKind::Scroll {
+            x: None,
+            y: None,
+            dx: 0,
+            dy: 3,
+        };
+        assert_eq!(
+            plan_input(RequestedTier::Auto, &scroll, caps, false).unwrap(),
+            vec![TierName::Event, TierName::Activate]
+        );
+        assert_eq!(
+            plan_input(RequestedTier::Named(TierName::Event), &scroll, caps, false).unwrap(),
+            vec![TierName::Event]
+        );
+        assert_eq!(
+            plan_input(
+                RequestedTier::Named(TierName::Activate),
+                &scroll,
+                caps,
+                false
+            )
+            .unwrap(),
+            vec![TierName::Activate]
+        );
+        // The missing-feature and missing-platform refusals are unchanged.
+        assert_eq!(
+            plan_input(
+                RequestedTier::Named(TierName::Event),
+                &scroll,
+                Capabilities { event: false },
+                false
+            )
+            .unwrap_err()
+            .code(),
+            "unsupported"
+        );
+        assert_eq!(
+            plan_input(
+                RequestedTier::Named(TierName::Synthetic),
+                &scroll,
+                caps,
+                false
+            )
+            .unwrap_err()
+            .code(),
+            "unsupported"
+        );
     }
 
     #[test]

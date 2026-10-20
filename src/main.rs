@@ -474,7 +474,14 @@ enum CliCommand {
     /// Negative numbers are accepted both as `--dy=-3` and as the separate
     /// argument `--dy -3`.
     ///
+    /// On macOS the result is verified, not assumed: a wheel event posted to a
+    /// non-frontmost app is never delivered to its views. The response reports
+    /// `via` (`event` or `ax_scrollbar`), `scrolled`, and the scroll bar's
+    /// `before` / `after` values. When the wheel event is not delivered, the
+    /// accessibility scroll bar is driven instead and a warning says so.
+    ///
     /// Example: computer-use scroll --direction down --amount 3
+    /// Example: computer-use scroll --app Notes --dy 3 --tier event
     Scroll {
         /// Move the pointer to this logical x before scrolling.
         #[arg(long, allow_negative_numbers = true)]

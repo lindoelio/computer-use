@@ -543,6 +543,7 @@ fn off_platform_input<B: DesktopBackend + ?Sized>(
         cursor_moved: true,
         focus_restored: None,
         warnings: Vec::new(),
+        scroll: None,
     })
 }
 

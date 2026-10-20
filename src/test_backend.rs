@@ -93,6 +93,16 @@ pub struct StubBackend {
     pub tiers_run: Mutex<Vec<String>>,
     /// Event and synthetic tiers report cursor motion. With `--require-background` they fail first.
     pub event_moves_cursor: bool,
+    /// Scroll-bar value the stub reports before a scroll.
+    pub scroll_value: Mutex<f64>,
+    /// False models macOS dropping a wheel event posted to a non-frontmost pid:
+    /// the event tier then reports `via: ax_scrollbar` with the fallback warning.
+    /// True models a delivered wheel event: `via: event`.
+    pub scroll_event_delivered: bool,
+    /// The AX scroll-bar tier finds no scroll area, so nothing can be verified.
+    pub scroll_area_missing: bool,
+    /// `AX` refuses the scroll-bar value write.
+    pub scroll_ax_refused: bool,
     /// Secure-field rectangles returned by `secure_ocr_frames`, in image
     /// pixels. `None` keeps the empty list every non-macOS backend returns.
     pub secure_frames: Mutex<Option<Vec<crate::vision::ocr::ImageRect>>>,
@@ -192,6 +202,10 @@ impl Default for StubBackend {
             fail_tiers: Mutex::new(Vec::new()),
             tiers_run: Mutex::new(Vec::new()),
             event_moves_cursor: false,
+            scroll_value: Mutex::new(0.0),
+            scroll_event_delivered: true,
+            scroll_area_missing: false,
+            scroll_ax_refused: false,
             secure_frames: Mutex::new(None),
             secure_frames_map: Mutex::new(None),
             marks_map: Mutex::new(None),
@@ -896,7 +910,7 @@ impl DesktopBackend for StubBackend {
                 "built without skylight feature".into(),
             ));
         }
-        if job.tier == TierName::Ax {
+        if job.tier == TierName::Ax && !crate::tier::is_scroll(&job.kind) {
             return Err(ComputerError::Unsupported(
                 "tier ax does not post coordinate or keyboard events".into(),
             ));
@@ -913,6 +927,7 @@ impl DesktopBackend for StubBackend {
                 "cursor moved and --require-background is set".into(),
             ));
         }
+        let mut scroll = None;
         match &job.kind {
             InputKind::Click {
                 x,
@@ -932,6 +947,7 @@ impl DesktopBackend for StubBackend {
                     }
                 }
                 self.simulate_scroll(*dx, *dy)?;
+                scroll = Some(self.simulated_scroll(job.tier, *dx, *dy)?);
             }
             InputKind::Type { text } => self.simulate_type(text)?,
             InputKind::Key { strokes } => {
@@ -974,7 +990,11 @@ impl DesktopBackend for StubBackend {
             tier: job.tier.as_str(),
             cursor_moved: job.tier == TierName::Activate || (background && self.event_moves_cursor),
             focus_restored: (job.tier == TierName::Activate).then_some(true),
-            warnings: Vec::new(),
+            warnings: scroll
+                .as_ref()
+                .map(|outcome| outcome.warnings.clone())
+                .unwrap_or_default(),
+            scroll,
         })
     }
 
@@ -1063,6 +1083,63 @@ impl DesktopBackend for StubBackend {
 }
 
 impl StubBackend {
+    /// What the stub reports for one verified scroll.
+    ///
+    /// This models the macOS contract: the wheel event is posted, the scroll
+    /// bar is read back, and a bar that did not move falls back to
+    /// `AXValue`. [`Self::scroll_event_delivered`] selects which side of that
+    /// the stub takes, so the response fields are testable on every OS.
+    fn simulated_scroll(
+        &self,
+        tier: crate::tier::TierName,
+        dx: i32,
+        dy: i32,
+    ) -> Result<crate::scroll::Outcome, ComputerError> {
+        use crate::scroll::{self, AxCause, AxFailure, Axis, Outcome};
+        if self.scroll_area_missing {
+            return Err(ComputerError::ExecutionFailed(
+                "no AXScrollArea under the point and none in the window, so the scroll cannot be verified"
+                    .into(),
+            ));
+        }
+        let axes: Vec<Axis> = Axis::both()
+            .into_iter()
+            .filter(|axis| axis.delta(dx, dy) != 0)
+            .collect();
+        // No axis is addressed, so there is no bar and nothing to verify.
+        let Some(axis) = axes.first().copied() else {
+            return Ok(Outcome::none());
+        };
+        let steps = axis.delta(dx, dy);
+        let before = *self.scroll_value.lock().expect("scroll value");
+        // Tier activate is a real foreground wheel, and tier ax drives the bar
+        // directly, so neither one posts a wheel event it then has to verify.
+        let cause = if tier == crate::tier::TierName::Ax {
+            AxCause::ExplicitAxTier
+        } else {
+            AxCause::WheelEventNotDelivered
+        };
+        if tier == crate::tier::TierName::Activate
+            || (tier != crate::tier::TierName::Ax && self.scroll_event_delivered)
+        {
+            let after = scroll::next_value(before, steps, None);
+            *self.scroll_value.lock().expect("scroll value") = after;
+            return Ok(Outcome::event(before, after));
+        }
+        if scroll::at_limit(before, steps) {
+            return Ok(Outcome::at_limit(axis, steps, before));
+        }
+        if self.scroll_ax_refused {
+            return Err(ComputerError::ExecutionFailed(
+                AxFailure::Refused.reason(axis),
+            ));
+        }
+        let next = scroll::next_value(before, steps, None);
+        *self.scroll_value.lock().expect("scroll value") = next;
+        scroll::ax_result(axis, before, next, Some(next), cause)
+            .map_err(|failure| ComputerError::ExecutionFailed(failure.reason(axis)))
+    }
+
     /// Two monitors side by side: the default 800x600 screen at the origin and
     /// a 640x480 one whose origin is `(800, 100)`. This is the display list the
     /// `--display` filter tests run against.

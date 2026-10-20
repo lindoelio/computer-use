@@ -33,9 +33,9 @@ pub fn run(
     kind: InputKind,
 ) -> Result<InputReport, ComputerError> {
     let requested = tier::parse_tier(flags.tier.as_deref())?;
-    let attempts = tier::plan(
+    let attempts = tier::plan_input(
         requested,
-        tier::InputClass::Background,
+        &kind,
         backend.input_support(),
         tier::skylight_compiled(),
     )?;

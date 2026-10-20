@@ -404,6 +404,9 @@ mod posting_math {
 #[cfg(not(test))]
 fn perform_input_live(job: &InputJob) -> Result<InputReport, ComputerError> {
     match job.tier {
+        // A scroll has a real accessibility action, so `--tier ax` runs the
+        // scroll-bar path directly without posting an event.
+        TierName::Ax if crate::tier::is_scroll(&job.kind) => run_ax_scroll(job),
         TierName::Ax => Err(ComputerError::Unsupported(
             "tier ax does not post coordinate or keyboard events; pass --element to use an accessibility action".into(),
         )),
@@ -477,12 +480,206 @@ fn run_events(job: &InputJob, synthetic: bool) -> Result<InputReport, ComputerEr
             "cursor moved and --require-background is set".into(),
         ));
     }
+    // A posted scroll is not proof of a scroll. Read the bar back and say what
+    // actually happened; the AX scroll-bar path is the fallback when the wheel
+    // event was not delivered to a background app.
+    let scroll = match &job.kind {
+        InputKind::Scroll { x, y, dx, dy } => Some(verified_scroll(&target, (*x, *y), *dx, *dy)?),
+        _ => None,
+    };
+    if let Some(outcome) = &scroll {
+        warnings.extend(outcome.warnings.iter().cloned());
+    }
     Ok(InputReport {
         tier: job.tier.as_str(),
         cursor_moved: moved,
         focus_restored: None,
         warnings,
+        scroll,
     })
+}
+
+/// Read the scroll bar before and after the post, then fall back to `AXValue`.
+///
+/// This is the whole point of the fix: `CGEventPostToPid` returns without
+/// error whether or not the app acted on the event, and a non-frontmost app
+/// does not act on it. So the only honest report is a measured one.
+#[cfg(not(test))]
+fn verified_scroll(
+    target: &EventTarget,
+    point: (Option<i32>, Option<i32>),
+    dx: i32,
+    dy: i32,
+) -> Result<crate::scroll::Outcome, ComputerError> {
+    let app = super::ax::application(target.pid).map_err(walk_error)?;
+    let axes = active_axes(dx, dy);
+    // `scroll --dx 0 --dy 0` (or `--amount 0`) asks for no movement at all.
+    // Posting did nothing, so there is nothing to verify and nothing to report.
+    let Some(primary) = axes.first().copied() else {
+        return Ok(crate::scroll::Outcome::none());
+    };
+    let bars = find_bars(&app, point, &axes)?;
+    // The reported values are the primary axis, which is the one the caller
+    // scrolled. A scroll with only one non-zero delta has exactly one axis.
+    let Some(bar) = bars.get(&primary) else {
+        return Err(no_scroll_area(primary));
+    };
+    let before = bar.value().map_err(walk_error)?;
+    // The wheel event was posted by the caller. Settle, then measure again.
+    std::thread::sleep(super::scroll_ax::SETTLE);
+    let after = bar.value().map_err(walk_error)?;
+    let steps = primary.delta(dx, dy);
+    match crate::scroll::decide(before, after, steps, bar.visible_fraction()) {
+        crate::scroll::Decision::Event { before, after } => {
+            Ok(crate::scroll::Outcome::event(before, after))
+        }
+        crate::scroll::Decision::AxScrollbar { before, next } => {
+            // A wheel event was posted and did not deliver, so say so.
+            write_bar(
+                bar,
+                primary,
+                before,
+                next,
+                crate::scroll::AxCause::WheelEventNotDelivered,
+            )
+        }
+        crate::scroll::Decision::AtLimit { value } => {
+            Ok(crate::scroll::Outcome::at_limit(primary, steps, value))
+        }
+        crate::scroll::Decision::Unverifiable => Err(no_scroll_area(primary)),
+    }
+}
+
+/// Write `AXValue` and re-read the bar to confirm it moved.
+#[cfg(not(test))]
+fn write_bar(
+    bar: &super::scroll_ax::ScrollBar,
+    axis: crate::scroll::Axis,
+    before: f64,
+    next: f64,
+    cause: crate::scroll::AxCause,
+) -> Result<crate::scroll::Outcome, ComputerError> {
+    if bar.set_value(next).is_err() {
+        return Err(walk_to_computer(
+            crate::scroll::AxFailure::Refused.reason(axis),
+        ));
+    }
+    let read_back = bar.value().ok().flatten();
+    crate::scroll::ax_result(axis, before, next, read_back, cause)
+        .map_err(|failure| walk_to_computer(failure.reason(axis)))
+}
+
+/// `--tier ax` for a scroll: drive the scroll bar without posting an event.
+#[cfg(not(test))]
+fn run_ax_scroll(job: &InputJob) -> Result<InputReport, ComputerError> {
+    let InputKind::Scroll { x, y, dx, dy } = job.kind else {
+        return Err(ComputerError::Unsupported(
+            "tier ax does not post coordinate or keyboard events".into(),
+        ));
+    };
+    let target = resolve_target(job, crate::tier::input_point(&job.kind))?;
+    let app = super::ax::application(target.pid).map_err(walk_error)?;
+    let axes = active_axes(dx, dy);
+    let Some(primary) = axes.first().copied() else {
+        return Ok(InputReport {
+            tier: job.tier.as_str(),
+            cursor_moved: false,
+            focus_restored: None,
+            warnings: Vec::new(),
+            scroll: Some(crate::scroll::Outcome::none()),
+        });
+    };
+    let bars = find_bars(&app, (x, y), &axes)?;
+    let Some(bar) = bars.get(&primary) else {
+        return Err(no_scroll_area(primary));
+    };
+    let steps = primary.delta(dx, dy);
+    let before = bar.value().map_err(walk_error)?;
+    let Some(before) = before else {
+        return Err(walk_to_computer(no_bar_value(primary)));
+    };
+    if crate::scroll::at_limit(before, steps) {
+        // Nothing to do is a true answer, and it is not the AX path's doing.
+        return Ok(InputReport {
+            tier: job.tier.as_str(),
+            cursor_moved: false,
+            focus_restored: None,
+            warnings: Vec::new(),
+            scroll: Some(crate::scroll::Outcome::at_limit(primary, steps, before)),
+        });
+    }
+    let next = crate::scroll::next_value(before, steps, bar.visible_fraction());
+    // The caller asked for the scroll bar, so no "wheel event" warning applies.
+    let outcome = write_bar(
+        bar,
+        primary,
+        before,
+        next,
+        crate::scroll::AxCause::ExplicitAxTier,
+    )?;
+    Ok(InputReport {
+        tier: job.tier.as_str(),
+        cursor_moved: false,
+        focus_restored: None,
+        warnings: outcome.warnings.clone(),
+        scroll: Some(outcome),
+    })
+}
+
+/// The axes this scroll actually moves, vertical first.
+#[cfg(not(test))]
+fn active_axes(dx: i32, dy: i32) -> Vec<crate::scroll::Axis> {
+    crate::scroll::Axis::both()
+        .into_iter()
+        .filter(|axis| axis.delta(dx, dy) != 0)
+        .collect()
+}
+
+/// Resolve a scroll bar per active axis. A missing bar is only fatal for the
+/// primary axis, which is the one the response reports.
+#[cfg(not(test))]
+fn find_bars(
+    app: &objc2_application_services::AXUIElement,
+    point: (Option<i32>, Option<i32>),
+    axes: &[crate::scroll::Axis],
+) -> Result<
+    std::collections::BTreeMap<crate::scroll::Axis, super::scroll_ax::ScrollBar>,
+    ComputerError,
+> {
+    let mut bars = std::collections::BTreeMap::new();
+    for axis in axes {
+        let found = super::scroll_ax::find(app, point, *axis).map_err(walk_error)?;
+        if let Some(bar) = found {
+            bars.insert(*axis, bar);
+        }
+    }
+    Ok(bars)
+}
+
+#[cfg(not(test))]
+fn no_scroll_area(axis: crate::scroll::Axis) -> ComputerError {
+    walk_to_computer(format!(
+        "no {} AXScrollArea under the point or in the window, so the scroll cannot be verified",
+        axis.as_str()
+    ))
+}
+
+#[cfg(not(test))]
+fn no_bar_value(axis: crate::scroll::Axis) -> String {
+    format!(
+        "the {} AXScrollBar has no numeric AXValue to read",
+        axis.as_str()
+    )
+}
+
+#[cfg(not(test))]
+fn walk_error(error: super::ax::WalkError) -> ComputerError {
+    error.into_computer()
+}
+
+#[cfg(not(test))]
+fn walk_to_computer(message: String) -> ComputerError {
+    ComputerError::ExecutionFailed(message)
 }
 
 /// Result of asking macOS whether an app currently has an AXFocusedUIElement.
@@ -550,6 +747,7 @@ fn run_activate(job: &InputJob) -> Result<InputReport, ComputerError> {
         cursor_moved: true,
         focus_restored,
         warnings: Vec::new(),
+        scroll: None,
     })
 }
 

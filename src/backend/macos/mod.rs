@@ -17,6 +17,7 @@ pub(crate) mod input;
 pub(crate) mod menu;
 #[cfg(not(test))]
 pub(crate) mod overlay;
+pub(crate) mod scroll_ax;
 pub(crate) mod spaces;
 
 pub(crate) use apps::{activate, launch, list_apps, list_windows, quit};

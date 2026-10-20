@@ -3409,19 +3409,34 @@ fn scroll(
             dy: scroll_dy,
         },
     ) {
-        Ok(report) => Response::success(finish_input(
-            json!({
+        Ok(report) => {
+            let body = json!({
                 "action": "scroll",
                 "x": x,
                 "y": y,
                 "dx": scroll_dx,
                 "dy": scroll_dy,
-            }),
-            report,
-            Vec::new(),
-        )),
+            });
+            Response::success(finish_input(scroll_body(body, &report), report, Vec::new()))
+        }
         Err(error) => Response::from_error(error),
     }
+}
+
+/// Add the verified-scroll fields when the backend reported them.
+///
+/// `via` is `event` when the posted wheel event moved the scroll bar and
+/// `ax_scrollbar` when `AXValue` had to be written instead. Windows and Linux
+/// report no outcome, so their response keeps its existing shape.
+fn scroll_body(mut body: Value, report: &crate::tier::InputReport) -> Value {
+    let Some(outcome) = &report.scroll else {
+        return body;
+    };
+    body["via"] = json!(outcome.via.as_str());
+    body["scrolled"] = json!(outcome.scrolled);
+    body["before"] = json!(outcome.before);
+    body["after"] = json!(outcome.after);
+    body
 }
 
 fn planned_tiers(
@@ -6776,6 +6791,203 @@ mod tests {
         // The shared `display` key is stripped, never decoded as an action field.
         let request = parse_request(json!({"action": "isolation", "display": "1"})).unwrap();
         assert_eq!(request.context.display.as_deref(), Some("1"));
+    }
+
+    fn scroll_action(dx: Option<i32>, dy: Option<i32>) -> Action {
+        Action::Scroll {
+            x: None,
+            y: None,
+            dx,
+            dy,
+            direction: None,
+            amount: None,
+        }
+    }
+
+    /// Compare a JSON float with a tolerance, so `0.05 * 3` is `0.15`.
+    fn near(value: f64, expected: f64) -> bool {
+        (value - expected).abs() < 1e-9
+    }
+
+    fn tier_context(tier: &str) -> CallContext {
+        CallContext {
+            tier: Some(tier.to_string()),
+            ..CallContext::default()
+        }
+    }
+
+    #[test]
+    fn a_scroll_reports_the_tier_that_actually_moved_the_scroll_bar() {
+        let backend = StubBackend::default();
+        let value = dispatch_with(&backend, scroll_action(None, Some(3))).to_value();
+        assert_eq!(value["ok"], json!(true));
+        assert_eq!(value["via"], json!("event"));
+        assert_eq!(value["scrolled"], json!(true));
+        assert_eq!(value["before"], json!(0.0));
+        assert!(near(value["after"].as_f64().unwrap_or_default(), 0.15));
+        assert_eq!(value["tier"], json!("event"));
+        // A delivered wheel event has nothing to warn about.
+        assert!(value.get("warnings").is_none());
+    }
+
+    #[test]
+    fn a_dropped_wheel_event_falls_back_to_the_ax_scroll_bar_and_says_so() {
+        let backend = StubBackend {
+            scroll_event_delivered: false,
+            ..StubBackend::default()
+        };
+        let value = dispatch_with(&backend, scroll_action(None, Some(2))).to_value();
+        assert_eq!(value["ok"], json!(true));
+        assert_eq!(value["via"], json!("ax_scrollbar"));
+        assert_eq!(value["scrolled"], json!(true));
+        assert_eq!(value["before"], json!(0.0));
+        assert!(near(value["after"].as_f64().unwrap_or_default(), 0.1));
+        assert_eq!(
+            value["warnings"][0],
+            json!("wheel event not delivered to background app; used AX scroll bar")
+        );
+    }
+
+    #[test]
+    fn a_bar_already_at_its_limit_is_ok_and_never_claims_a_scroll() {
+        let backend = StubBackend {
+            scroll_event_delivered: false,
+            scroll_value: std::sync::Mutex::new(1.0),
+            ..StubBackend::default()
+        };
+        let value = dispatch_with(&backend, scroll_action(None, Some(3))).to_value();
+        assert_eq!(value["ok"], json!(true));
+        assert_eq!(value["scrolled"], json!(false));
+        assert_eq!(value["before"], json!(1.0));
+        assert_eq!(value["after"], json!(1.0));
+        let warning = value["warnings"][0].as_str().unwrap_or_default();
+        assert!(warning.contains("bottom"), "{warning}");
+    }
+
+    #[test]
+    fn a_scroll_that_cannot_be_verified_is_never_reported_as_a_scroll() {
+        let backend = StubBackend {
+            scroll_area_missing: true,
+            ..StubBackend::default()
+        };
+        let response = dispatch_with_context(
+            &backend,
+            scroll_action(None, Some(3)),
+            &tier_context("event"),
+        );
+        assert!(!response.ok);
+        assert_eq!(code_of(&response), "execution_failed");
+        let message = response.to_value()["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(message.contains("cannot be verified"), "{message}");
+        assert!(response.to_value().get("scrolled").is_none());
+    }
+
+    #[test]
+    fn an_ax_refusal_is_a_failure_and_not_a_scroll() {
+        let backend = StubBackend {
+            scroll_event_delivered: false,
+            scroll_ax_refused: true,
+            ..StubBackend::default()
+        };
+        let response = dispatch_with_context(
+            &backend,
+            scroll_action(None, Some(3)),
+            &tier_context("event"),
+        );
+        assert!(!response.ok);
+        assert_eq!(code_of(&response), "execution_failed");
+        assert!(
+            response.to_value()["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("refused"),
+            "{:?}",
+            response.to_value()
+        );
+    }
+
+    #[test]
+    fn a_zero_delta_scroll_reports_no_scroll_and_does_not_panic() {
+        // `--dx 0 --dy 0` addresses no axis at all. There is no bar to report,
+        // so the answer is `scrolled: false` with null values, not a failure.
+        for tier in ["event", "ax"] {
+            let backend = StubBackend::default();
+            let value = dispatch_with_context(
+                &backend,
+                scroll_action(Some(0), Some(0)),
+                &tier_context(tier),
+            )
+            .to_value();
+            assert_eq!(value["ok"], json!(true), "tier {tier}");
+            assert_eq!(value["scrolled"], json!(false), "tier {tier}");
+            assert_eq!(value["before"], json!(null), "tier {tier}");
+            assert_eq!(value["after"], json!(null), "tier {tier}");
+            assert!(value.get("warnings").is_none(), "tier {tier}");
+        }
+    }
+
+    #[test]
+    fn an_explicit_ax_scroll_runs_the_scroll_bar_path_without_posting_an_event() {
+        let backend = StubBackend::default();
+        let response =
+            dispatch_with_context(&backend, scroll_action(None, Some(3)), &tier_context("ax"));
+        let value = response.to_value();
+        assert_eq!(value["ok"], json!(true));
+        assert_eq!(value["tier"], json!("ax"));
+        assert_eq!(value["via"], json!("ax_scrollbar"));
+        assert_eq!(value["scrolled"], json!(true));
+        // No wheel event was posted, so the "not delivered" note would be false.
+        assert!(
+            value.get("warnings").is_none(),
+            "unexpected warnings: {:?}",
+            value["warnings"]
+        );
+        assert_eq!(
+            *backend.tiers_run.lock().unwrap(),
+            vec!["ax".to_string()],
+            "tier ax must not fall back to activate"
+        );
+    }
+
+    #[test]
+    fn require_background_never_reaches_the_activate_scroll_tier() {
+        // The AX scroll-bar path needs no activation, so it is the only honest
+        // answer when the wheel event is not delivered to a background app.
+        let backend = StubBackend {
+            scroll_event_delivered: false,
+            scroll_area_missing: true,
+            ..StubBackend::default()
+        };
+        let context = CallContext {
+            tier: Some("event".into()),
+            require_background: true,
+            ..CallContext::default()
+        };
+        let response = dispatch_with_context(&backend, scroll_action(None, Some(3)), &context);
+        assert!(!response.ok);
+        assert_eq!(code_of(&response), "execution_failed");
+        let tiers = backend.tiers_run.lock().unwrap().clone();
+        assert!(
+            !tiers.iter().any(|tier| tier == "activate"),
+            "activate must never run: {tiers:?}"
+        );
+    }
+
+    #[test]
+    fn a_horizontal_scroll_reports_the_horizontal_bar() {
+        let backend = StubBackend {
+            scroll_event_delivered: false,
+            scroll_value: std::sync::Mutex::new(0.5),
+            ..StubBackend::default()
+        };
+        let value = dispatch_with(&backend, scroll_action(Some(-2), None)).to_value();
+        assert_eq!(value["via"], json!("ax_scrollbar"));
+        assert_eq!(value["before"], json!(0.5));
+        assert!(near(value["after"].as_f64().unwrap_or_default(), 0.4));
+        assert_eq!(value["dx"], json!(-2));
     }
 }
 

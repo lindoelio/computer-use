@@ -192,12 +192,30 @@ The release binary is built with `--features portal`, which links `libpipewire-0
 
 | `--tier` | What it does |
 | --- | --- |
-| `ax` | Accessibility action or value. Does not activate the app. |
+| `ax` | Accessibility action or value. Does not activate the app. Also the scroll-bar path for `scroll`. |
 | `event` | Post events to the target process. Does not move the system cursor. macOS posts to the target pid via `CGEventPostToPid`. Linux uses XTest on X11 and the RemoteDesktop portal on Wayland. |
 | `synthetic` | Private SkyLight front-process call, then post events. Requires `--features skylight` and `--tier synthetic` (or `--synthetic-focus`). |
 | `activate` | Activate the target, run foreground input, then restore the previous app. Takes `foreground.lock`. |
 
 `--require-background` refuses `activate` and turns cursor motion into `execution_failed`. `--allow-foreground` skips the lock. `--no-overlay` skips the agent-cursor helper socket. The agent cursor overlay (`overlay serve`) is macOS-only; a missing helper adds `overlay helper not running` and the action still succeeds.
+
+### Scroll is verified on macOS, not assumed
+
+A scroll wheel posted with `CGEventPostToPid` is **not delivered to the views of a non-frontmost app**: the post returns without error and nothing moves. So `scroll` on macOS measures instead of assuming. It reads the `AXScrollArea` scroll bar (under `--x/--y`, else the window's first usable scroll area) before and after the post, then reports what actually happened:
+
+| `via` | When |
+| --- | --- |
+| `event` | The posted wheel event moved the bar. |
+| `ax_scrollbar` | The wheel event did nothing, so `AXValue` was written on the bar. Adds the warning `wheel event not delivered to background app; used AX scroll bar`. Neither path activates the app or moves the cursor. |
+
+`scrolled` is `true` only when a bar value really changed, and `before` / `after` carry the values (0.0–1.0) on the primary axis. A bar already at its limit returns `ok` with `scrolled: false` and a warning naming the edge; a scroll that cannot be verified at all (no `AXScrollArea`) is `execution_failed`, never a silent success. `--tier ax` scrolls by driving the bar directly and posts no event.
+
+Two honest limitations:
+
+- **The wheel event is not delivered even to a frontmost app.** Measured live on macOS 27 with TextEdit frontmost: the posted wheel left `AXValue` untouched, so the fallback ran. The verification is what makes that visible instead of silent. The warning text still says "background app" because that contract is fixed.
+- **The step is an approximation.** AX does not say how much of a document is on screen, and an `AXScrollBar` element spans the whole track, so the derived fraction sits near 1.0 and one wheel line moves roughly a third of the content. That is close to the system default of three lines per notch, but it is a coarse scroll, not a precise one. Pass an explicit `--amount` for control.
+
+Windows and Linux do not verify this way; their scroll responses keep their existing shape.
 
 ## JSON actions
 
@@ -213,7 +231,7 @@ The `Action` enum in `src/protocol.rs` is the protocol. `id` is echoed on the re
 | `press` | `count` (1–3), `button` | AXPress for left, AXShowMenu for right when advertised. |
 | `type` | `text` | Uses `AXValue` when `--element` is set and settable. |
 | `key` | `keys` | Combo such as `cmd+shift+4`. |
-| `scroll` | `x`, `y`, `dx`/`scroll_x`, `dy`/`scroll_y`, `direction`, `amount` | Positive `dy` is down; positive `dx` is right. `direction` + `amount` is a separate form; do not mix. |
+| `scroll` | `x`, `y`, `dx`/`scroll_x`, `dy`/`scroll_y`, `direction`, `amount` | Positive `dy` is down; positive `dx` is right. `direction` + `amount` is a separate form; do not mix. macOS adds `via`, `scrolled`, `before`, `after` (see *Scroll is verified on macOS*). |
 | `drag` | `path` (array of points or `x,y,x,y` string), `button` | At least two points. Tier `event` posts mouse-dragged events to the pid; tier `activate` uses enigo. |
 | `mouse_down` | `x`, `y`, `button` | Held until `mouse-up` or process exit. |
 | `mouse_up` | `x`, `y`, `button` | Releases the press from `mouse_down`. |
@@ -355,3 +373,4 @@ Copyright 2026 Lindoélio Lázaro.
 - **Element indices across CLI calls.** Indices from `tree` are cached per session. The default session is the current process, so separate one-shot invocations only share indices when you pass the same `--session <ID>` to `tree` and to the element action.
 - **`set_value` replaces the field.** `set-value` (and `type --element N` without an explicit `--tier`) writes the AX value, replacing the whole field contents. Pass `--tier event` to insert keystrokes at the focused caret instead.
 - **`type --tier event` needs keyboard focus.** Keystrokes posted to a pid are dropped if no element in that app has focus. `type` then returns ok with a `warning`; click the field (`click --tier event`) or pass `--element N` first.
+- **`scroll --tier event` used to lie.** It returned `ok` without scrolling a background app, because a wheel event posted to a non-frontmost pid is never delivered to its views. `scroll` now reads the scroll bar back and reports `via`, `scrolled`, `before`, and `after`; when the wheel event is not delivered it falls back to the `AXValue` scroll bar and says so in a warning. If there is no scroll area to verify against, it is `execution_failed` instead of a silent success.

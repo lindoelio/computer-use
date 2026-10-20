@@ -1103,6 +1103,7 @@ async fn run_remote_desktop(
         cursor_moved: true,
         focus_restored: None,
         warnings,
+        scroll: None,
     })
 }
 
