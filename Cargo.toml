@@ -141,7 +141,10 @@ dispatch2 = "0.3"
 objc2-foundation = { version = "0.3.2", default-features = false, features = [
     "NSArray",
     "NSBundle",
+    "NSData",
+    "NSDictionary",
     "NSError",
+    "NSObject",
     "NSProcessInfo",
     "NSString",
     "NSURL",
@@ -161,8 +164,11 @@ objc2-screen-capture-kit = { version = "0.3.2", default-features = false, featur
 # P11: VNRecognizeTextRequest (accurate + language correction) for OCR.
 objc2-vision = { version = "0.3.2", default-features = false, features = [
     "VNRecognizeTextRequest",
+    "VNRequest",
     "VNRequestHandler",
     "VNObservation",
+    "VNTypes",
+    "objc2-core-foundation",
 ] }
 
 [profile.release]
