@@ -567,8 +567,8 @@ mod windows {
         }
         let source = image.as_raw();
         let mut bgra = Vec::with_capacity(source.len());
-        for pixel in source.chunks_exact(4) {
-            bgra.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+        for [r, g, b, a] in source.as_chunks::<4>().0 {
+            bgra.extend_from_slice(&[*b, *g, *r, *a]);
         }
         let buffer = CryptographicBuffer::CreateFromByteArray(&bgra).map_err(|error| {
             ComputerError::ExecutionFailed(format!(
