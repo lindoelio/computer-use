@@ -467,9 +467,14 @@ mod virtual_display {
     use std::ffi::{c_void, CStr};
 
     /// `CGVirtualDisplayDescriptorCreate` — returns a `CGVirtualDisplayDescriptor *`.
+    ///
+    /// The signature is recorded so the private ABI is documented in one place.
+    /// Nothing in this build calls through it.
+    #[allow(dead_code)]
     pub(super) type DescriptorCreate = unsafe extern "C" fn() -> *mut c_void;
 
     /// `CGVirtualDisplayCreate(descriptor, out_display_id)`.
+    #[allow(dead_code)]
     pub(super) type DisplayCreate = unsafe extern "C" fn(*const c_void, *mut u32) -> i32;
 
     const CORE_GRAPHICS: &CStr = c"/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics";
@@ -488,11 +493,6 @@ mod virtual_display {
     /// CoreGraphics mapped. Reporting "not exported" because the framework was
     /// never opened would be a wrong answer, not an honest one.
     pub(super) fn resolve_symbols() -> Symbols {
-        // The function pointer aliases above document the signatures. The probe
-        // only needs the addresses, and never calls through them.
-        let _descriptor: Option<DescriptorCreate> = None;
-        let _create: Option<DisplayCreate> = None;
-
         // SAFETY: the path is a NUL-terminated literal for a system framework
         // that is always present on macOS. RTLD_LAZY resolves nothing until a
         // symbol is used, and the handle is closed before returning.
