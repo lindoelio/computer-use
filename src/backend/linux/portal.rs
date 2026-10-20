@@ -764,7 +764,8 @@ fn grab_pipewire_frame(
     let _ = timer.update_timer(Some(CAPTURE_TIMEOUT), None);
     mainloop.run();
 
-    shared.borrow_mut().frame.take().ok_or_else(|| {
+    let frame = shared.borrow_mut().frame.take();
+    frame.ok_or_else(|| {
         ComputerError::ExecutionFailed(
             "the ScreenCast portal produced no video frame within 5s".into(),
         )
@@ -880,12 +881,12 @@ pub(crate) fn perform_event_tier(
         ));
     }
 
-    crate::backend::linux::runtime::block_on(run_remote_desktop(&job.kind))?
+    crate::backend::linux::runtime::block_on(run_remote_desktop(job.kind.clone()))?
 }
 
 #[cfg(feature = "portal")]
 async fn run_remote_desktop(
-    kind: &crate::tier::InputKind,
+    kind: crate::tier::InputKind,
 ) -> Result<crate::tier::InputReport, ComputerError> {
     use crate::tier::InputKind;
     use ashpd::desktop::{
@@ -959,11 +960,9 @@ async fn run_remote_desktop(
         warnings.push(EIS_UNAVAILABLE_NOTE.to_string());
     }
 
-    let absolute = |x: i32, y: i32| notify_absolute(&remote, &session, node, x, y);
-
     match kind {
         InputKind::Move { x, y } => {
-            absolute(*x, *y).await?;
+            notify_absolute(&remote, &session, node, x, y).await?;
         }
         InputKind::Click {
             x,
@@ -971,9 +970,9 @@ async fn run_remote_desktop(
             button,
             count,
         } => {
-            absolute(*x, *y).await?;
-            let code = evdev_button(*button);
-            for index in 0..*count {
+            notify_absolute(&remote, &session, node, x, y).await?;
+            let code = evdev_button(button);
+            for index in 0..count {
                 if index > 0 {
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
@@ -999,25 +998,25 @@ async fn run_remote_desktop(
         }
         InputKind::Scroll { x, y, dx, dy } => {
             if let (Some(x), Some(y)) = (x, y) {
-                absolute(*x, *y).await?;
+                notify_absolute(&remote, &session, node, x, y).await?;
             }
-            if *dy != 0 {
+            if dy != 0 {
                 remote
                     .notify_pointer_axis_discrete(
                         &session,
                         Axis::Vertical,
-                        *dy,
+                        dy,
                         NotifyPointerAxisDiscreteOptions::default(),
                     )
                     .await
                     .map_err(portal_error)?;
             }
-            if *dx != 0 {
+            if dx != 0 {
                 remote
                     .notify_pointer_axis_discrete(
                         &session,
                         Axis::Horizontal,
-                        *dx,
+                        dx,
                         NotifyPointerAxisDiscreteOptions::default(),
                     )
                     .await
@@ -1241,7 +1240,12 @@ async fn try_eis(
     // The EIS socket is a `SOCK_STREAM` unix socket handed over by the
     // portal, as a `zvariant::OwnedFd`.
     let owned: std::os::fd::OwnedFd = fd.into();
-    let Ok(socket) = std::os::unix::net::UnixStream::from(owned) else {
+    // `OwnedFd -> UnixStream` is `TryFrom`: the descriptor has to be a
+    // socket, and a portal that hands over anything else is simply not
+    // offering EIS.
+    let Ok(socket) = <std::os::unix::net::UnixStream as std::convert::TryFrom<
+        std::os::fd::OwnedFd,
+    >>::try_from(owned) else {
         return false;
     };
     let Ok(context) = EiContext::new(socket) else {
