@@ -1,10 +1,10 @@
 [package]
 name = "computer-use"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"
-description = "Cross-platform desktop automation for agents: screenshots, mouse, keyboard, and accessibility."
+description = "Cross-platform desktop automation for agents: screenshots, mouse, keyboard, accessibility, CDP, and isolation."
 repository = "https://github.com/lindoelio/computer-use"
 homepage = "https://github.com/lindoelio/computer-use"
 readme = "README.md"
@@ -24,6 +24,18 @@ include = [
     "/CHANGELOG.md",
     "/LICENSE-MIT",
     "/LICENSE-APACHE",
+    # Documentation shipped with the crate tarball.
+    "/docs/ROADMAP.md",
+    "/docs/ISOLATION.md",
+    "/docs/PACKAGING.md",
+    "/docs/SKYLIGHT.md",
+    "/docs/policy.example.toml",
+    # macOS .app packaging assets and the build script. The bundle id is
+    # `ai.lindoelio.computer-use`; the script ad-hoc signs when no Developer
+    # ID is configured.
+    "/packaging/macos/Info.plist",
+    "/packaging/macos/entitlements.plist",
+    "/scripts/package-macos-app.sh",
 ]
 
 [lib]

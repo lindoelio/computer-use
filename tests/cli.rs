@@ -364,7 +364,7 @@ fn version_prints_package_version() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("computer-use"));
-    assert!(stdout.contains("0.1.0"), "{stdout}");
+    assert!(stdout.contains("0.2.0"), "{stdout}");
 }
 
 #[test]
