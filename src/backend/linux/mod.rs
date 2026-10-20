@@ -316,6 +316,9 @@ enum EventRoute {
     /// Wayland with `portal` compiled in: the RemoteDesktop portal.
     Portal,
     /// Wayland without `portal`: nothing can do this.
+    // Only the non-portal build constructs this arm; the variant stays so the
+    // model is the same three states in either build.
+    #[cfg_attr(feature = "portal", allow(dead_code))]
     Unsupported,
 }
 
@@ -622,6 +625,7 @@ mod tests {
         assert_ne!(EventRoute::Portal, EventRoute::Unsupported);
     }
 
+    #[test]
     fn doctor_uses_the_shared_shape() {
         let report = doctor(DoctorOptions::default()).unwrap();
         let value = serde_json::to_value(&report).unwrap();

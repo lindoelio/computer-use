@@ -1237,17 +1237,9 @@ async fn try_eis(
     else {
         return false;
     };
-    // The EIS socket is a `SOCK_STREAM` unix socket handed over by the
-    // portal, as a `zvariant::OwnedFd`.
-    let owned: std::os::fd::OwnedFd = fd.into();
-    // `OwnedFd -> UnixStream` is `TryFrom`: the descriptor has to be a
-    // socket, and a portal that hands over anything else is simply not
-    // offering EIS.
-    let Ok(socket) = <std::os::unix::net::UnixStream as std::convert::TryFrom<
-        std::os::fd::OwnedFd,
-    >>::try_from(owned) else {
-        return false;
-    };
+    // `ConnectToEIS` hands back the portal's `SOCK_STREAM` unix socket
+    // already owned; the std conversion is infallible.
+    let socket = std::os::unix::net::UnixStream::from(fd);
     let Ok(context) = EiContext::new(socket) else {
         return false;
     };
