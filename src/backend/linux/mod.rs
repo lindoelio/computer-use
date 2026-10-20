@@ -573,6 +573,9 @@ mod tests {
         let job = InputJob {
             tier: TierName::Event,
             kind: InputKind::Move { x: 0, y: 0 },
+            app: None,
+            window: None,
+            allow_foreground: false,
             require_background: false,
         };
         // The dispatcher entry point is `perform_input`; route the same
@@ -610,6 +613,9 @@ mod tests {
         let job = InputJob {
             tier: TierName::Activate,
             kind: InputKind::Move { x: 0, y: 0 },
+            app: None,
+            window: None,
+            allow_foreground: false,
             require_background: false,
         };
         // Pin the TierName::Activate -> perform_activate_tier wiring

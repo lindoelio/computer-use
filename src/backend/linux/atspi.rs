@@ -92,19 +92,37 @@ pub(crate) fn ping() -> bool {
 /// Public entry point for the dispatcher.
 pub(crate) fn build_tree(query: &TreeQuery) -> Result<TreeReport, ComputerError> {
     let outcome = runtime::block_on(async {
-        tokio::time::timeout(
-            ATSPI_CALL_BUDGET,
-            walk_live(query, false, false /* no signal capture */),
-        )
-        .await
-    })?;
+        tokio::time::timeout(ATSPI_CALL_BUDGET, walk_live(query, false, false)).await
+    });
     match outcome {
-        Ok(Ok(report)) => Ok(report),
+        Ok(Ok(live)) => Ok(tree_report_from(&live)),
         Ok(Err(error)) => Err(error),
         Err(_elapsed) => Err(ComputerError::ExecutionFailed(format!(
             "AT-SPI walk exceeded {}s budget",
             ATSPI_CALL_BUDGET.as_secs()
         ))),
+    }
+}
+
+/// Reduce a live walk into the public `TreeReport` shape.
+fn walk_live_to_report(live: LiveWalk) -> TreeReport {
+    tree_report_from(&live)
+}
+
+/// Borrow a live walk and produce the dispatcher's `TreeReport`.
+fn tree_report_from(live: &LiveWalk) -> TreeReport {
+    TreeReport {
+        pid: live.pid,
+        window_id: live.window_id,
+        revision: live.ui_revision,
+        source: SOURCE_LABEL.to_string(),
+        truncated: live.truncated,
+        tree: live.tree_text.clone(),
+        full_text: live.full_text.clone(),
+        diff: None,
+        app: None,
+        note: None,
+        legacy: None,
     }
 }
 
@@ -125,7 +143,14 @@ pub(crate) fn element_action(request: &ElementRequest) -> Result<ElementOutcome,
     let request = request.clone();
     let op = request.op.clone();
 
-    let joined = runtime::block_on(async move {
+    // Map `tokio::time::error::Elapsed` (and any other timeout error) to
+    // the project error type so the outer match sees a single error
+    // channel. The closure we run is the same async block whether the
+    // budget hit or not.
+    let joined: Result<
+        Result<(String, Option<LiveWalk>, CachedSnapshot, String), ElementError>,
+        tokio::time::error::Elapsed,
+    > = runtime::block_on(async move {
         tokio::time::timeout(ATSPI_CALL_BUDGET, async {
             let cached = load_cached_snapshot(&query).await?;
             let cached = match cached {
@@ -158,17 +183,17 @@ pub(crate) fn element_action(request: &ElementRequest) -> Result<ElementOutcome,
             // Re-fetch on the same bus, log a failure but never turn a
             // completed action into an error.
             let refreshed = match walk_live(&query, false, false).await {
-                Ok(report) => report,
+                Ok(report) => Some(report),
                 Err(error) => {
                     return Ok((
                         via,
                         None,
                         cached,
                         format!("tree was not re-read after the action: {error}"),
-                    ))
+                    ));
                 }
             };
-            Ok((via, Some(refreshed), cached, String::new()))
+            Ok((via, refreshed, cached, String::new()))
         })
         .await
     });
@@ -363,12 +388,21 @@ async fn walk_live(
 /// the live tree's `get_children` results. This mirrors the walk
 /// `render_node` used to populate `interfaces` so the index the gate
 /// validated points to the same AT-SPI object the tree rendered.
+///
+/// `AccessibleProxy<'_>` borrows from the `ObjectRefOwned` we passed
+/// to `as_accessible_proxy`. We hold every visited `ObjectRefOwned`
+/// in a `Vec` on the stack so the final proxy can borrow from the
+/// last entry without dangling.
 async fn proxy_at<'a>(
     connection: &'a AccessibilityConnection,
-    root: &'a ObjectRefOwned,
+    root: ObjectRefOwned,
     path: &[usize],
 ) -> Result<AccessibleProxy<'a>, ComputerError> {
-    let mut current = root
+    let mut visited: Vec<ObjectRefOwned> = vec![root];
+    // Hold the live intermediate proxies inside the loop body only, then
+    // drop them at the end of each iteration. The `Vec<ObjectRefOwned>`
+    // keeps the underlying bus references anchored for the final call.
+    let mut current = visited[0]
         .as_accessible_proxy(connection.connection())
         .await
         .map_err(atspi_error)?;
@@ -379,7 +413,10 @@ async fn proxy_at<'a>(
                 "path index {child_index} did not resolve to an AT-SPI child"
             )));
         };
-        current = child_ref
+        visited.push(child_ref);
+        current = visited
+            .last()
+            .expect("just pushed")
             .as_accessible_proxy(connection.connection())
             .await
             .map_err(atspi_error)?;
@@ -400,7 +437,7 @@ async fn perform_action(
 
     let connection = connect().await?;
     let interfaces = live.interfaces.get(path).copied().unwrap_or_default();
-    let proxy = proxy_at(&connection, &live.root_object, path).await?;
+    let proxy = proxy_at(&connection, live.root_object.clone(), path).await?;
     let element_writes_text = matches!(
         op,
         ElementOp::SetValue { .. } | ElementOp::SelectText { .. } | ElementOp::Type { .. }
