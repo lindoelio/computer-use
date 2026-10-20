@@ -100,6 +100,10 @@ pub struct StubBackend {
     /// frames are screen points, so redaction is only correct when the
     /// dispatcher passes the map of the capture the OCR ran on.
     pub secure_frames_map: Mutex<Option<crate::image_util::ScreenshotMap>>,
+    /// Screenshot map handed to the last `marks_for_tree` call. Element frames
+    /// are screen points, so boxes are only right when the dispatcher passes the
+    /// map of the capture the marks are stamped on.
+    pub marks_map: Mutex<Option<crate::image_util::ScreenshotMap>>,
     /// Buttons still down. One-shot dispatch releases these.
     pub held_buttons: Mutex<Vec<MouseButton>>,
     /// Buttons released by [`DesktopBackend::release_held`], not by `mouse_up`.
@@ -190,6 +194,7 @@ impl Default for StubBackend {
             event_moves_cursor: false,
             secure_frames: Mutex::new(None),
             secure_frames_map: Mutex::new(None),
+            marks_map: Mutex::new(None),
             held_buttons: Mutex::new(Vec::new()),
             releases: Mutex::new(Vec::new()),
             holds_ms: Mutex::new(Vec::new()),
@@ -472,7 +477,7 @@ impl DesktopBackend for StubBackend {
                 "accessibility is unavailable".into(),
             ));
         }
-        let (info, window_id, title) = self.resolve_tree_target(query)?;
+        let (info, window_id, title, _) = self.resolve_tree_target(query)?;
         let pid = info.pid;
         let value = self.stub_value.lock().expect("stub value").clone();
         let mut window = UiNode::bare("AXWindow");
@@ -536,7 +541,7 @@ impl DesktopBackend for StubBackend {
             let selector = parse_app_selector(app)?;
             policy::deny_or_allow(policy::selector_denial(&selector))?;
         }
-        let (info, window_id, title) = self.resolve_tree_target(&query)?;
+        let (info, window_id, title, _) = self.resolve_tree_target(&query)?;
         policy::deny_or_allow(policy::identity_denial(
             info.bundle_id.as_deref(),
             info.path.as_deref().map(Path::new),
@@ -816,7 +821,7 @@ impl DesktopBackend for StubBackend {
             full: false,
             session: session.map(str::to_string),
         };
-        let Ok((info, window_id, _)) = self.resolve_tree_target(&query) else {
+        let Ok((info, window_id, _, _)) = self.resolve_tree_target(&query) else {
             return Ok(None);
         };
         let key = (
@@ -1046,10 +1051,14 @@ impl DesktopBackend for StubBackend {
 
     fn marks_for_tree(
         &self,
-        _query: &TreeQuery,
-        _map: &crate::image_util::ScreenshotMap,
+        query: &TreeQuery,
+        map: &crate::image_util::ScreenshotMap,
     ) -> Result<Vec<crate::vision::MarkBox>, ComputerError> {
-        Ok(Vec::new())
+        *self.marks_map.lock().expect("marks map") = Some(map.clone());
+        let root = self.marks_fixture(query)?;
+        // Same walker the platform backends use, so the mock proves the shared
+        // frame-to-pixel path and not a parallel test-only implementation.
+        Ok(crate::vision::marks_for_nodes(&root, map))
     }
 }
 
@@ -1150,7 +1159,7 @@ impl StubBackend {
     fn resolve_tree_target(
         &self,
         query: &TreeQuery,
-    ) -> Result<(AppInfo, u32, String), ComputerError> {
+    ) -> Result<(AppInfo, u32, String, Option<WindowBounds>), ComputerError> {
         let apps = self.all_apps();
         let info = if let Some(app) = query.app.as_deref() {
             let selector = parse_app_selector(app)?;
@@ -1173,7 +1182,48 @@ impl StubBackend {
             .map(|window| window.title.clone())
             .unwrap_or_else(|| info.name.clone());
         let window_id = chosen.as_ref().map(|window| window.id).unwrap_or(0);
-        Ok((info, window_id, title))
+        Ok((
+            info,
+            window_id,
+            title,
+            chosen.as_ref().map(|window| window.bounds),
+        ))
+    }
+
+    /// Framed tree handed to `marks_for_tree`.
+    ///
+    /// It mirrors a real backend: the window frame is the target window's
+    /// screen-point bounds and the child sits inside it, so a capture of that
+    /// window yields in-canvas boxes while a capture of something else yields
+    /// none. `set_live` replaces it with a caller-supplied tree.
+    fn marks_fixture(&self, query: &TreeQuery) -> Result<UiNode, ComputerError> {
+        if let Some(live) = self.live_override.lock().expect("live").as_ref() {
+            return Ok(live.ui.clone());
+        }
+        let (_, _, title, bounds) = self.resolve_tree_target(query)?;
+        let bounds = bounds.unwrap_or(WindowBounds {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        });
+        let mut window = UiNode::bare("AXWindow");
+        window.title = Some(title);
+        window.frame = Some(NodeFrame {
+            x: f64::from(bounds.x),
+            y: f64::from(bounds.y),
+            width: f64::from(bounds.width),
+            height: f64::from(bounds.height),
+        });
+        let mut text = UiNode::bare("AXTextArea");
+        text.frame = Some(NodeFrame {
+            x: f64::from(bounds.x) + 10.0,
+            y: f64::from(bounds.y) + 10.0,
+            width: f64::from(bounds.width) - 20.0,
+            height: 40.0,
+        });
+        window.children = vec![text];
+        Ok(window)
     }
 }
 

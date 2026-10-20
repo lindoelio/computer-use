@@ -9,5 +9,5 @@
 pub mod marks;
 pub mod ocr;
 
-pub use marks::{draw_marks, ocr_label, tree_label, MarkBox};
+pub use marks::{draw_marks, marks_for_nodes, ocr_label, tree_label, MarkBox};
 pub use ocr::{recognize, redact_blocks, ImageRect as OcrImageRect, OcrBlock, OcrResult};

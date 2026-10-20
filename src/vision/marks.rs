@@ -7,6 +7,9 @@
 
 use image::{Pixel, Rgba, RgbaImage};
 
+use crate::image_util::{screen_rect_to_image, ScreenshotMap};
+use crate::tree::{UiNode, CHILD_CAP, DEPTH_CAP, LINE_CAP};
+
 /// One rectangle plus its human-readable label.
 ///
 /// `label` is what the user sees inside the box. The protocol decides whether
@@ -75,6 +78,61 @@ pub fn ocr_label(index: u32) -> String {
     format!("o{index}")
 }
 
+/// Numbered boxes for every node of `root` whose frame lands inside `map`.
+///
+/// Element frames are in screen points while `map` describes the pixels of one
+/// capture, so every frame goes through [`screen_rect_to_image`]. A node with no
+/// frame contributes no box but its children are still walked: a frameless
+/// group must never hide the subtree below it.
+///
+/// Indices mirror [`crate::tree::render`] exactly — same preorder, same
+/// `CHILD_CAP` / `DEPTH_CAP` / `LINE_CAP` budget — so the number drawn on the
+/// image is the number `tree` prints for that element.
+#[must_use]
+pub fn marks_for_nodes(root: &UiNode, map: &ScreenshotMap) -> Vec<MarkBox> {
+    let mut out = Vec::new();
+    let mut index = 0_u32;
+    collect_marks(root, map, 0, &mut index, &mut out);
+    out
+}
+
+fn collect_marks(
+    node: &UiNode,
+    map: &ScreenshotMap,
+    depth: usize,
+    index: &mut u32,
+    out: &mut Vec<MarkBox>,
+) {
+    let label = tree_label(*index);
+    *index = index.saturating_add(1);
+    if let Some(frame) = node.frame {
+        if let Some((x, y, width, height)) =
+            screen_rect_to_image(map, frame.x, frame.y, frame.width, frame.height)
+        {
+            out.push(MarkBox {
+                rect: ImageRect {
+                    x,
+                    y,
+                    width,
+                    height,
+                },
+                label,
+            });
+        }
+    }
+    let total = node.child_count.unwrap_or(node.children.len());
+    if depth >= DEPTH_CAP {
+        return;
+    }
+    let show = total.min(CHILD_CAP).min(node.children.len());
+    for child in node.children.iter().take(show) {
+        if usize::try_from(*index).unwrap_or(usize::MAX) >= LINE_CAP {
+            return;
+        }
+        collect_marks(child, map, depth + 1, index, out);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Internals
 // ---------------------------------------------------------------------------
@@ -128,7 +186,12 @@ fn draw_label(image: &mut RgbaImage, rect: ImageRect, label: &str) {
     let pixels = label_to_pixels(label);
     let rect_w = rect.width.max(1);
     let rect_h = rect.height.max(1);
-    let cell = (rect_w / pixels.cols.max(1) as u32).min(rect_h / FONT_HEIGHT.max(1) as u32);
+    // The cell is one font pixel. It may shrink to fit a small box, but it is
+    // capped: a glyph that scales with the box made the window's own mark
+    // paint a 452x678 white digit and buried the screenshot under the overlay.
+    let cell = (rect_w / pixels.cols.max(1) as u32)
+        .min(rect_h / FONT_HEIGHT.max(1) as u32)
+        .min(MAX_LABEL_CELL);
     if cell == 0 {
         return;
     }
@@ -231,6 +294,12 @@ struct GlyphPixels {
 /// and bounds the size of a set-of-marks overlay.
 const MAX_LABEL_CHARS: usize = 4;
 
+/// Largest font pixel in a label, in image pixels.
+///
+/// A number is a corner badge, not a watermark: at 4 a one-digit label is a
+/// 16x24 box and a two-digit one is 32x24, whatever the element's own size is.
+const MAX_LABEL_CELL: u32 = 4;
+
 fn label_to_pixels(label: &str) -> GlyphPixels {
     // MAX_LABEL_CHARS hard caps the number of glyphs; each glyph is
     // FONT_WIDTH columns wide, so the column buffer must hold that many
@@ -301,10 +370,216 @@ fn fill_unknown(rows: &mut [[bool; FONT_WIDTH * MAX_LABEL_CHARS]], col_offset: u
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::image_util::{prepare_shot, ShotFit};
+    use crate::tree::NodeFrame;
     use image::{Rgba, RgbaImage};
 
     fn white_square(size: u32) -> RgbaImage {
         RgbaImage::from_pixel(size, size, Rgba([255, 255, 255, 255]))
+    }
+
+    /// Map of a Retina window capture: an 800x500-point window at screen
+    /// `(120, 40)`, a 1600x1000 buffer at scale 2, fitted down to 1440 wide.
+    /// This is the P4 example, so every element-frame box in this module is
+    /// built against a map a real capture really produces.
+    fn retina_window_map() -> ScreenshotMap {
+        let buffer = RgbaImage::from_pixel(1600, 1000, Rgba([120, 120, 120, 255]));
+        prepare_shot(
+            &buffer,
+            ShotFit {
+                scale: 2.0,
+                origin_x: 120,
+                origin_y: 40,
+                logical_width: 800,
+                logical_height: 500,
+                max_width: 1440,
+                canvas: None,
+            },
+        )
+        .expect("prepare_shot")
+        .map
+    }
+
+    fn framed(role: &str, frame: NodeFrame) -> UiNode {
+        let mut node = UiNode::bare(role);
+        node.frame = Some(frame);
+        node
+    }
+
+    fn rect(x: f64, y: f64, width: f64, height: f64) -> NodeFrame {
+        NodeFrame {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn screen_point_frames_at_a_nonzero_origin_become_in_canvas_marks() {
+        // The reported failure: on a real Retina window every element frame
+        // came back as screen points while the capture map describes pixels of
+        // a window that does not start at (0, 0), so nothing survived the
+        // conversion and `screenshot --marks` wrote a clean image.
+        let map = retina_window_map();
+        assert_eq!(map.origin.x, 120);
+        assert_eq!(map.scale, 2.0);
+
+        let root = framed(
+            "AXWindow",
+            rect(120.0, 40.0, 800.0, 500.0), // exactly the captured window
+        );
+        let mut inner = framed("AXTextArea", rect(140.0, 60.0, 760.0, 100.0));
+        inner.value = Some("hello".into());
+        let root = UiNode {
+            children: vec![inner],
+            ..root
+        };
+
+        let marks = marks_for_nodes(&root, &map);
+        assert_eq!(
+            marks.len(),
+            2,
+            "both the window and the text area are inside the capture"
+        );
+
+        // The window covers the whole fitted capture, and the text area sits
+        // 20 points inside it, which is 36 pixels at 1440/800.
+        assert_eq!(marks[0].label, "0");
+        assert_eq!(marks[1].label, "1");
+        assert_eq!(
+            marks[0].rect,
+            ImageRect {
+                x: 0,
+                y: 0,
+                width: 1440,
+                height: 900
+            }
+        );
+        assert_eq!(
+            marks[1].rect,
+            ImageRect {
+                x: 36,
+                y: 36,
+                width: 1368,
+                height: 180
+            }
+        );
+
+        for mark in &marks {
+            assert!(
+                mark.rect.x >= 0
+                    && mark.rect.y >= 0
+                    && mark.rect.x + mark.rect.width as i32 <= map.width as i32
+                    && mark.rect.y + mark.rect.height as i32 <= map.height as i32,
+                "mark {:?} escaped the {}x{} canvas",
+                mark.rect,
+                map.width,
+                map.height
+            );
+        }
+    }
+
+    #[test]
+    fn mark_indices_match_the_numbers_the_tree_prints() {
+        let map = retina_window_map();
+        let root = UiNode {
+            children: vec![
+                framed("AXTextArea", rect(140.0, 60.0, 760.0, 100.0)),
+                framed("AXButton", rect(140.0, 200.0, 120.0, 40.0)),
+            ],
+            ..framed("AXWindow", rect(120.0, 40.0, 800.0, 500.0))
+        };
+        let rendered = crate::tree::render(&root);
+        let marks = marks_for_nodes(&root, &map);
+        assert_eq!(marks.len(), 3);
+        for mark in &marks {
+            assert!(
+                rendered.text.contains(&format!("[{}]", mark.label)),
+                "index {} is not in the rendered tree:\n{}",
+                mark.label,
+                rendered.text
+            );
+        }
+    }
+
+    #[test]
+    fn a_frameless_group_does_not_hide_its_subtree() {
+        // The macOS walk used to `return` on a node with no frame, so a
+        // frameless container took every element below it down with it.
+        let map = retina_window_map();
+        let mut group = UiNode::bare("AXGroup");
+        group.frame = None;
+        group.children = vec![framed("AXButton", rect(140.0, 200.0, 120.0, 40.0))];
+        let root = UiNode {
+            children: vec![group],
+            ..framed("AXWindow", rect(120.0, 40.0, 800.0, 500.0))
+        };
+
+        let marks = marks_for_nodes(&root, &map);
+        assert_eq!(
+            marks.len(),
+            2,
+            "the window and the button under the frameless group"
+        );
+        assert_eq!(marks[1].label, "2", "the group still consumed index 1");
+    }
+
+    #[test]
+    fn frames_outside_the_capture_produce_no_box() {
+        let map = retina_window_map();
+        let root = framed("AXWindow", rect(4_000.0, 4_000.0, 300.0, 200.0));
+        assert!(marks_for_nodes(&root, &map).is_empty());
+    }
+
+    #[test]
+    fn a_large_box_does_not_paint_a_giant_label() {
+        // A live Finder window reported 73% of its pixels rewritten: the
+        // window's own mark scaled its digit to the whole capture and buried
+        // the screenshot under white. A label stays a corner badge.
+        let image = RgbaImage::from_pixel(1440, 682, Rgba([20, 20, 20, 255]));
+        let marks = vec![MarkBox {
+            rect: ImageRect {
+                x: 0,
+                y: 0,
+                width: 1440,
+                height: 682,
+            },
+            label: tree_label(0),
+        }];
+        let marked = draw_marks(&image, &marks);
+
+        let badge_w = (FONT_WIDTH * MAX_LABEL_CELL as usize) as i32;
+        let badge_h = (FONT_HEIGHT * MAX_LABEL_CELL as usize) as i32;
+        let dark = Rgba([20, 20, 20, 255]);
+        let mut text_outside_badge = 0_u32;
+        for y in 0..marked.height() as i32 {
+            for x in 0..marked.width() as i32 {
+                // The border and its halo legitimately span the whole box;
+                // only the white glyph has to stay inside the badge.
+                if marked.get_pixel(x as u32, y as u32).to_rgba() == MARK_TEXT
+                    && (x >= badge_w || y >= badge_h)
+                {
+                    text_outside_badge += 1;
+                }
+            }
+        }
+
+        let total_changed = marked
+            .pixels()
+            .zip(image.pixels())
+            .filter(|(after, before)| **after != dark && **after != **before)
+            .count() as u32;
+
+        assert_eq!(
+            text_outside_badge, 0,
+            "the digit must stay inside its {badge_w}x{badge_h} badge"
+        );
+        assert!(
+            total_changed < 1440 * 682 / 4,
+            "the overlay rewrote {total_changed} of {} pixels",
+            1440 * 682
+        );
     }
 
     #[test]

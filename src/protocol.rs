@@ -2681,8 +2681,14 @@ fn screenshot(
         },
     )?;
     let mut image = prepared.image;
+    let mut warnings = raw.warnings;
     if marks {
-        apply_marks(&mut image, &prepared.map, context, backend)?;
+        let applied = apply_marks(&mut image, &prepared.map, context, backend)?;
+        if applied == 0 {
+            // A silent zero is indistinguishable from "the marks were drawn".
+            // Say so instead of writing a clean capture that answers `ok`.
+            warnings.push("marks: no accessibility element frame fell inside this capture".into());
+        }
     }
     let encoded = image_util::encode_rgba(&image, format)?;
     let path = match output {
@@ -2695,7 +2701,6 @@ fn screenshot(
         }
     }
     fs::write(&path, &encoded.bytes)?;
-    let mut warnings = raw.warnings;
     if let Err(error) = cache::store_screenshot_map(context.session.as_deref(), &prepared.map) {
         warnings.push(format!("screenshot map was not cached: {error}"));
     }
@@ -3702,7 +3707,10 @@ fn latest_prepared_ocr_capture(
 }
 
 /// Draw tree index marks on `image`. Returns the count of marks applied.
-/// When the tree is empty, returns 0 and adds a note rather than failing.
+///
+/// The overlay is painted onto a copy, so the returned image has to be written
+/// back into `*image`. Dropping it leaves the caller's pixels untouched and
+/// `screenshot --marks` writes a clean capture while still answering `ok`.
 fn apply_marks(
     image: &mut image::RgbaImage,
     map: &crate::image_util::ScreenshotMap,
@@ -3713,7 +3721,8 @@ fn apply_marks(
     if boxes.is_empty() {
         return Ok(0);
     }
-    crate::vision::draw_marks(image, &boxes);
+    let marked = crate::vision::draw_marks(image, &boxes);
+    *image = marked;
     Ok(boxes.len())
 }
 
@@ -4959,6 +4968,136 @@ mod tests {
         }];
         let kept = redact_secure_ocr_blocks(outside, &backend, &context, &map).unwrap();
         assert_eq!(kept.len(), 1);
+    }
+
+    /// Screenshot with `--marks` on a real window answered `ok` and wrote an
+    /// unmarked PNG. `apply_marks` painted the overlay onto a copy of the image
+    /// and threw the copy away, so the encoded bytes never changed.
+    #[test]
+    fn marks_change_the_pixels_the_screenshot_writes() {
+        let cache = crate::cache::CacheEnv::acquire();
+        let backend = StubBackend::default();
+        let context = CallContext {
+            app: Some("Notes".into()),
+            session: Some("marks".into()),
+            ..CallContext::default()
+        };
+        let plain = cache.dir().join("plain.png");
+        let marked = cache.dir().join("marked.png");
+
+        let shot = |path: std::path::PathBuf, marks: bool| {
+            screenshot(
+                &backend,
+                &context,
+                ScreenshotArgs {
+                    output: Some(path.to_string_lossy().into_owned()),
+                    region: None,
+                    format: Some(ImageFormat::Png),
+                    max_width: None,
+                    canvas: None,
+                    include_base64: false,
+                    window_crop: false,
+                    marks,
+                },
+            )
+        };
+
+        let clean = shot(plain.clone(), false).expect("plain screenshot");
+        let marked_body = shot(marked.clone(), true).expect("marked screenshot");
+
+        let clean_bytes = std::fs::read(&plain).expect("plain png");
+        let marked_bytes = std::fs::read(&marked).expect("marked png");
+        assert_ne!(
+            clean_bytes, marked_bytes,
+            "--marks wrote the same image as a plain screenshot"
+        );
+
+        // The map the backend converted frames with must be the map of this
+        // capture, otherwise screen points are read as image pixels.
+        let seen = backend
+            .marks_map
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("marks_for_tree was called");
+        assert_eq!(
+            i64::from(seen.origin.x),
+            clean["origin"]["x"].as_i64().unwrap()
+        );
+        assert_eq!(
+            i64::from(seen.origin.y),
+            clean["origin"]["y"].as_i64().unwrap()
+        );
+        assert_eq!(
+            seen.content_width,
+            clean["content_width"].as_u64().unwrap() as u32
+        );
+        assert_eq!(
+            seen.logical_width,
+            clean["logical_width"].as_u64().unwrap() as u32
+        );
+
+        // Marks were applied, so this is not the "nothing to draw" warning.
+        let warnings = marked_body["warnings"].as_array();
+        assert!(
+            !warnings
+                .map(|items| items
+                    .iter()
+                    .any(|item| item.as_str().is_some_and(|text| text.starts_with("marks:"))))
+                .unwrap_or(false),
+            "unexpected marks warning: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn marks_warn_when_no_frame_is_inside_the_capture() {
+        // A silent zero is indistinguishable from "the marks were drawn".
+        let cache = crate::cache::CacheEnv::acquire();
+        let backend = StubBackend::default();
+        // A tree whose window sits far away from the captured screen: every
+        // frame is off-canvas, so nothing can be drawn.
+        backend.set_live({
+            let mut window = crate::tree::UiNode::bare("AXWindow");
+            window.frame = Some(crate::tree::NodeFrame {
+                x: 9_000.0,
+                y: 9_000.0,
+                width: 100.0,
+                height: 100.0,
+            });
+            window
+        });
+        let context = CallContext {
+            session: Some("marks-empty".into()),
+            ..CallContext::default()
+        };
+        let body = screenshot(
+            &backend,
+            &context,
+            ScreenshotArgs {
+                output: Some(
+                    cache
+                        .dir()
+                        .join("marks-empty.png")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                region: None,
+                format: Some(ImageFormat::Png),
+                max_width: None,
+                canvas: None,
+                include_base64: false,
+                window_crop: false,
+                marks: true,
+            },
+        )
+        .expect("screenshot");
+        let warnings = body["warnings"].as_array().expect("warnings");
+        assert!(
+            warnings
+                .iter()
+                .any(|item| item.as_str().is_some_and(|text| text.starts_with("marks:"))),
+            "expected a marks warning, got {warnings:?}"
+        );
     }
 
     #[test]

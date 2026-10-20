@@ -150,16 +150,16 @@ pub(crate) fn recognize_text(
 }
 
 /// Numbered boxes for `--marks`, taken from the live UIA tree.
+///
+/// The walk itself is shared with macOS in [`crate::vision::marks_for_nodes`],
+/// so the numbers drawn on the image are the numbers `tree` prints.
 #[allow(dead_code)]
 pub(crate) fn marks_for_tree(
     query: &TreeQuery,
     map: &crate::image_util::ScreenshotMap,
 ) -> Result<Vec<crate::vision::MarkBox>, ComputerError> {
     let root = uia::build_tree(query)?;
-    let mut out: Vec<crate::vision::MarkBox> = Vec::new();
-    let mut index = 0_u32;
-    walk_marks(&root.root, map, &mut index, &mut out);
-    Ok(out)
+    Ok(crate::vision::marks_for_nodes(&root.root, map))
 }
 
 /// Image-pixel rectangles of every `IsPassword` element, converted through the
@@ -173,32 +173,6 @@ pub(crate) fn secure_ocr_frames(
     let mut out = Vec::new();
     walk_secure(&tree.root, map, &mut out);
     Ok(out)
-}
-
-fn walk_marks(
-    node: &crate::tree::UiNode,
-    map: &crate::image_util::ScreenshotMap,
-    index: &mut u32,
-    out: &mut Vec<crate::vision::MarkBox>,
-) {
-    let label = index.to_string();
-    *index = index.saturating_add(1);
-    if let Some(frame) = node.frame {
-        if let Some((x, y, width, height)) = screen_rect(frame, map) {
-            out.push(crate::vision::MarkBox {
-                rect: crate::vision::marks::ImageRect {
-                    x,
-                    y,
-                    width,
-                    height,
-                },
-                label,
-            });
-        }
-    }
-    for child in &node.children {
-        walk_marks(child, map, index, out);
-    }
 }
 
 fn walk_secure(
