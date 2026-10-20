@@ -91,16 +91,16 @@ pub(crate) fn ping() -> bool {
 
 /// Public entry point for the dispatcher.
 pub(crate) fn build_tree(query: &TreeQuery) -> Result<TreeReport, ComputerError> {
-    let outcome: Result<Result<LiveWalk, tokio::time::error::Elapsed>, ComputerError> =
-        runtime::block_on(async {
-            tokio::time::timeout(ATSPI_CALL_BUDGET, walk_live(query, false, false)).await
-        });
+    let outcome = runtime::block_on(async {
+        tokio::time::timeout(ATSPI_CALL_BUDGET, walk_live(query, false, false)).await
+    });
     match outcome {
-        Ok(Ok(live)) => Ok(tree_report_from(&live)),
-        Ok(Err(_elapsed)) => Err(ComputerError::ExecutionFailed(format!(
+        Ok(Ok(Ok(live))) => Ok(tree_report_from(&live)),
+        Ok(Ok(Err(_elapsed))) => Err(ComputerError::ExecutionFailed(format!(
             "AT-SPI walk exceeded {}s budget",
             ATSPI_CALL_BUDGET.as_secs()
         ))),
+        Ok(Err(error)) => Err(error),
         Err(error) => Err(error),
     }
 }
@@ -187,13 +187,14 @@ pub(crate) fn element_action(request: &ElementRequest) -> Result<ElementOutcome,
     })?;
 
     let result = match joined {
-        Ok(Ok(value)) => value,
-        Ok(Err(_elapsed)) => {
+        Ok(Ok(Ok(value))) => value,
+        Ok(Ok(Err(_elapsed))) => {
             return Err(ElementError::new(ComputerError::ExecutionFailed(format!(
                 "AT-SPI element action exceeded {}s budget",
                 ATSPI_CALL_BUDGET.as_secs()
             ))));
         }
+        Ok(Err(error)) => return Err(error),
         Err(error) => return Err(error),
     };
     let (via, refreshed, cached, revalidation_warning) = result;
@@ -208,7 +209,6 @@ pub(crate) fn element_action(request: &ElementRequest) -> Result<ElementOutcome,
         .unwrap_or(snapshot.revision);
     if let Some(live) = refreshed {
         snapshot.tree = live.tree_text.clone();
-        snapshot.full_text = live.full_text.clone();
         snapshot.truncated = live.truncated;
         snapshot.revision = live.ui_revision;
         snapshot.observed = Some(live.observed_root);
@@ -388,13 +388,16 @@ async fn proxy_at<'a>(
     path: &[usize],
 ) -> Result<AccessibleProxy<'a>, ComputerError> {
     let mut visited: Vec<ObjectRefOwned> = vec![root];
-    let mut current: Option<AccessibleProxy<'a>> = None;
+    // Build the root proxy up front; the loop then descends `path` from
+    // it. The first iteration handles the empty path case too: `current`
+    // is set after the loop body runs even when `path` is empty, then
+    // we re-handle the root proxy below.
+    let mut current = visited[0]
+        .as_accessible_proxy(connection.connection())
+        .await
+        .map_err(atspi_error)?;
     for &child_index in path {
-        let child_refs = if let Some(proxy) = current.as_ref() {
-            proxy.get_children().await.map_err(atspi_error)?
-        } else {
-            visited[0].get_children().await.map_err(atspi_error)?
-        };
+        let child_refs = current.get_children().await.map_err(atspi_error)?;
         let Some(child_ref) = child_refs.into_iter().nth(child_index) else {
             return Err(ComputerError::ElementNotFound(format!(
                 "path index {child_index} did not resolve to an AT-SPI child"
@@ -407,17 +410,9 @@ async fn proxy_at<'a>(
             .as_accessible_proxy(connection.connection())
             .await
             .map_err(atspi_error)?;
-        current = Some(proxy);
+        current = proxy;
     }
-    // Final proxy: either built by the loop, or the application root
-    // when the path was empty.
-    match current {
-        Some(proxy) => Ok(proxy),
-        None => visited[0]
-            .as_accessible_proxy(connection.connection())
-            .await
-            .map_err(atspi_error),
-    }
+    Ok(current)
 }
 
 /// Drive one element op through the matching AT-SPI interface. Returns
@@ -683,7 +678,7 @@ fn render_node<'a>(
     want_full: bool,
     depth: usize,
 ) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<RenderedNode<'a>, ComputerError>> + Send + 'a>,
+    Box<dyn std::future::Future<Output = Result<RenderedNode, ComputerError>> + Send + 'a>,
 > {
     Box::pin(async move {
         let role = proxy.get_role().await.map_err(atspi_error)?;
@@ -749,20 +744,20 @@ fn render_node<'a>(
 /// One `UiNode` paired with the AT-SPI data element actions consume:
 /// the `InterfaceSet` of the node (drives interface presence checks) and
 /// the rendered children (so callers can keep going down the tree).
-struct RenderedNode<'a> {
+struct RenderedNode {
     /// Public, redacted shape the project renders and diffs.
     node: UiNode,
     /// AT-SPI interfaces exposed by the node.
     interfaces: atspi::InterfaceSet,
     /// Children with their own [`RenderedNode`] payload.
-    rendered_children: Vec<RenderedNode<'a>>,
+    rendered_children: Vec<RenderedNode>,
 }
 
 /// Reduce a `RenderedNode` tree into the public `UiNode` and a per-path
 /// interface map keyed by child-index path. Empty path is the root, same
 /// as `element::find_path`.
 fn reduce_tree(
-    rendered: &RenderedNode<'_>,
+    rendered: &RenderedNode,
     path: &mut Vec<usize>,
     out_interfaces: &mut HashMap<Vec<usize>, atspi::InterfaceSet>,
 ) -> UiNode {
@@ -927,13 +922,15 @@ mod tests {
         // path slice, and returns an AccessibleProxy. The `ObjectRefOwned`
         // is owned so the resolved proxy can borrow from the visited
         // stack; see `proxy_at` for the lifetime story.
-        let _: fn(
-            &AccessibilityConnection,
+        let _: for<'a> fn(
+            &'a AccessibilityConnection,
             ObjectRefOwned,
-            &[usize],
+            &'a [usize],
         ) -> std::pin::Pin<
             Box<
-                dyn std::future::Future<Output = Result<AccessibleProxy<'_>, ComputerError>> + Send,
+                dyn std::future::Future<Output = Result<AccessibleProxy<'a>, ComputerError>>
+                    + Send
+                    + 'a,
             >,
         > = proxy_at;
     }
