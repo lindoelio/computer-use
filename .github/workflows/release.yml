@@ -192,10 +192,10 @@ jobs:
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
-          existing=$(gh release view "${tag}" --json body --jq .body)
+          existing=$(gh release view "${tag}" --repo "$GITHUB_REPOSITORY" --json body --jq .body)
           note='`computer-use-macos-arm64-app-unsigned.zip` is ad-hoc signed and not notarized. Developer ID signing secrets were not configured. See docs/PACKAGING.md.'
           {
             printf '%s\n\n' "${note}"
             printf '%s\n' "${existing}"
           } > "${RUNNER_TEMP}/release-notes.md"
-          gh release edit "${tag}" --notes-file "${RUNNER_TEMP}/release-notes.md"
+          gh release edit "${tag}" --repo "$GITHUB_REPOSITORY" --notes-file "${RUNNER_TEMP}/release-notes.md"
