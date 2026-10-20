@@ -134,11 +134,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - README rewritten from the current CLI surface: all commands, default max-width, policy path, feature flags, permissions per OS, tiers, JSON actions, error codes, library surface.
 - New `docs/CLI.md` (cli reference): every command, flag, JSON action name, and error code, with a `tests/cli_doc_matches_help.rs` snapshot that parses the doc and asserts each entry is reachable on a fresh build. The doc notes that `smart-computer-use/references/cli-reference.md` is regenerated in a separate repo.
 - A `vs Codex` summary under the parity table listing where we exceed, match, and fall short, with no marketing claims.
+- `docs(P15): honest parity audit` — added a `Verification` column to the parity table (`live` / `CI` / `compile-only`), downgraded `Synthetic focus enforcer` and `Virtual display / isolation` from `DONE` to `PARTIAL` to match the code, corrected the `vs Codex` summary (Codex does ship a foreground-only Windows backend with an app allowlist per OpenAI's docs, Codex captures per target window, Codex ships with a model trained for computer use — OpenAI reports GPT-5.5 at 78.7% OSWorld-Verified), and added a one-line tally under the table.
 
 ### Known limitations
 
 Items tested by code and CI but not exercised live for this release.
 
+- **Per-row verification levels in the parity table.** The 0.2.0 parity table now states, for every row, whether it was exercised on a real window on the development Mac (`live`), wired and unit/integration-tested in CI on Ubuntu/macOS/Windows (`CI`), or compiled but never invoked (`compile-only`). Accessibility was off for this process on the development Mac, so almost nothing on macOS AX / event / activate / SkyLight / synthetic was exercised live. The live paths on this Mac were `doctor`, `list-apps`, `list-windows`, `policy check`, `displays`, full-desktop `screenshot`, the macOS Vision unit test (`cargo test --release vision_recognizes_drawn_text -- --ignored --nocapture`), and `scripts/package-macos-app.sh` ad-hoc packaging. Everything else on macOS is `CI`. Windows and Linux are `CI` for the whole 0.2.0 surface.
 - **Accessibility was off for this process on the development Mac.** The full live path (press, value, set-value, perform-action, scroll-into-view, hit-test, event posting, AX press via SkyLight) was not exercised against a real window because the TCC grant is missing in this profile. `doctor` reports it. The code paths and unit tests pass.
 - **Windows is CI-only, not live.** UIA patterns, tier `activate`, and the per-window `windows-capture` path are wired and tested on the macOS harness with the mock backend, and CI compiles and unit-tests on `windows-latest`. No live Windows host ran in P15.
 - **Linux is CI-only, not live.** No Wayland compositor was available on the development machine. AT-SPI works on X11 with `DISPLAY`; RemoteDesktop portal works when `portal` is compiled in. `list_windows` / `list_apps` / `launch` / `activate` / `quit` are still `unsupported`, so `screenshot --app` cannot reach `capture_window` yet.
@@ -150,7 +152,14 @@ Items tested by code and CI but not exercised live for this release.
 
 ### Cut from 0.2.0
 
-Nothing was cut. Every parity row landed; two remain `PARTIAL` because each platform implementation can fail (`scroll_to` returns `execution_failed` on Linux when `Component` is missing; `select_text` returns `execution_failed` when `Text` is missing), not because the parity contract is unmet. The honest tally is in the parity table.
+Nothing was cut from the parity contract. The 0.2.0 surface still covers every row in the table. Five rows are `PARTIAL` rather than `DONE`, because each implementation can fail closed on a window that does not advertise the platform interface, not because the parity contract is unmet:
+
+- `Scroll into view before the action` and `select_text` via selected range — `execution_failed` on a window that does not expose `ScrollItemPattern` (Windows) or `Component` (Linux), and `TextPattern` / `Text` respectively.
+- `Synthetic focus enforcer (SkyLight / CPS)` — wired behind `--features skylight`, but the default release binary is built **without** `--features skylight`, so the symbol call path is never invoked on this Mac or in CI.
+- `Linux` — `list_windows` / `list_apps` / `launch` / `activate` / `quit` are still `unsupported`, so `screenshot --app` cannot reach `capture_window` yet.
+- `Virtual display / isolation` — the macOS `CGVirtualDisplay*` path is probe-only (no display is ever created); the Linux path is a recipe (no Xvfb is started); there is no live sandbox on this Mac.
+
+The honest tally is in the parity table.
 
 ### Removed
 
