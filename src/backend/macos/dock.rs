@@ -9,6 +9,10 @@ use objc2_application_services::AXUIElement;
 use objc2_core_foundation::{CFArray, CFBoolean, CFRetained, CFString};
 
 use super::ax::{self, application, array_elements, classify, copy_cf, copy_string, CopyClass};
+
+/// AXRole string for the Dock's items container. Constant so the matcher
+/// and the test both reference the same value.
+const AX_ROLE_LIST: &str = "AXList";
 use crate::backend::{DockClickReport, DockItem, DockListReport};
 use crate::error::ComputerError;
 
@@ -19,7 +23,7 @@ const DOCK_BUNDLE_ID: &str = "com.apple.dock";
 pub(crate) fn list() -> Result<DockListReport, ComputerError> {
     ensure_trusted()?;
     let dock = dock_application_element()?;
-    let children = copy_children(&dock)?;
+    let children = copy_dock_items(&dock)?;
     let mut items = Vec::with_capacity(children.len());
     for child in children {
         let title = copy_string(&child, "AXTitle")
@@ -34,6 +38,46 @@ pub(crate) fn list() -> Result<DockListReport, ComputerError> {
     Ok(DockListReport { items })
 }
 
+/// Walk the Dock's AX tree to its `AXList` of `AXDockItem` children.
+///
+/// The Dock's `com.apple.dock` process exposes a single AXList whose
+/// children are the visible Dock items. The previous implementation read
+/// the AX application element's direct AXChildren and skipped everything
+/// that did not look like an app — that returned zero items even when the
+/// Dock had apps, because the app element's children are unrelated system
+/// nodes, not the Dock items. Walk the first AXList we hit and read its
+/// AXChildren as the items.
+fn copy_dock_items(dock: &AXUIElement) -> Result<Vec<CFRetained<AXUIElement>>, ComputerError> {
+    let list = first_list_child(dock)?;
+    copy_children(&list)
+}
+
+/// Find the Dock's `AXList` child. The Dock exposes one list per screen;
+/// picking the first one matches what the user sees on the primary display.
+fn first_list_child(dock: &AXUIElement) -> Result<CFRetained<AXUIElement>, ComputerError> {
+    let children = copy_children(dock)?;
+    let roles: Vec<String> = children
+        .iter()
+        .map(|child| {
+            copy_string(child, "AXRole")
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+        })
+        .collect();
+    let index = first_list_index(&roles)
+        .ok_or_else(|| ComputerError::ExecutionFailed("Dock has no AXList child".into()))?;
+    Ok(children.into_iter().nth(index).expect("index present"))
+}
+
+/// Pure helper: return the index of the first AXList role in `roles`.
+/// Returns `None` when no element has that role. The Dock exposes one
+/// list per screen; picking the first matches the primary display and
+/// keeps the logic unit-testable without a live AXUIElement.
+fn first_list_index<T: AsRef<str>>(roles: &[T]) -> Option<usize> {
+    roles.iter().position(|role| role.as_ref() == AX_ROLE_LIST)
+}
+
 /// Press the first Dock item whose title matches `title` case-insensitively.
 pub(crate) fn click(title: &str) -> Result<DockClickReport, ComputerError> {
     if title.trim().is_empty() {
@@ -43,7 +87,7 @@ pub(crate) fn click(title: &str) -> Result<DockClickReport, ComputerError> {
     }
     ensure_trusted()?;
     let dock = dock_application_element()?;
-    let children = copy_children(&dock)?;
+    let children = copy_dock_items(&dock)?;
     let needle = title.to_lowercase();
     for child in children {
         let candidate = copy_string(&child, "AXTitle")
@@ -141,5 +185,43 @@ fn press(element: &CFRetained<AXUIElement>) -> Result<(), ComputerError> {
         CopyClass::Missing | CopyClass::Failed => Err(ComputerError::ExecutionFailed(
             "AXPress on dock item failed".into(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{first_list_index, AX_ROLE_LIST};
+
+    #[test]
+    fn first_list_index_finds_the_ax_list_child() {
+        // Real macOS Dock exposes a single AXList inside its app element;
+        // the previous code returned ok with zero items because it read
+        // AXChildren directly off the application element. This is the
+        // shape that walk has to accept.
+        let roles = ["AXWindow", "AXGroup", "AXList", "AXDockItem"];
+        assert_eq!(first_list_index(&roles), Some(2));
+    }
+
+    #[test]
+    fn first_list_index_takes_the_first_list_when_more_than_one() {
+        // The Dock exposes one list per screen. Picking the first matches
+        // the primary display; if a later phase wants the per-screen list,
+        // that's a separate helper.
+        let roles = ["AXList", "AXList", "AXDockItem"];
+        assert_eq!(first_list_index(&roles), Some(0));
+    }
+
+    #[test]
+    fn first_list_index_returns_none_when_no_list() {
+        let roles = ["AXWindow", "AXGroup", "AXDockItem"];
+        assert_eq!(first_list_index(&roles), None);
+    }
+
+    #[test]
+    fn first_list_index_handles_empty_children() {
+        let empty: [&str; 0] = [];
+        assert_eq!(first_list_index(&empty), None);
+        // The constant is what the live helper passes into first_list_index.
+        assert_eq!(AX_ROLE_LIST, "AXList");
     }
 }
