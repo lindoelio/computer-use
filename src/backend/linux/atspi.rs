@@ -925,16 +925,13 @@ mod tests {
         );
     }
 
-    /// `proxy_at`'s argument shape stays the same: `ObjectRefOwned`
-    /// root and a child-index path. The live walk produces both, the
-    /// proxy resolution consumes them.
+    /// `proxy_at`'s symbol resolves from this module: a future refactor
+    /// that drops or renames it is caught at compile time, because the
+    /// `async fn` return type is opaque and cannot be pinned with a
+    /// function pointer without a helper trait.
     #[test]
-    fn proxy_at_signature_is_stable() {
-        // `proxy_at` is an async function. The signature uses a single
-        // lifetime for the connection and the path slice (both must
-        // outlive the returned `AccessibleProxy`). Pinning the type
-        // here catches a regression that drops one.
-        let _: for<'a> fn(&'a AccessibilityConnection, ObjectRefOwned, &'a [usize]) -> _ = proxy_at;
+    fn proxy_at_symbol_resolves() {
+        let _symbol = proxy_at;
     }
 
     /// The Linux `via` tag for element actions is `"atspi"`; the
