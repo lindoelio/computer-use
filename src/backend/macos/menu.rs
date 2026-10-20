@@ -213,20 +213,47 @@ fn find_menu_item(menu: &AXUIElement, title: &str) -> Option<CFRetained<AXUIElem
     None
 }
 
+/// Find the menu of a menu-bar item by walking its `AXChildren` for a node
+/// whose role is `AXMenu`. Apple's accessibility model does not publish an
+/// `AXMenu` attribute on `AXMenuBarItem` (or on a submenu `AXMenuItem`); the
+/// menu is the first child whose role is `AXMenu`.
 fn menu_for_menu_bar_item(item: &AXUIElement) -> Option<CFRetained<AXUIElement>> {
-    copy_optional_element(item, "AXMenu")
+    first_child_with_role(item, "AXMenu")
 }
 
+/// Find the submenu of a menu item the same way: walk `AXChildren` and pick the
+/// first node whose role is `AXMenu`.
 fn menu_for_menu_item(item: &AXUIElement) -> Option<CFRetained<AXUIElement>> {
-    copy_optional_element(item, "AXMenu").or_else(|| copy_optional_element(item, "AXMenuItem"))
+    first_child_with_role(item, "AXMenu")
 }
 
-fn copy_optional_element(
-    element: &AXUIElement,
-    attribute: &str,
-) -> Option<CFRetained<AXUIElement>> {
-    let cf = copy_cf(element, attribute).ok().flatten()?;
-    cf.downcast::<AXUIElement>().ok()
+/// Walk `AXChildren` and return the first node whose `AXRole` matches `role`.
+///
+/// Returns `None` when the children cannot be read or no child has that role.
+/// This is the macOS accessibility reality for menus: a menu-bar item's menu is
+/// reachable through children, not through an `AXMenu` attribute.
+fn first_child_with_role(item: &AXUIElement, role: &str) -> Option<CFRetained<AXUIElement>> {
+    let children = copy_children(item).ok()?;
+    let roles: Vec<String> = children
+        .iter()
+        .map(|child| {
+            copy_string(child, "AXRole")
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+        })
+        .collect();
+    let index = first_index_with_role(&roles, role)?;
+    children.into_iter().nth(index)
+}
+
+/// Pure helper: return the index of the first element whose `AXRole` matches
+/// `needle`. Returns `None` when no element matches. Used by the menu walker
+/// to pick the `AXMenu` child of a `AXMenuBarItem` or a submenu `AXMenuItem`.
+/// Kept as a separate function so the matching logic has a unit test that
+/// does not need a live AXUIElement.
+fn first_index_with_role<T: AsRef<str>>(roles: &[T], needle: &str) -> Option<usize> {
+    roles.iter().position(|role| role.as_ref() == needle)
 }
 
 fn press(element: &CFRetained<AXUIElement>) -> Result<(), ComputerError> {
@@ -262,5 +289,40 @@ fn map_attr_error(error: ax::AttrError) -> ComputerError {
         ax::AttrError::Missing | ax::AttrError::Failed => {
             ComputerError::ExecutionFailed("Accessibility call failed".into())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::first_index_with_role;
+
+    #[test]
+    fn first_index_with_role_picks_the_ax_menu_child() {
+        // Real macOS Finder menu-bar items have an AXMenuBarItem whose
+        // AXChildren list a single AXMenu node before any AXMenuItem.
+        let roles = ["AXMenuBarItem", "AXMenu", "AXMenuItem"];
+        assert_eq!(first_index_with_role(&roles, "AXMenu"), Some(1));
+    }
+
+    #[test]
+    fn first_index_with_role_returns_none_when_no_menu_child() {
+        // A submenu item without children returns None so the caller can
+        // surface "menu segment X has no submenu".
+        let roles = ["AXMenuItem", "AXMenuItem"];
+        assert_eq!(first_index_with_role(&roles, "AXMenu"), None);
+    }
+
+    #[test]
+    fn first_index_with_role_takes_the_first_match() {
+        // The spec says the menu is the FIRST child whose role is AXMenu.
+        // Anything later is a leaf the walker should ignore.
+        let roles = ["AXMenuBarItem", "AXMenu", "AXMenu", "AXMenuItem"];
+        assert_eq!(first_index_with_role(&roles, "AXMenu"), Some(1));
+    }
+
+    #[test]
+    fn first_index_with_role_handles_empty_input() {
+        let empty: [&str; 0] = [];
+        assert_eq!(first_index_with_role(&empty, "AXMenu"), None);
     }
 }
