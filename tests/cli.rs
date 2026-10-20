@@ -921,3 +921,65 @@ fn display_virtual_exec_without_a_command_is_an_argument_error() {
         "stdout: {stdout}"
     );
 }
+
+/// Regression: `scroll --dy -3` used to be rejected because clap treated
+/// the bare `-3` as a flag. Both the `--dy=-3` form and the separate
+/// `--dy -3` form must parse and dispatch the same JSON response.
+#[test]
+fn scroll_accepts_negative_deltas_without_equal_sign() {
+    let eq_output = run(&["scroll", "--dy=-3"]);
+    let eq_value: Value = serde_json::from_slice(&eq_output.stdout).unwrap();
+    assert_eq!(eq_value["ok"], true, "{eq_value}");
+    assert_eq!(eq_value["dy"], -3);
+    assert_eq!(eq_value["tier"], "event");
+
+    let space_output = run(&["scroll", "--dy", "-3"]);
+    let space_value: Value = serde_json::from_slice(&space_output.stdout).unwrap();
+    assert_eq!(
+        space_value["ok"], true,
+        "scroll --dy -3 must parse without flag clash: {space_value}"
+    );
+    assert_eq!(space_value["dy"], -3);
+    assert_eq!(space_value["tier"], "event");
+    // The two invocations should produce structurally identical scroll params.
+    assert_eq!(space_value["dy"], eq_value["dy"]);
+}
+
+/// Regression: both `--dx` and `--dy` accept the bare negative literal.
+/// Covers the case most callers hit when scripting positive/negative deltas.
+#[test]
+fn scroll_accepts_negative_dx_and_dy_in_one_invocation() {
+    let output = run(&["scroll", "--dx", "-1", "--dy", "-3"]);
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["ok"], true, "{value}");
+    assert_eq!(value["dx"], -1);
+    assert_eq!(value["dy"], -3);
+
+    let output = run(&["scroll", "--dx=-1", "--dy=-3"]);
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["ok"], true, "{value}");
+    assert_eq!(value["dx"], -1);
+    assert_eq!(value["dy"], -3);
+}
+
+/// Regression: `--amount` accepts both forms for negative wheel steps,
+/// and `--tier event --require-background` keeps the response structured.
+#[test]
+fn scroll_negative_amount_with_background_tier_returns_event_tier() {
+    let output = run(&[
+        "scroll",
+        "--direction",
+        "up",
+        "--amount",
+        "-3",
+        "--tier",
+        "event",
+        "--require-background",
+    ]);
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["ok"], true, "{value}");
+    // `up` keeps the dy positive by `amount` steps — the seat belt is the
+    // structured response, not the dy sign.
+    assert_eq!(value["tier"], "event");
+    assert_eq!(value["cursor_moved"], false);
+}

@@ -471,26 +471,28 @@ enum CliCommand {
     /// Use `--dx` and `--dy`, or `--direction` with optional `--amount`.
     /// Positive dy scrolls down. Positive dx scrolls right.
     /// Optional `--x` and `--y` move the pointer first and must be passed together.
+    /// Negative numbers are accepted both as `--dy=-3` and as the separate
+    /// argument `--dy -3`.
     ///
     /// Example: computer-use scroll --direction down --amount 3
     Scroll {
         /// Move the pointer to this logical x before scrolling.
-        #[arg(long)]
+        #[arg(long, allow_negative_numbers = true)]
         x: Option<i32>,
         /// Move the pointer to this logical y before scrolling.
-        #[arg(long)]
+        #[arg(long, allow_negative_numbers = true)]
         y: Option<i32>,
         /// Horizontal wheel steps. Positive is right.
-        #[arg(long)]
+        #[arg(long, allow_negative_numbers = true)]
         dx: Option<i32>,
         /// Vertical wheel steps. Positive is down.
-        #[arg(long)]
+        #[arg(long, allow_negative_numbers = true)]
         dy: Option<i32>,
         /// Scroll direction used with `--amount`.
         #[arg(long, value_enum)]
         direction: Option<CliDirection>,
         /// Wheel steps used with `--direction`. Default: 1.
-        #[arg(long)]
+        #[arg(long, allow_negative_numbers = true)]
         amount: Option<i32>,
     },
 
