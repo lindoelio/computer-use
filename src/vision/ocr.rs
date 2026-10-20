@@ -791,19 +791,36 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "windows")]
-    fn windows_ocr_returns_unsupported() {
+    fn windows_media_ocr_runs_and_never_returns_unsupported() {
+        // P12b replaced the P11 `unsupported` stub with a real
+        // `Windows.Media.Ocr.OcrEngine` call, so `Unsupported` is now a
+        // contract violation, not an accepted outcome.
+        //
+        // A blank image legitimately recognizes to zero blocks. A runner with
+        // no OCR recognizer language pack installed fails with
+        // `execution_failed` naming the pack — also acceptable. Anything else,
+        // including a panic from the WinRT apartment, is a bug.
         use image::RgbaImage;
-        let image = RgbaImage::from_pixel(8, 8, image::Rgba([255, 255, 255, 255]));
+        let image = RgbaImage::from_pixel(64, 32, image::Rgba([255, 255, 255, 255]));
         let map = make_stub_map();
-        let err = recognize(&image, &map).unwrap_err();
-        match err {
-            ComputerError::Unsupported(reason) => {
+        match recognize(&image, &map) {
+            Ok(result) => {
                 assert!(
-                    reason.contains("P12") || reason.to_lowercase().contains("windows"),
-                    "Windows unsupported message must mention P12/Windows: {reason}"
+                    result.blocks.iter().all(|block| {
+                        block.width >= 1 && block.height >= 1 && block.x >= 0 && block.y >= 0
+                    }),
+                    "blocks must be non-empty image rects: {:?}",
+                    result.blocks
                 );
             }
-            other => panic!("expected Unsupported, got {other:?}"),
+            Err(ComputerError::Unsupported(_)) => {
+                panic!("Windows OCR must not be unsupported after P12b")
+            }
+            Err(ComputerError::ExecutionFailed(reason)) => assert!(
+                reason.contains("Windows.Media.Ocr"),
+                "a Windows OCR failure must name the engine: {reason}"
+            ),
+            Err(other) => panic!("unexpected error from Windows OCR: {other:?}"),
         }
     }
 
