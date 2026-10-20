@@ -248,9 +248,10 @@ fn element_commands_are_unsupported_off_macos_and_windows() {
 
 #[test]
 fn tree_command_is_unsupported_off_macos_and_windows() {
-    // `tree` is real on macOS (P12a) and on Windows (UIA). Linux is the
-    // only platform that still returns `unsupported` for it.
-    if cfg!(target_os = "macos") || cfg!(target_os = "windows") {
+    // `tree` is real on macOS (P12a), Windows (UIA), and Linux (AT-SPI,
+    // P13a). Other platforms — none today — would still expect the
+    // `unsupported` envelope. The skip list reflects exactly that.
+    if cfg!(target_os = "macos") || cfg!(target_os = "windows") || cfg!(target_os = "linux") {
         return;
     }
     let output = run(&["tree"]);
