@@ -152,7 +152,11 @@ pub(crate) fn element_action(request: &ElementRequest) -> Result<ElementOutcome,
 
     // Run the whole async walk + action + re-fetch through the runtime;
     // runtime / connection failures are surfaced as `ComputerError`
-    // before any element work runs.
+    // before any element work runs. The `query` value is moved into
+    // the async block; the outer code reads `query.session.as_deref()`
+    // only after the block returns, so we keep an owned copy of the
+    // session string for the post-action `cache::store` call.
+    let session_for_store = query.session.clone();
     let joined = runtime::block_on(async move {
         tokio::time::timeout(ATSPI_CALL_BUDGET, async {
             let cached = load_cached_snapshot(&query).await?;
@@ -228,7 +232,7 @@ pub(crate) fn element_action(request: &ElementRequest) -> Result<ElementOutcome,
         snapshot.revision = live.ui_revision;
         snapshot.observed = Some(live.observed_root);
         snapshot.observed_revision = Some(live.ui_revision);
-        if let Err(error) = crate::cache::store(query.session.as_deref(), &snapshot) {
+        if let Err(error) = crate::cache::store(session_for_store.as_deref(), &snapshot) {
             warnings.push(format!("session cache was not updated: {error}"));
         }
     }
@@ -926,9 +930,11 @@ mod tests {
     /// proxy resolution consumes them.
     #[test]
     fn proxy_at_signature_is_stable() {
-        // `proxy_at` is an async function. Naming it pins the symbol;
-        // the actual signature lives in the source.
-        let _: fn(&AccessibilityConnection, ObjectRefOwned, &[usize]) -> _ = proxy_at;
+        // `proxy_at` is an async function. The signature carries two
+        // independent lifetimes — one for the connection, one for the
+        // path slice. The return type is the connection's lifetime.
+        let _: for<'a, 'b> fn(&'a AccessibilityConnection, ObjectRefOwned, &'b [usize]) -> _ =
+            proxy_at;
     }
 
     /// The Linux `via` tag for element actions is `"atspi"`; the
