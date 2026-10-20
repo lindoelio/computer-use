@@ -5,8 +5,8 @@
 //! of a non-frontmost app: the post returns without error and nothing moves.
 //! Writing `AXValue` on the scroll bar does move it, needs no activation, and
 //! does not move the cursor. This module owns the Accessibility half of that:
-//! locating the scroll area, reading and writing the bar, and estimating the
-//! visible fraction that turns wheel lines into a value delta.
+//! locating the scroll area, reading and writing the bar, and measuring the
+//! content-over-visible sizes that turn wheel lines into a value delta.
 //!
 //! The decision logic lives in [`crate::scroll`], which is pure and tested on
 //! every OS. This file only measures and acts.
@@ -42,14 +42,21 @@ const SEARCH_BUDGET: Duration = Duration::from_secs(2);
 /// short enough that a caller is not left waiting on every scroll.
 pub(crate) const SETTLE: Duration = Duration::from_millis(150);
 
+/// Cap on how many `AXChildren` we walk looking for the document child. A
+/// scroll area typically has only one document child, but real apps sometimes
+/// hide helpers, toolbars, or overlays as siblings; we stop early to keep the
+/// measurement bounded.
+const CONTENT_CHILD_SCAN_CAP: usize = 8;
+
 /// The scroll bar for one axis of a scroll area.
 ///
 /// `bar` is retained on its own, so it stays valid without holding the scroll
-/// area alive; the visible fraction is measured once, while both are to hand.
+/// area alive; `step` is measured once, while both are to hand.
 pub(crate) struct ScrollBar {
     bar: CFRetained<AXUIElement>,
-    /// Thumb length over track length, when both sizes could be read.
-    visible_fraction: Option<f64>,
+    /// Per-line scroll step, in `0..=1`, derived from the content-over-visible
+    /// sizes. Carries the warning the sizing pass produced, when applicable.
+    step: crate::scroll::Step,
 }
 
 impl ScrollBar {
@@ -63,9 +70,9 @@ impl ScrollBar {
         ax::set_f64(&self.bar, "AXValue", value)
     }
 
-    /// Thumb length over track length, used to size one wheel line.
-    pub(crate) fn visible_fraction(&self) -> Option<f64> {
-        self.visible_fraction
+    /// The per-line scroll step (0..=1) the AX scroll-bar write should use.
+    pub(crate) fn step(&self) -> &crate::scroll::Step {
+        &self.step
     }
 }
 
@@ -181,7 +188,7 @@ fn search(
     Ok(())
 }
 
-/// The scroll bar `axis` advertises on `element`, with its visible fraction.
+/// The scroll bar `axis` advertises on `element`, with its sized step.
 fn scroll_bar(element: &AXUIElement, axis: crate::scroll::Axis) -> Option<ScrollBar> {
     if role(element).as_deref() != Some("AXScrollArea") {
         return None;
@@ -190,33 +197,108 @@ fn scroll_bar(element: &AXUIElement, axis: crate::scroll::Axis) -> Option<Scroll
         .ok()
         .flatten()
         .and_then(|value| value.downcast::<AXUIElement>().ok())?;
-    let visible_fraction = visible_fraction(element, &bar, axis);
-    Some(ScrollBar {
-        bar,
-        visible_fraction,
-    })
+    let step = measure_step(element, &bar, axis);
+    Some(ScrollBar { bar, step })
 }
 
-/// Scroll bar length along its axis over the scroll area's.
+/// Build the per-line scroll step for `axis`.
 ///
-/// This is a weak proxy for the visible fraction of the content, not a
-/// measurement of it. On a live `AXScrollArea` the scroll bar element spans the
-/// whole track, so the ratio sits near 1.0 and one wheel line ends up moving
-/// about a third of the content. AX does not say how much of a document is on
-/// screen, so the caller treats the step as an approximation. See
-/// [`crate::scroll::step_per_line`].
-fn visible_fraction(
+/// `visible` is the scroll area's own `AXSize` along `axis`, minus the
+/// orthogonal scroll bar (a horizontal bar inside a vertical scroll area eats
+/// some vertical space, and vice versa) when both are present. `content` is
+/// the `AXSize` along `axis` of the first `AXChildren` that is not another
+/// scroll bar — typically `AXTextArea`, `AXTable`, `AXOutline`, or `AXGroup`.
+/// Anything missing here falls through [`crate::scroll::content_step`], which
+/// advertises [`crate::scroll::APPROXIMATED_WARNING`] on the response.
+fn measure_step(
     area: &AXUIElement,
     bar: &AXUIElement,
     axis: crate::scroll::Axis,
+) -> crate::scroll::Step {
+    let visible_area = ax::ax_size_of(area);
+    let visible = match (visible_area, axis) {
+        (Some((_, height)), crate::scroll::Axis::Vertical) => {
+            let subtract =
+                orthogonal_bar_length(area, bar, crate::scroll::Axis::Horizontal).unwrap_or(0.0);
+            Some(height - subtract)
+        }
+        (Some((width, _)), crate::scroll::Axis::Horizontal) => {
+            let subtract =
+                orthogonal_bar_length(area, bar, crate::scroll::Axis::Vertical).unwrap_or(0.0);
+            Some(width - subtract)
+        }
+        (None, _) => None,
+    };
+    let content = content_size_for_axis(area, axis);
+    crate::scroll::content_step(content, visible)
+}
+
+/// Length of the orthogonal scroll bar, when both bars are present.
+///
+/// We compare each child of the scroll area against the scroll-bar attribute
+/// names — `AXVerticalScrollBar` and `AXHorizontalScrollBar`. Anything
+/// matching is a scroll bar; everything else is a candidate for content. The
+/// comparison is generous (a child's role may be hidden) so we fall back to
+/// the scroll bar itself rather than misclassifying it as document content.
+fn orthogonal_bar_length(
+    area: &AXUIElement,
+    bar: &AXUIElement,
+    orthogonal_axis: crate::scroll::Axis,
 ) -> Option<f64> {
-    let bar_length = size_along(bar, axis)?;
-    let track_length = size_along(area, axis)?;
-    if bar_length <= 0.0 || track_length <= 0.0 {
+    if !has_orthogonal_bar(area, orthogonal_axis) {
         return None;
     }
-    let fraction = bar_length / track_length;
-    (fraction.is_finite() && fraction > 0.0).then_some(fraction)
+    size_along(bar, orthogonal_axis)
+}
+
+/// True when `area` advertises a scroll bar along `orthogonal_axis`.
+///
+/// Same-source check: when `area` has the `AXVerticalScrollBar` attribute the
+/// caller did not ask about, that bar shares `area` and its length along the
+/// orthogonal axis is the amount to subtract from `visible`.
+fn has_orthogonal_bar(area: &AXUIElement, orthogonal_axis: crate::scroll::Axis) -> bool {
+    matches!(
+        ax::copy_cf(area, orthogonal_axis.bar_attribute()),
+        Ok(Some(_))
+    )
+}
+
+/// `AXSize` along `axis` for the first `AXChildren` element of `area` that is
+/// not an `AXScrollBar`.
+///
+/// AX exposes document content as a single scroll child (the `AXTextArea`,
+/// `AXTable`, `AXOutline`, or `AXGroup`). The bar of the *other* axis is also
+/// a child, but its role is hidden; we still skip it by looking for the scroll
+/// bar attribute matches.
+fn content_size_for_axis(area: &AXUIElement, axis: crate::scroll::Axis) -> Option<f64> {
+    let deadline = Instant::now() + Duration::from_millis(250);
+    let children = ax::children(area, CONTENT_CHILD_SCAN_CAP, deadline).ok()?;
+    let bar_attributes = [
+        crate::scroll::Axis::Horizontal.bar_attribute(),
+        crate::scroll::Axis::Vertical.bar_attribute(),
+    ];
+    for child in children {
+        if is_scroll_bar(&child, &bar_attributes) {
+            continue;
+        }
+        if let Some(size) = size_along(&child, axis) {
+            if size > 0.0 {
+                return Some(size);
+            }
+        }
+    }
+    None
+}
+
+/// True when `child` is one of the named scroll bars on `area`.
+///
+/// We compare against `AXValue`-less attribute copies; a `None` means the
+/// scroll bar attribute is not set on this child, so the child is the
+/// document rather than a bar.
+fn is_scroll_bar(child: &AXUIElement, bar_attributes: &[&str]) -> bool {
+    bar_attributes
+        .iter()
+        .any(|attribute| matches!(ax::copy_cf(child, attribute), Ok(Some(_))))
 }
 
 fn size_of(element: &AXUIElement) -> Option<f64> {

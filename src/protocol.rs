@@ -3426,8 +3426,11 @@ fn scroll(
 /// Add the verified-scroll fields when the backend reported them.
 ///
 /// `via` is `event` when the posted wheel event moved the scroll bar and
-/// `ax_scrollbar` when `AXValue` had to be written instead. Windows and Linux
-/// report no outcome, so their response keeps its existing shape.
+/// `ax_scrollbar` when `AXValue` had to be written instead. `step` is the
+/// per-line fraction (0..=1) the AX scroll-bar path computed from the
+/// content-over-visible sizes, surfaced for transparency even when the wheel
+/// event tier did the scrolling. Windows and Linux report no outcome, so
+/// their response keeps its existing shape.
 fn scroll_body(mut body: Value, report: &crate::tier::InputReport) -> Value {
     let Some(outcome) = &report.scroll else {
         return body;
@@ -3436,6 +3439,7 @@ fn scroll_body(mut body: Value, report: &crate::tier::InputReport) -> Value {
     body["scrolled"] = json!(outcome.scrolled);
     body["before"] = json!(outcome.before);
     body["after"] = json!(outcome.after);
+    body["step"] = json!(outcome.step);
     body
 }
 

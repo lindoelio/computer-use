@@ -1089,13 +1089,18 @@ impl StubBackend {
     /// bar is read back, and a bar that did not move falls back to
     /// `AXValue`. [`Self::scroll_event_delivered`] selects which side of that
     /// the stub takes, so the response fields are testable on every OS.
+    ///
+    /// The stub does not actually measure `AXSize`, so the step is the legacy
+    /// `Step::approx()` (five percent, no warnings). That keeps the existing
+    /// behaviour-based tests stable while the real macOS backend carries the
+    /// measured step.
     fn simulated_scroll(
         &self,
         tier: crate::tier::TierName,
         dx: i32,
         dy: i32,
     ) -> Result<crate::scroll::Outcome, ComputerError> {
-        use crate::scroll::{self, AxCause, AxFailure, Axis, Outcome};
+        use crate::scroll::{self, AxCause, AxFailure, Axis, Outcome, Step};
         if self.scroll_area_missing {
             return Err(ComputerError::ExecutionFailed(
                 "no AXScrollArea under the point and none in the window, so the scroll cannot be verified"
@@ -1110,6 +1115,7 @@ impl StubBackend {
         let Some(axis) = axes.first().copied() else {
             return Ok(Outcome::none());
         };
+        let step = Step::approx();
         let steps = axis.delta(dx, dy);
         let before = *self.scroll_value.lock().expect("scroll value");
         // Tier activate is a real foreground wheel, and tier ax drives the bar
@@ -1122,21 +1128,21 @@ impl StubBackend {
         if tier == crate::tier::TierName::Activate
             || (tier != crate::tier::TierName::Ax && self.scroll_event_delivered)
         {
-            let after = scroll::next_value(before, steps, None);
+            let after = scroll::next_value(before, steps, &step);
             *self.scroll_value.lock().expect("scroll value") = after;
-            return Ok(Outcome::event(before, after));
+            return Ok(Outcome::event(before, after, step.value));
         }
         if scroll::at_limit(before, steps) {
-            return Ok(Outcome::at_limit(axis, steps, before));
+            return Ok(Outcome::at_limit(axis, steps, before, Some(step.value)));
         }
         if self.scroll_ax_refused {
             return Err(ComputerError::ExecutionFailed(
                 AxFailure::Refused.reason(axis),
             ));
         }
-        let next = scroll::next_value(before, steps, None);
+        let next = scroll::next_value(before, steps, &step);
         *self.scroll_value.lock().expect("scroll value") = next;
-        scroll::ax_result(axis, before, next, Some(next), cause)
+        scroll::ax_result(axis, before, next, Some(next), cause, &step)
             .map_err(|failure| ComputerError::ExecutionFailed(failure.reason(axis)))
     }
 

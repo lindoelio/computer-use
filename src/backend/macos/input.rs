@@ -529,10 +529,12 @@ fn verified_scroll(
     std::thread::sleep(super::scroll_ax::SETTLE);
     let after = bar.value().map_err(walk_error)?;
     let steps = primary.delta(dx, dy);
-    match crate::scroll::decide(before, after, steps, bar.visible_fraction()) {
-        crate::scroll::Decision::Event { before, after } => {
-            Ok(crate::scroll::Outcome::event(before, after))
-        }
+    match crate::scroll::decide(before, after, steps, bar.step()) {
+        crate::scroll::Decision::Event { before, after } => Ok(crate::scroll::Outcome::event(
+            before,
+            after,
+            bar.step().value,
+        )),
         crate::scroll::Decision::AxScrollbar { before, next } => {
             // A wheel event was posted and did not deliver, so say so.
             write_bar(
@@ -543,9 +545,12 @@ fn verified_scroll(
                 crate::scroll::AxCause::WheelEventNotDelivered,
             )
         }
-        crate::scroll::Decision::AtLimit { value } => {
-            Ok(crate::scroll::Outcome::at_limit(primary, steps, value))
-        }
+        crate::scroll::Decision::AtLimit { value } => Ok(crate::scroll::Outcome::at_limit(
+            primary,
+            steps,
+            value,
+            Some(bar.step().value),
+        )),
         crate::scroll::Decision::Unverifiable => Err(no_scroll_area(primary)),
     }
 }
@@ -565,7 +570,7 @@ fn write_bar(
         ));
     }
     let read_back = bar.value().ok().flatten();
-    crate::scroll::ax_result(axis, before, next, read_back, cause)
+    crate::scroll::ax_result(axis, before, next, read_back, cause, bar.step())
         .map_err(|failure| walk_to_computer(failure.reason(axis)))
 }
 
@@ -604,11 +609,16 @@ fn run_ax_scroll(job: &InputJob) -> Result<InputReport, ComputerError> {
             tier: job.tier.as_str(),
             cursor_moved: false,
             focus_restored: None,
-            warnings: Vec::new(),
-            scroll: Some(crate::scroll::Outcome::at_limit(primary, steps, before)),
+            warnings: bar.step().warnings.clone(),
+            scroll: Some(crate::scroll::Outcome::at_limit(
+                primary,
+                steps,
+                before,
+                Some(bar.step().value),
+            )),
         });
     }
-    let next = crate::scroll::next_value(before, steps, bar.visible_fraction());
+    let next = crate::scroll::next_value(before, steps, bar.step());
     // The caller asked for the scroll bar, so no "wheel event" warning applies.
     let outcome = write_bar(
         bar,
