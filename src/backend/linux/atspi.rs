@@ -143,14 +143,10 @@ pub(crate) fn element_action(request: &ElementRequest) -> Result<ElementOutcome,
     let request = request.clone();
     let op = request.op.clone();
 
-    // Map `tokio::time::error::Elapsed` (and any other timeout error) to
-    // the project error type so the outer match sees a single error
-    // channel. The closure we run is the same async block whether the
-    // budget hit or not.
-    let joined: Result<
-        Result<(String, Option<LiveWalk>, CachedSnapshot, String), ElementError>,
-        tokio::time::error::Elapsed,
-    > = runtime::block_on(async move {
+    // Run the whole async walk + action + re-fetch through the runtime;
+    // runtime / connection failures are surfaced as `ComputerError`
+    // before any element work runs.
+    let joined = runtime::block_on(async move {
         tokio::time::timeout(ATSPI_CALL_BUDGET, async {
             let cached = load_cached_snapshot(&query).await?;
             let cached = match cached {
@@ -182,25 +178,20 @@ pub(crate) fn element_action(request: &ElementRequest) -> Result<ElementOutcome,
             let via = perform_action(&live, &gate.path, &op).await?;
             // Re-fetch on the same bus, log a failure but never turn a
             // completed action into an error.
-            let refreshed = match walk_live(&query, false, false).await {
-                Ok(report) => Some(report),
-                Err(error) => {
-                    return Ok((
-                        via,
-                        None,
-                        cached,
-                        format!("tree was not re-read after the action: {error}"),
-                    ));
-                }
+            let (refreshed, revalidation_warning) = match walk_live(&query, false, false).await {
+                Ok(report) => (Some(report), String::new()),
+                Err(error) => (
+                    None,
+                    format!("tree was not re-read after the action: {error}"),
+                ),
             };
-            Ok((via, refreshed, cached, String::new()))
+            Ok((via, refreshed, cached, revalidation_warning))
         })
         .await
-    });
+    })?;
 
     let result = match joined {
-        Ok(Ok(value)) => value,
-        Ok(Err(error)) => return Err(error),
+        Ok(value) => value,
         Err(_elapsed) => {
             return Err(ElementError::new(ComputerError::ExecutionFailed(format!(
                 "AT-SPI element action exceeded {}s budget",
@@ -208,11 +199,12 @@ pub(crate) fn element_action(request: &ElementRequest) -> Result<ElementOutcome,
             ))));
         }
     };
-    let (via, refreshed, mut snapshot, revalidation_warning) = result;
+    let (via, refreshed, cached, revalidation_warning) = result;
     let mut warnings = Vec::new();
     if !revalidation_warning.is_empty() {
         warnings.push(revalidation_warning);
     }
+    let mut snapshot = cached.snapshot;
     let new_revision = refreshed
         .as_ref()
         .map(|live| live.ui_revision)
