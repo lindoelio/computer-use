@@ -666,11 +666,19 @@ pub fn press_route(
 }
 
 /// Build the steps that run after settable and character-count reads.
+///
+/// `explicit_tier` is the raw value the caller passed for `--tier`. `None`
+/// or empty means "auto": the accessibility value is used when the element
+/// advertises it as settable; otherwise the keystroke fallback runs. A
+/// non-empty value (e.g. `"event"`) forces the keystroke path because
+/// `set_value` REPLACES the field contents and the caller explicitly asked
+/// for keystroke input.
 pub fn steps(
     op: &ElementOp,
     gate: &Gate,
     settable: bool,
     char_count: Option<i64>,
+    explicit_tier: Option<&str>,
 ) -> Result<Vec<Step>, ElementError> {
     match op {
         ElementOp::Press { count, button } => {
@@ -701,13 +709,24 @@ pub fn steps(
         }
         ElementOp::Type { text } => {
             validate_text(text, false)?;
-            if settable {
+            if settable && !explicit_non_auto_tier(explicit_tier) {
                 Ok(vec![Step::TypeSetValue { text: text.clone() }])
             } else {
                 Ok(vec![Step::TypeEnigo { text: text.clone() }])
             }
         }
     }
+}
+
+/// True when the caller passed an explicit, non-auto `--tier` flag. Used by
+/// `type` to keep `set_value` as an opt-in: `set_value` REPLACES the field
+/// contents, so an explicit `--tier event` (or any other named tier) must
+/// fall through to the keystroke path.
+fn explicit_non_auto_tier(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(str::trim).filter(|text| !text.is_empty()),
+        Some("event" | "synthetic" | "activate" | "ax")
+    )
 }
 
 /// `execution_failed` listing the actions CopyActionNames returned.
@@ -825,7 +844,7 @@ mod tests {
         let allowed = gate(&input_for(&op, &cached, revision, &cached_ui, 1)).unwrap();
         assert_eq!(allowed.path, vec![0]);
         assert!(!allowed.scroll_first);
-        let steps = steps(&op, &allowed, false, None).unwrap();
+        let steps = steps(&op, &allowed, false, None, None).unwrap();
         assert_eq!(steps, vec![Step::Press { count: 1 }]);
 
         let mut changed_role = cached_ui.clone();
@@ -906,7 +925,7 @@ mod tests {
         let scroll = ElementOp::ScrollTo;
         let allowed = gate(&input_for(&scroll, &cached, revision, &cached_ui, 1)).unwrap();
         assert!(!allowed.scroll_first);
-        let steps = steps(&scroll, &allowed, false, None).unwrap();
+        let steps = steps(&scroll, &allowed, false, None, None).unwrap();
         assert_eq!(steps, vec![Step::ScrollTo]);
         let perform = ElementOp::Perform {
             name: "AXScrollToVisible".into(),
@@ -970,5 +989,73 @@ mod tests {
             validate_range(0, 6, Some(5)).unwrap_err().code(),
             "invalid_arguments"
         );
+    }
+
+    #[test]
+    fn explicit_event_tier_skips_set_value_on_a_settable_field() {
+        // The bug: `type --element <N> --tier event` still went down the
+        // set_value path. set_value REPLACES the field contents; the user
+        // asked for keystrokes. With --tier event set the path must fall
+        // through to TypeEnigo even when the element advertises settable.
+        let op = ElementOp::Type {
+            text: "hello".into(),
+        };
+        // `settable = true` would otherwise pick TypeSetValue; the explicit
+        // tier forces TypeEnigo.
+        let steps = steps(&op, &stub_gate_for_type(), true, Some(0), Some("event")).unwrap();
+        assert_eq!(
+            steps,
+            vec![Step::TypeEnigo {
+                text: "hello".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn explicit_synthetic_tier_also_skips_set_value() {
+        let op = ElementOp::Type { text: "x".into() };
+        let steps = steps(&op, &stub_gate_for_type(), true, Some(1), Some("synthetic")).unwrap();
+        assert_eq!(steps, vec![Step::TypeEnigo { text: "x".into() }]);
+    }
+
+    #[test]
+    fn no_explicit_tier_keeps_set_value_on_a_settable_field() {
+        // The default ("auto") keeps the original behaviour: a settable
+        // text field still goes through set_value. The explicit tier flag
+        // is what flips the choice.
+        let op = ElementOp::Type {
+            text: "world".into(),
+        };
+        let steps = steps(&op, &stub_gate_for_type(), true, Some(0), None).unwrap();
+        assert_eq!(
+            steps,
+            vec![Step::TypeSetValue {
+                text: "world".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn no_explicit_tier_falls_through_to_keystrokes_when_not_settable() {
+        let op = ElementOp::Type { text: "x".into() };
+        let steps = steps(&op, &stub_gate_for_type(), false, None, None).unwrap();
+        assert_eq!(steps, vec![Step::TypeEnigo { text: "x".into() }]);
+    }
+
+    /// A minimal gate for the type action. The `Type` branch in `steps`
+    /// only inspects `gate.actions` for the ScrollTo path, and our tests
+    /// here exercise the `Type` branch directly, so the gate contents are
+    /// unused — but `steps` takes the gate by reference, so we still need
+    /// to pass something that satisfies the type.
+    fn stub_gate_for_type() -> Gate {
+        Gate {
+            path: Vec::new(),
+            scroll_first: false,
+            outside_warning: None,
+            needs_settable: false,
+            needs_chars: false,
+            actions: Vec::new(),
+            center: None,
+        }
     }
 }

@@ -606,7 +606,13 @@ impl DesktopBackend for StubBackend {
         } else {
             None
         };
-        let planned = element::steps(&request.op, &gate, settable, char_count)?;
+        let planned = element::steps(
+            &request.op,
+            &gate,
+            settable,
+            char_count,
+            request.tier.as_deref(),
+        )?;
         let mut warnings = Vec::new();
         if let Some(warning) = gate.outside_warning.clone() {
             warnings.push(warning);
