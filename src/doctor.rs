@@ -43,6 +43,11 @@ pub struct DoctorOptions {
     pub prompt: bool,
     /// Open the first missing Settings pane.
     pub open_settings: bool,
+    /// Linux only: caller passed `--x11` to force the X11 detection.
+    /// Other platforms ignore the field so the dispatcher can pass it
+    /// unconditionally.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub x11: bool,
 }
 
 /// Values the platform measured. Assembly does not measure them again.

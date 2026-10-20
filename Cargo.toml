@@ -58,9 +58,9 @@ xcap = "0.3.3"
 # P10: optional CDP client (attach only, never to spawn). Pinned to 0.9.1 per the
 # ROADMAP.md design.
 chromiumoxide = { version = "0.9.1", optional = true, default-features = false }
-# We create a `current_thread` runtime per call (P10 design). `macros` is unused
-# here but chromiumoxide itself needs `net`, `time`, etc.; cargo feature
-# unification picks those up from chromiumoxide's own deps.
+# P10 builds the runtime fresh per call. P13a reuses the same dependency so the
+# Linux AT-SPI work can `block_on` `AccessibilityConnection::new()` from the CLI
+# thread without pulling in a second async runtime.
 tokio = { version = "1", optional = true, default-features = false, features = [
     "rt",
 ] }
@@ -78,8 +78,19 @@ libc = "0.2"
 arboard = "3.7.0"
 
 # Default features pull `wayland-data-control`. X11 plus image data is enough.
+# P13a: AT-SPI2 for the accessibility tree, actions, and component extents; the
+# `connection` + `proxies` features pull zbus, the `AccessibilityConnection`
+# builder, the `AccessibleProxy` we walk, and the `Action`/`Text`/`Value`/
+# `Component` proxies that drive element actions. `x11rb` with the `xtest`
+# feature provides XTest fake_input for the `event` input tier on plain X11
+# (Wayland without portal is `unsupported` until part B). A small current-
+# thread tokio runtime drives `block_on(AccessibilityConnection::new())` from
+# the CLI thread.
 [target.'cfg(target_os = "linux")'.dependencies]
 arboard = { version = "3.7.0", default-features = false, features = ["image-data"] }
+atspi = { version = "0.30.0", default-features = false, features = ["connection", "proxies"] }
+x11rb = { version = "0.13", default-features = false, features = ["allow-unsafe-code", "xtest"] }
+tokio = { version = "1", default-features = false, features = ["rt", "macros"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"

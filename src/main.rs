@@ -591,6 +591,12 @@ enum CliCommand {
         /// Open System Settings to the first missing permission pane.
         #[arg(long)]
         open_settings: bool,
+        /// Linux only: force X11 detection even on a session that exposes
+        /// both `DISPLAY` and `WAYLAND_DISPLAY`. Other platforms ignore the
+        /// flag.
+        #[cfg_attr(not(target_os = "linux"), arg(long, hide = true))]
+        #[arg(long)]
+        x11: bool,
     },
 
     /// Print the key window's accessibility tree.
@@ -1275,9 +1281,11 @@ fn command_action(
         CliCommand::Doctor {
             prompt,
             open_settings,
+            x11,
         } => Action::Doctor {
             prompt: *prompt,
             open_settings: *open_settings,
+            x11: *x11,
         },
         CliCommand::Tree => Action::Tree,
         CliCommand::Ocr { force } => Action::Ocr { force: *force },

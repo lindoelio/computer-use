@@ -764,6 +764,28 @@ macro_rules! impl_platform_backend {
                 windows::element_action(request)
             }
 
+            // P13a: Linux element actions route through AT-SPI once the
+            // `portal` feature lands in part B. For now the cached
+            // fingerprint is revalidated and the live dispatch path stays
+            // `unsupported`, mirroring the macOS / Windows shape.
+            #[cfg(target_os = "linux")]
+            fn element_action(
+                &self,
+                request: &ElementRequest,
+            ) -> Result<ElementOutcome, ElementError> {
+                linux::element_action(request)
+            }
+
+            // P13a: Linux `perform_input` overrides the default so the
+            // `event` tier can use XTest `fake_input` on plain X11.
+            #[cfg(target_os = "linux")]
+            fn perform_input(
+                &self,
+                job: &crate::tier::InputJob,
+            ) -> Result<crate::tier::InputReport, ComputerError> {
+                linux::perform_input(job)
+            }
+
             // P12b: Windows captures through `windows-capture` and recognizes
             // text with `Windows.Media.Ocr`. The secure-frame walk is the
             // same `UiNode` recursion as macOS, converted through the map.

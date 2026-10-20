@@ -331,6 +331,11 @@ pub enum Action {
         /// Open the first missing System Settings pane. macOS only.
         #[serde(default)]
         open_settings: bool,
+        /// Linux only: force X11 detection even when WAYLAND_DISPLAY is set.
+        /// Other platforms ignore the field so the dispatcher can pass it
+        /// unconditionally.
+        #[serde(default)]
+        x11: bool,
     },
     /// Numbered accessibility tree for the key window.
     Tree,
@@ -1091,11 +1096,13 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
         Action::Doctor {
             prompt,
             open_settings,
+            x11,
         } => result_response(doctor(
             backend,
             crate::doctor::DoctorOptions {
                 prompt,
                 open_settings,
+                x11,
             },
         )),
         Action::CursorPosition => result_response(cursor_position(backend)),
@@ -4422,6 +4429,7 @@ mod tests {
             Action::Doctor {
                 prompt: false,
                 open_settings: false,
+                x11: false,
             },
         );
         let value = response.to_value();
@@ -4445,7 +4453,8 @@ mod tests {
             prompted,
             Action::Doctor {
                 prompt: true,
-                open_settings: false
+                open_settings: false,
+                ..
             }
         ));
         let plain: Action = serde_json::from_str(r#"{"action":"doctor"}"#).unwrap();
@@ -4453,7 +4462,8 @@ mod tests {
             plain,
             Action::Doctor {
                 prompt: false,
-                open_settings: false
+                open_settings: false,
+                ..
             }
         ));
 
