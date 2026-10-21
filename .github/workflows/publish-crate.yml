@@ -1,0 +1,131 @@
+name: Publish crate
+
+# Publishing to crates.io is irreversible: a version that reaches the registry
+# can never be replaced. This workflow therefore publishes exactly one version
+# per tag, refuses a tag whose version disagrees with Cargo.toml, and skips
+# cleanly when the registry already carries that version.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag to publish. Its Cargo.toml version is the one that ships."
+        required: true
+        default: "v0.3.1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-crate-${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
+  cancel-in-progress: false
+
+env:
+  PUBLISH_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
+  CRATE_NAME: computer-use
+
+jobs:
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.PUBLISH_REF }}
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Same dependency set as the release build: `enigo` needs libxdo on
+      # Linux and `arboard` needs the X11 client headers.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libxdo-dev libx11-dev libxcb1-dev \
+            libxrandr-dev libdbus-1-dev libxkbcommon-dev libatspi2.0-dev \
+            libpipewire-0.3-dev libclang-dev clang
+
+      - name: Read the version from Cargo.toml
+        id: meta
+        run: |
+          set -euo pipefail
+          version=$(python3 -c "
+          import pathlib, re
+          text = pathlib.Path('Cargo.toml').read_text()
+          match = re.search(r'(?m)^version = \"([^\"]+)\"', text)
+          if match is None:
+              raise SystemExit('no version in Cargo.toml')
+          print(match.group(1))
+          ")
+          tag="${PUBLISH_REF#refs/tags/}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "Publishing ${CRATE_NAME} ${version} from ${tag}"
+
+      - name: Refuse a tag whose version disagrees with Cargo.toml
+        run: |
+          set -euo pipefail
+          version="${{ steps.meta.outputs.version }}"
+          tag="${{ steps.meta.outputs.tag }}"
+          if [ "${tag}" != "v${version}" ]; then
+            echo "::error::tag ${tag} does not match the Cargo.toml version ${version}"
+            exit 1
+          fi
+
+      - name: Check whether crates.io already carries this version
+        id: registry
+        run: |
+          set -euo pipefail
+          version="${{ steps.meta.outputs.version }}"
+          published=$(curl -sS --max-time 30 -H "User-Agent: computer-use-release-workflow" \
+            "https://crates.io/api/v1/crates/${CRATE_NAME}" \
+            | python3 -c "
+          import json, sys
+          versions = [v['num'] for v in json.load(sys.stdin)['versions']]
+          print('yes' if '${version}' in versions else 'no')
+          ")
+          echo "published=${published}" >> "${GITHUB_OUTPUT}"
+          if [ "${published}" = "yes" ]; then
+            echo "crates.io already has ${version} — nothing to publish."
+          else
+            echo "crates.io has no ${version} yet."
+          fi
+
+      - name: cargo publish --dry-run
+        if: steps.registry.outputs.published != 'yes'
+        run: cargo publish --dry-run --locked
+
+      - name: cargo publish
+        if: steps.registry.outputs.published != 'yes'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          cargo publish --locked --token "${CARGO_REGISTRY_TOKEN}"
+
+      - name: Confirm the version on crates.io
+        if: steps.registry.outputs.published != 'yes'
+        run: |
+          set -euo pipefail
+          version="${{ steps.meta.outputs.version }}"
+          found=no
+          for attempt in 1 2 3 4 5; do
+            if curl -sS --max-time 30 -H "User-Agent: computer-use-release-workflow" \
+              "https://crates.io/api/v1/crates/${CRATE_NAME}" \
+              | python3 -c "
+          import json, sys
+          versions = [v['num'] for v in json.load(sys.stdin)['versions']]
+          print('yes' if '${version}' in versions else 'no')
+          " | grep -qx yes; then
+              found=yes
+              break
+            fi
+            sleep 10
+          done
+          if [ "${found}" != "yes" ]; then
+            echo "::error::${version} is not on crates.io after publishing"
+            exit 1
+          fi
+          echo "${CRATE_NAME} ${version} is live on crates.io."
