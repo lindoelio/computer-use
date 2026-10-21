@@ -4,6 +4,31 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - 2026-10-20
+
+### Added
+
+#### Agent loop
+
+- `--state-diff` attaches only the post-action delta and omits the full tree. It implies `--state`. On a busy window the state payload drops from tens of kilobytes to a few lines, which is what a loop actually reads.
+- The JSON context key `state_diff` does the same for `exec`, `serve`, and `--json`.
+- The `tree` response and the `state` block carry `baseline: "created" | "existing"`, so an agent can tell a fresh tree from a delta without guessing.
+- The CLI commands `batch` and `cursor-position`, which close the gap with the JSON actions `batch` and `cursor_position`.
+- `policy check` returns `code: "ok" | "policy_denied"` next to `decision`, so a caller can branch on a machine-readable token.
+
+#### Policy
+
+- A user policy file may exempt a specific built-in deny entry with `[builtin_deny] exempt = [...]`. The entry matches a bundle id, an executable name, or a `.app` bundle name, and covers the whole app. The admin file cannot set it. The built-in list is unchanged by default.
+
+### Changed
+
+- The `--full` help text no longer claims to replace the cached baseline. The baseline is always the most recent observation.
+- The `docs/CLI.md` post-action state section documents the `state` block, the diff line format (`+`, `-`, `~`), and the `--state-diff` variant.
+
+### Fixed
+
+- The crate documentation contradicted itself: the changelog and the roadmap notes column still said the live element path had never been exercised, while the verification column of the same table recorded a live macOS pass on 2026-10-20. The verification column is now the single source of truth.
+
 ## [0.2.0] - 2026-10-20
 
 ### Added
@@ -153,7 +178,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 Items tested by code and CI but not exercised live for this release.
 
 - **Per-row verification levels in the parity table.** The 0.2.0 parity table now states, for every row, whether it was exercised on a real window on the development Mac (`live`), wired and unit/integration-tested in CI on Ubuntu/macOS/Windows (`CI`), or compiled but never invoked (`compile-only`). Accessibility was off for this process on the development Mac, so almost nothing on macOS AX / event / activate / SkyLight / synthetic was exercised live. The live paths on this Mac were `doctor`, `list-apps`, `list-windows`, `policy check`, `displays`, full-desktop `screenshot`, the macOS Vision unit test (`cargo test --release vision_recognizes_drawn_text -- --ignored --nocapture`), and `scripts/package-macos-app.sh` ad-hoc packaging. Everything else on macOS is `CI`. Windows and Linux are `CI` for the whole 0.2.0 surface.
-- **Accessibility was off for this process on the development Mac.** The full live path (press, value, set-value, perform-action, scroll-into-view, hit-test, event posting, AX press via SkyLight) was not exercised against a real window because the TCC grant is missing in this profile. `doctor` reports it. The code paths and unit tests pass.
+- **Accessibility was off for this process on the development Mac at the time of the 0.2.0 build.** The full live path (press, value, set-value, perform-action, scroll-into-view, hit-test, event posting, AX press via SkyLight) could not be exercised against a real window because the TCC grant was missing in this profile. A later pass on 2026-10-20, after the grant was available, exercised the element path against a real window: `tree --app TextEdit --session S` then `--element 2` actions hit the text area, `set-value` and `select-text` returned ok, `perform-action --name AXPress` toggled the bold checkbox, and `tree --diff` returned a delta after a baseline. The verification column of the parity table records the current truth per row. `doctor` reports the grant when it is missing. The code paths and unit tests pass.
 - **Windows is CI-only, not live.** UIA patterns, tier `activate`, and the per-window `windows-capture` path are wired and tested on the macOS harness with the mock backend, and CI compiles and unit-tests on `windows-latest`. No live Windows host ran in P15.
 - **Linux is CI-only, not live.** No Wayland compositor was available on the development machine. AT-SPI works on X11 with `DISPLAY`; RemoteDesktop portal works when `portal` is compiled in. `list_windows` / `list_apps` / `launch` / `activate` / `quit` are still `unsupported`, so `screenshot --app` cannot reach `capture_window` yet.
 - **CDP click uses `Input.dispatchMouseEvent`.** No screen-space transform; the click is in the page coordinate system. The deviation is documented at the function and in P10.

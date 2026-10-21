@@ -581,6 +581,8 @@ pub struct CallContext {
     pub full: bool,
     /// Attach post-action state. Used from P5.
     pub return_state: bool,
+    /// Attach only the post-action delta instead of the full tree.
+    pub state_diff: bool,
     /// Attach a screenshot with post-action state. Used from P5.
     pub include_screenshot: bool,
     /// Coordinate space name. Used from P5.
@@ -651,13 +653,15 @@ pub fn parse_request(mut value: Value) -> Result<Request, ComputerError> {
 }
 
 fn take_context(object: &mut Map<String, Value>) -> Result<CallContext, ComputerError> {
+    let state_diff = take_bool(object, "state_diff")?;
     Ok(CallContext {
         app: take_stringish(object, "app")?,
         window: take_stringish(object, "window")?,
         element: take_optional_u32(object, "element")?,
         diff: take_bool(object, "diff")?,
         full: take_bool(object, "full")?,
-        return_state: take_bool(object, "return_state")?,
+        return_state: take_bool(object, "return_state")? || state_diff,
+        state_diff,
         include_screenshot: take_bool(object, "include_screenshot")?,
         coord: take_stringish(object, "coord")?,
         session: take_stringish(object, "session")?,
@@ -1479,6 +1483,9 @@ fn prepare_action(
             }
         }
     };
+    // The backends consult the built-in deny list without carrying the policy,
+    // so the exemptions go into the process-wide registry here.
+    policy::set_builtin_exemptions(loaded.builtin_exempt());
     let warning = if loaded.pause_on_user_input {
         backend.user_input_pause_warning().map(str::to_string)
     } else {
@@ -1836,6 +1843,7 @@ fn policy_check(
         Ok(policy) => policy,
         Err(error) => return (Response::from_error(error), policy::Subject::default()),
     };
+    policy::set_builtin_exemptions(loaded.builtin_exempt());
     let selector = match parse_app_selector(app) {
         Ok(selector) => selector,
         Err(error) => return (Response::from_error(error), policy::Subject::default()),
@@ -1850,15 +1858,16 @@ fn policy_check(
         }
     }
     let decision = policy::app_verdict(&loaded, &subject);
-    let (name, source) = match decision {
-        policy::Decision::Allow { source } => ("allow", source),
-        policy::Decision::Deny { source, .. } => ("deny", source),
-        policy::Decision::Confirm { .. } => ("allow", "default"),
+    let (name, source, code) = match decision {
+        policy::Decision::Allow { source } => ("allow", source, "ok"),
+        policy::Decision::Deny { source, .. } => ("deny", source, "policy_denied"),
+        policy::Decision::Confirm { .. } => ("allow", "default", "ok"),
     };
     (
         Response::success(json!({
             "decision": name,
             "source": source,
+            "code": code,
             "bundle_id": subject.bundle_id,
         })),
         subject,
@@ -2290,6 +2299,7 @@ fn prepare_batch_step(
     let mut context = outer.clone();
     overlay_context(&mut context, object)?;
     context.return_state = false;
+    context.state_diff = false;
     context.include_screenshot = false;
     let action = serde_json::from_value(value)
         .map_err(|error| ComputerError::InvalidArguments(error.to_string()))?;
@@ -2316,6 +2326,7 @@ fn overlay_context(
         context.full = take_bool(object, "full")?;
     }
     let _ = object.remove("return_state");
+    let _ = object.remove("state_diff");
     let _ = object.remove("include_screenshot");
     let _ = object.remove("id");
     let _ = object.remove("stop_on_error");
@@ -2384,20 +2395,36 @@ fn attach_post_state(
     kind: PostKind,
     mut response: Response,
 ) -> Response {
-    if !context.return_state || matches!(kind, PostKind::ReadOnly) {
+    // `state_diff` implies the post-state: it is the same attachment without
+    // the full tree.
+    if !(context.return_state || context.state_diff) || matches!(kind, PostKind::ReadOnly) {
         return response;
     }
     let mut warnings = Vec::new();
     let mut state = match backend.tree(&tree_query(context)) {
-        Ok(report) => json!({
-            "app": report.app,
-            "pid": report.pid,
-            "window_id": report.window_id,
-            "revision": report.revision,
-            "tree": report.full_text,
-            "diff": report.diff,
-            "truncated": report.truncated,
-        }),
+        Ok(report) => {
+            // `diff` is `None` when this observation created the baseline.
+            let baseline = if report.diff.is_some() {
+                "existing"
+            } else {
+                "created"
+            };
+            let mut state = json!({
+                "app": report.app,
+                "pid": report.pid,
+                "window_id": report.window_id,
+                "revision": report.revision,
+                "diff": report.diff,
+                "truncated": report.truncated,
+                "baseline": baseline,
+            });
+            // `--state-diff` keeps the delta and drops the full tree. The full
+            // tree is the expensive half of this payload.
+            if !context.state_diff {
+                state["tree"] = json!(report.full_text);
+            }
+            state
+        }
         Err(error) => {
             if !response.ok {
                 return response;
@@ -2411,6 +2438,7 @@ fn attach_post_state(
                 "tree": null,
                 "diff": null,
                 "truncated": null,
+                "baseline": null,
             })
         }
     };
@@ -3757,6 +3785,8 @@ fn tree_action(
         "source": report.source,
         "truncated": report.truncated,
         "tree": report.tree,
+        // `diff` is `None` when this observation created the baseline.
+        "baseline": if report.diff.is_some() { "existing" } else { "created" },
     });
     if let Some(note) = report.note {
         body["note"] = json!(note);
@@ -5305,6 +5335,73 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("\"a\" -> \"abc\""), "{text}");
+    }
+
+    #[test]
+    fn state_diff_omits_the_full_tree_and_keeps_the_delta() {
+        let backend = StubBackend::default();
+        let first = dispatch_with_context(&backend, Action::Tree, &ctx("Notes"));
+        assert!(first.ok, "{first:?}");
+        *backend.stub_value.lock().unwrap() = "ab".into();
+        let mut context = element_context(0);
+        context.return_state = true;
+        context.state_diff = true;
+        let response = dispatch_with_context(&backend, Action::Focus, &context);
+        assert!(response.ok, "{response:?}");
+        let value = response.to_value();
+        // The full tree is the expensive half of the payload. It is gone.
+        assert!(value["state"].get("tree").is_none(), "{value}");
+        let diff = value["state"]["diff"].as_str().unwrap();
+        assert!(
+            diff.contains("~ [1] AXTextArea value: \"a\" -> \"ab\""),
+            "{diff}"
+        );
+        assert_eq!(value["state"]["baseline"], "existing");
+        assert_eq!(value["state"]["app"], "com.apple.Notes");
+    }
+
+    #[test]
+    fn state_diff_without_state_still_attaches_the_post_state() {
+        let backend = StubBackend::default();
+        let seeded = dispatch_with_context(&backend, Action::Tree, &ctx("Notes"));
+        assert!(seeded.ok, "{seeded:?}");
+        let mut context = element_context(0);
+        context.state_diff = true;
+        let response = dispatch_with_context(&backend, Action::Focus, &context);
+        assert!(response.ok, "{response:?}");
+        let value = response.to_value();
+        assert!(value["state"].get("tree").is_none(), "{value}");
+        assert!(value["state"].get("diff").is_some(), "{value}");
+    }
+
+    #[test]
+    fn the_tree_response_says_whether_a_baseline_existed() {
+        let backend = StubBackend::default();
+        let first = dispatch_with_context(&backend, Action::Tree, &ctx("Notes"));
+        assert!(first.ok, "{first:?}");
+        assert_eq!(first.to_value()["baseline"], "created");
+        *backend.stub_value.lock().unwrap() = "ab".into();
+        let second = dispatch_with_context(&backend, Action::Tree, &ctx("Notes"));
+        assert!(second.ok, "{second:?}");
+        assert_eq!(second.to_value()["baseline"], "existing");
+    }
+
+    #[test]
+    fn policy_check_reports_a_code_next_to_the_decision() {
+        let backend = StubBackend::default();
+        let response = dispatch_with_context(
+            &backend,
+            Action::PolicyCheck,
+            &CallContext {
+                app: Some("Notes".into()),
+                ..CallContext::default()
+            },
+        );
+        assert!(response.ok, "{response:?}");
+        let value = response.to_value();
+        assert_eq!(value["decision"], "allow");
+        assert_eq!(value["code"], "ok");
+        assert!(value["source"].is_string(), "{value}");
     }
 
     #[test]

@@ -7,11 +7,72 @@
 //! to false when the key is absent, so a missing file does not install an event tap.
 
 use std::path::Path;
+use std::sync::{OnceLock, RwLock};
 
 use crate::error::ComputerError;
 use crate::target::AppSelector;
 
 const SYSTEM_SETTINGS_BUNDLES: &[&str] = &["com.apple.systempreferences", "com.apple.Settings"];
+
+/// Built-in deny entries the loaded policy exempts.
+///
+/// The built-in list refuses terminals and password managers, plus apps that
+/// run agents of their own. A policy file can exempt a specific entry with
+/// `[builtin_deny] exempt = [...]`, but only the user file may do so and the
+/// exemption is never implicit. The registry is process-wide because the
+/// backends consult the built-in list without carrying the policy.
+static BUILTIN_EXEMPT: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
+
+fn exempt_registry() -> &'static RwLock<Vec<String>> {
+    BUILTIN_EXEMPT.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+/// Replace the built-in exemptions with `items`. Called once per action, right
+/// after the policy file is loaded.
+pub fn set_builtin_exemptions(items: &[String]) {
+    let mut registry = exempt_registry()
+        .write()
+        .unwrap_or_else(|error| error.into_inner());
+    *registry = items.to_vec();
+}
+
+/// The built-in exemptions currently in force.
+pub fn builtin_exemptions() -> Vec<String> {
+    exempt_registry()
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone()
+}
+
+/// True when `value` names a built-in entry the policy exempts.
+fn is_exempt(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    builtin_exemptions()
+        .iter()
+        .any(|item| item.trim().eq_ignore_ascii_case(value))
+}
+
+/// True when the exempt list names this bundle id, executable name, or bundle
+/// path. The comparison is deliberately loose so one entry can cover the
+/// bundle id, the executable, and the `.app` path of the same app.
+fn exempts_identity(bundle_id: Option<&str>, exe_name: Option<&str>, bundle: Option<&str>) -> bool {
+    let mut candidates: Vec<&str> = Vec::new();
+    if let Some(bundle_id) = bundle_id {
+        candidates.push(bundle_id);
+    }
+    if let Some(exe_name) = exe_name {
+        candidates.push(exe_name);
+        candidates.push(exe_name.trim_end_matches(".exe"));
+    }
+    if let Some(bundle) = bundle {
+        candidates.push(bundle);
+        candidates.push(bundle.trim_end_matches(".app"));
+    }
+    candidates.iter().any(|candidate| is_exempt(candidate))
+}
 
 /// Bundle ids that are always refused. Comparison is case-insensitive.
 const DENIED_BUNDLE_IDS: &[&str] = &[
@@ -167,11 +228,20 @@ pub fn identity_denial(
     ax_identifier: Option<&str>,
 ) -> Option<Denial> {
     if let Some(bundle_id) = bundle_id {
-        if let Some(message) = bundle_denial(bundle_id) {
-            return Some(Denial {
-                source: "bundle",
-                message,
-            });
+        let exe_name = exe_path
+            .and_then(|path| path.file_name())
+            .and_then(|file| file.to_str());
+        let bundle = exe_path
+            .and_then(|path| path.components().next_back())
+            .map(|component| component.as_os_str().to_string_lossy().to_string())
+            .filter(|text| text.ends_with(".app"));
+        if !exempts_identity(Some(bundle_id), exe_name, bundle.as_deref()) {
+            if let Some(message) = bundle_denial(bundle_id) {
+                return Some(Denial {
+                    source: "bundle",
+                    message,
+                });
+            }
         }
         if is_system_settings(bundle_id) && privacy_or_security(window_title, ax_identifier) {
             return Some(Denial {
@@ -181,6 +251,15 @@ pub fn identity_denial(
         }
     }
     if let Some(path) = exe_path {
+        let exe_name = path.file_name().and_then(|file| file.to_str());
+        let bundle = path
+            .components()
+            .next_back()
+            .map(|component| component.as_os_str().to_string_lossy().to_string())
+            .filter(|text| text.ends_with(".app"));
+        if exempts_identity(bundle_id, exe_name, bundle.as_deref()) {
+            return None;
+        }
         if let Some(message) = path_denial(path) {
             return Some(Denial {
                 source: "path",
@@ -229,6 +308,9 @@ pub fn quit_is_protected(
 }
 
 fn bundle_denial(bundle_id: &str) -> Option<String> {
+    if is_exempt(bundle_id) {
+        return None;
+    }
     DENIED_BUNDLE_IDS
         .iter()
         .find(|id| id.eq_ignore_ascii_case(bundle_id))
@@ -263,9 +345,13 @@ fn path_denial(path: &Path) -> Option<String> {
 }
 
 fn denied_display_name(name: &str) -> bool {
+    let name = name.trim();
+    if is_exempt(name) {
+        return false;
+    }
     DENIED_DISPLAY_NAMES
         .iter()
-        .any(|denied| denied.eq_ignore_ascii_case(name.trim()))
+        .any(|denied| denied.eq_ignore_ascii_case(name))
 }
 
 fn is_system_settings(bundle_id: &str) -> bool {
@@ -414,6 +500,8 @@ pub struct LoadedPolicy {
     user_confirm: Option<String>,
     admin_confirm: Option<String>,
     timeout_secs: u64,
+    /// Built-in deny entries the user policy exempts.
+    builtin_exempt: Vec<String>,
     /// True only when a loaded file sets the key. A missing file stays false.
     pub pause_on_user_input: bool,
 }
@@ -428,6 +516,7 @@ impl Default for LoadedPolicy {
             user_confirm: None,
             admin_confirm: None,
             timeout_secs: 30,
+            builtin_exempt: Vec::new(),
             pause_on_user_input: false,
         }
     }
@@ -437,6 +526,11 @@ impl LoadedPolicy {
     /// Patterns from the user and admin files.
     pub fn blocked_urls(&self) -> &[String] {
         &self.blocked_urls
+    }
+
+    /// Built-in deny entries the user policy exempts.
+    pub fn builtin_exempt(&self) -> &[String] {
+        &self.builtin_exempt
     }
 
     /// Timeout for the confirm hook. Capped at 120 seconds.
@@ -875,6 +969,14 @@ fn merge_file(
     let source = match origin {
         PolicyOrigin::User => {
             policy.user_default_deny = default_deny;
+            if let Some(builtin) = parsed.builtin_deny.as_ref() {
+                for entry in &builtin.exempt {
+                    let entry = entry.trim();
+                    if !entry.is_empty() && !policy.builtin_exempt.iter().any(|item| item == entry) {
+                        policy.builtin_exempt.push(entry.to_string());
+                    }
+                }
+            }
             if let Some(confirm) = parsed.confirm.as_ref() {
                 if let Some(command) = confirm
                     .command
@@ -1016,6 +1118,18 @@ struct PolicyFile {
     confirm: Option<ConfirmSection>,
     #[serde(default)]
     browser: Option<BrowserSection>,
+    #[serde(default)]
+    builtin_deny: Option<BuiltinDenySection>,
+}
+
+/// Exemptions from the built-in deny list. Only the user policy file may set
+/// this; an admin file that sets it is ignored.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BuiltinDenySection {
+    /// Bundle ids, executable names, or `.app` bundle names to exempt.
+    #[serde(default)]
+    exempt: Vec<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]

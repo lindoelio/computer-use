@@ -30,6 +30,7 @@ const CONTEXT_KEYS: &[&str] = &[
     "diff",
     "full",
     "return_state",
+    "state_diff",
     "include_screenshot",
     "coord",
     "session",
@@ -372,7 +373,7 @@ fn help_lists_every_required_subcommand() {
 }
 
 #[test]
-fn version_is_0_2_0() {
+fn version_matches_the_manifest() {
     let bin = locate_binary();
     let output = Command::new(&bin)
         .arg("--version")
@@ -380,7 +381,13 @@ fn version_is_0_2_0() {
         .expect("run computer-use --version");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("0.2.0"), "{stdout}");
+    let manifest = fs::read_to_string(repo_root().join("Cargo.toml")).expect("Cargo.toml is readable");
+    let version = manifest
+        .lines()
+        .find_map(|line| line.strip_prefix("version = \""))
+        .and_then(|rest| rest.split('"').next())
+        .expect("Cargo.toml declares a version");
+    assert!(stdout.contains(version), "{stdout} should carry {version}");
     assert!(stdout.contains("computer-use"), "{stdout}");
 }
 

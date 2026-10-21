@@ -364,7 +364,16 @@ fn version_prints_package_version() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("computer-use"));
-    assert!(stdout.contains("0.2.0"), "{stdout}");
+    // Read the version from the manifest so a release bump cannot leave this
+    // test asserting a stale number.
+    let manifest = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+        .expect("Cargo.toml is readable");
+    let version = manifest
+        .lines()
+        .find_map(|line| line.strip_prefix("version = \""))
+        .and_then(|rest| rest.split('"').next())
+        .expect("Cargo.toml declares a version");
+    assert!(stdout.contains(version), "{stdout} should carry {version}");
 }
 
 #[test]

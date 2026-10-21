@@ -135,6 +135,8 @@ spaces              Group on-screen windows by the screen that contains each win
 session             Session cache and accessibility teardown (`end`, `prune`)
 serve               Read newline-delimited JSON actions from stdin
 exec                Run one JSON action from an argument
+batch               Run a batch of JSON actions from an argument
+cursor-position     Print the pointer position
 overlay             Local agent-cursor helper. This is not a network service
 browser             Chrome DevTools Protocol (CDP) subcommands. Requires `--cdp`
 help                Print this message or the help of the given subcommand(s)
@@ -180,7 +182,7 @@ sudo apt-get install -y pkg-config libxdo-dev libx11-dev libxcb1-dev \
 
 `xdotool` on `PATH` improves the frontmost-window lookup. The accessibility tree is `AT-SPI` (default features). Tier `event` is X11 XTest on plain X11 and the RemoteDesktop portal on Wayland when the `portal` feature is compiled in. Without `portal`, Wayland tier `event` is `unsupported`. Grant the session access to the X display (`DISPLAY` set, and the same user that owns the session).
 
-The release binary is built with `--features portal`, which links `libpipewire-0.3` at build time and pulls one frame off the portal's PipeWire stream. Linux OCR is `unsupported` in 0.2.0.
+The release binary is built with `--features portal`, which links `libpipewire-0.3` at build time and pulls one frame off the portal's PipeWire stream. Linux OCR is `unsupported`.
 
 ## Input tiers
 

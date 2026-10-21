@@ -58,7 +58,7 @@ struct Cli {
     #[arg(long, global = true, conflicts_with = "full")]
     diff: bool,
 
-    /// Print the full tree and replace the cached baseline.
+    /// Print the full tree. The baseline is always the most recent observation.
     #[arg(long, global = true)]
     full: bool,
 
@@ -69,6 +69,15 @@ struct Cli {
     /// Attach the post-action accessibility tree.
     #[arg(long = "state", global = true)]
     state: bool,
+
+    /// With `--state`, attach only the post-action delta instead of the full tree.
+    ///
+    /// The full tree is the expensive part of the payload: on a busy window it
+    /// runs to tens of kilobytes of numbered text, while the delta is a few
+    /// lines. Agents that drive a loop should prefer this and read
+    /// `state.diff`.
+    #[arg(long = "state-diff", global = true)]
+    state_diff: bool,
 
     /// With `--state`, also attach a screenshot. A window target captures that window.
     #[arg(long = "screenshot", global = true)]
@@ -742,6 +751,25 @@ enum CliCommand {
         json: String,
     },
 
+    /// Run a batch of JSON actions from an argument.
+    ///
+    /// The argument is a JSON object whose `action` field is `batch` and whose
+    /// `actions` array holds the steps. Every step shares one target and one
+    /// cache revision sequence, so element indices are re-validated between
+    /// steps. A nested `batch` is rejected.
+    ///
+    /// Example: computer-use batch '{"action":"batch","actions":[{"action":"wait","ms":10}]}'
+    Batch {
+        /// JSON object with an `action` field of `batch` and an `actions` array.
+        json: String,
+    },
+
+    /// Print the pointer position.
+    ///
+    /// Example: computer-use cursor-position
+    #[command(name = "cursor-position", alias = "cursor_position")]
+    CursorPosition,
+
     /// Local agent-cursor helper. This is not a network service.
     Overlay {
         #[command(subcommand)]
@@ -1044,6 +1072,12 @@ fn run() -> u8 {
             emit(&response, cli.pretty);
             code
         }
+        (Some(CliCommand::Batch { json }), _) => {
+            let response = handle_request_line_opts(json, line_options(&cli));
+            let code = u8::from(!response.ok);
+            emit(&response, cli.pretty);
+            code
+        }
         // `--display virtual` prepares an environment instead of dispatching an
         // action, so it is answered before the normal command routing. On a
         // platform without a supported recipe this is `unsupported`.
@@ -1106,7 +1140,8 @@ fn run() -> u8 {
                 full: cli.full,
                 session: cli.session.clone(),
                 require_visible: cli.require_visible,
-                return_state: cli.state,
+                return_state: cli.state || cli.state_diff,
+                state_diff: cli.state_diff,
                 include_screenshot: cli.include_screenshot,
                 coord: cli.coord.clone(),
                 policy: cli.policy.as_ref().map(|path| path.display().to_string()),
@@ -1384,6 +1419,7 @@ fn command_action(
             x11: *x11,
         },
         CliCommand::Tree => Action::Tree,
+        CliCommand::CursorPosition => Action::CursorPosition,
         CliCommand::Ocr { force } => Action::Ocr { force: *force },
         CliCommand::Menu { command } => match command {
             MenuCommand::List { app, depth } => {
@@ -1439,10 +1475,10 @@ fn command_action(
                 ttl_secs: Some(*ttl),
             },
         },
-        CliCommand::Serve | CliCommand::Exec { .. } | CliCommand::Overlay { .. } => {
+        CliCommand::Serve | CliCommand::Exec { .. } | CliCommand::Batch { .. } | CliCommand::Overlay { .. } => {
             return Err(Response::failure(
                 "invalid_arguments",
-                "internal error: serve, exec, and overlay are not desktop actions",
+                "internal error: serve, exec, batch, and overlay are not desktop actions",
             ))
         }
     };

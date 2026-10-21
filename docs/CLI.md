@@ -1,6 +1,6 @@
 # CLI reference
 
-Every command, flag, JSON action, and error code that the 0.2.0 binary accepts. The source of truth is the help output (`--help` on the binary) and the `Action`, `ComputerError`, and `CallContext` types in `src/protocol.rs` / `src/error.rs`. This document regenerates from `cargo build && ./target/debug/computer-use --help` and the protocol enums.
+Every command, flag, JSON action, and error code that the 0.3.0 binary accepts. The source of truth is the help output (`--help` on the binary) and the `Action`, `ComputerError`, and `CallContext` types in `src/protocol.rs` / `src/error.rs`. This document regenerates from `cargo build && ./target/debug/computer-use --help` and the protocol enums.
 
 If you find a divergence between this file and the binary, the binary is right. The test `tests/cli_doc_matches_help.rs` (added in P15) parses this Markdown and asserts that every JSON `action` name and every CLI subcommand listed here is reachable on a fresh build.
 
@@ -9,6 +9,37 @@ If you find a divergence between this file and the binary, the binary is right. 
 - Logical coordinates everywhere on the CLI and in JSON. Image-pixel coordinates are accepted when `coord: "image"` or `--coord image`.
 - One JSON object on stdout for every action. `--pretty` pretty-prints a one-shot; `serve` and `--json` stay one object per line.
 - `--help` and `--version` exit 0 and are human-readable. Other commands exit 0 on success and 1 on `{"ok":false,...}`. Bad CLI flags exit 2 and still print JSON.
+
+## Post-action state
+
+A mutating action with `--state` returns a `state` block beside the action result:
+
+```json
+{
+  "ok": true,
+  "action": "press",
+  "state": {
+    "app": "com.apple.Notes",
+    "pid": 812,
+    "window_id": 44,
+    "revision": 18114448678970534631,
+    "tree": "[0] AXWindow ...",
+    "diff": "~ [9] AXTextField value: \"old\" -> \"new\"",
+    "truncated": false,
+    "baseline": "existing"
+  }
+}
+```
+
+`state.tree` is the whole numbered tree and `state.diff` is the delta against the previous observation. On a busy window the tree runs to tens of kilobytes while the delta is a few lines, so an agent that drives a loop should ask for the delta only:
+
+```
+computer-use press --app Notes --element 12 --state-diff
+```
+
+`--state-diff` implies `--state` and omits `state.tree`. The block keeps `app`, `pid`, `window_id`, `revision`, `diff`, `truncated`, and `baseline`.
+
+A read-only action never attaches a state block. A failed action never attaches one either. When the action succeeded but the tree snapshot failed, the block is present with null fields and a `warnings` entry names the failure.
 
 ## Global flags
 
@@ -23,9 +54,10 @@ These flags apply to every subcommand. The JSON equivalents are sibling keys of 
 | `--element <N>` | `element` | none | Index from the latest `tree` for this app and window. |
 | `--require-visible` | `require_visible` | false | Fail when the element is outside the window and scroll-into-view cannot run. |
 | `--diff` | `diff` | true once a baseline exists | Print a diff against the cached tree. |
-| `--full` | `full` | off | Print the full tree and replace the cached baseline. |
+| `--full` | `full` | off | Print the full tree. The baseline is always the most recent observation. |
 | `--session <ID>` | `session` | process id | Cache namespace. |
 | `--state` | `return_state` | false | Attach the post-action accessibility tree. |
+| `--state-diff` | `state_diff` | false | Attach only the post-action delta. Implies `--state`. Omits `state.tree` and keeps `state.diff`. |
 | `--screenshot` | `include_screenshot` | false | With `--state`, also attach a window image. |
 | `--coord <screen\|image>` | `coord` | `screen` on the CLI, `image` inside adapters | Coordinate space for `x`/`y`. |
 | `--adapter <native\|openai\|anthropic>` | `adapter` | `native` | Schema translator for `exec`, `serve`, and `--json`. |
@@ -105,6 +137,8 @@ spaces              Group on-screen windows by the screen that contains each win
 session             Session cache and accessibility teardown
 serve               Read newline-delimited JSON actions from stdin and write one JSON response per line
 exec                Run one JSON action from an argument
+batch               Run a batch of JSON actions from an argument
+cursor-position     Print the pointer position
 overlay             Local agent-cursor helper. This is not a network service
 browser             Chrome DevTools Protocol (CDP) subcommands. Requires `--cdp` and a binary built with `--features cdp`
 help                Print this message or the help of the given subcommand(s)
@@ -430,7 +464,18 @@ Commands:
   check   Report allow or deny for `--app`.
 ```
 
-`policy check` returns `{ok: true, decision: "allow" | "deny", source: "builtin" | "admin" | "user" | "default", code: "ok" | "policy_denied", ...}` without performing an action.
+`policy check` returns `{ok: true, decision: "allow" | "deny", source: "builtin" | "admin" | "user" | "default", code: "ok" | "policy_denied", ...}` without performing an action. Branch on `decision`; `code` repeats it as a machine-readable token.
+
+A user policy file may exempt a specific built-in deny entry with a `[builtin_deny]` section. The admin file cannot set it.
+
+```toml
+version = 1
+
+[builtin_deny]
+exempt = ["app.crynta.terax"]
+```
+
+An exemption matches a bundle id, an executable name, or a `.app` bundle name, and covers the whole app.
 
 ### `pause`
 
@@ -456,7 +501,7 @@ Options:
       --open-settings      Open System Settings to the first missing permission pane (macOS only).
 ```
 
-`doctor` returns `{ok: true, permissions_ok: bool, missing: [...], fix: [...], identity: {...}, ...}`. Envelope `ok: true` means the report was produced, so the process exits 0 even when a permission is missing.
+`doctor` returns `{ok: true, permissions_ok: bool, missing: [...], fix: [...], fixes: [...], identity: {...}, ...}`. Envelope `ok: true` means the report was produced, so the process exits 0 even when a permission is missing. `fix` is an array parallel to `missing` — index `i` of `fix` describes `missing[i]` — and `fixes` carries the same entries as one-line strings.
 
 ### `tree`
 
@@ -465,6 +510,10 @@ usage: computer-use tree [OPTIONS]
 ```
 
 Prints the numbered accessibility tree for the key window (one line per node, `[n] ROLE "title" @x,y wxh value=... actions=...`). Truncation caps: 40 children (`… +N`), depth 12, 400 lines, then `truncated=true`.
+
+The response carries `baseline: "created" | "existing"`. `created` means this observation had no previous tree to compare against and the printed text is the whole tree; `existing` means the printed text is the delta against the previous observation.
+
+A diff line starts with `+` for an added node, `-` for a removed one, and `~` for a changed value (`~ [9] AXTextField value: "old" -> "new"`).
 
 ### `ocr`
 
@@ -562,6 +611,24 @@ usage: computer-use exec [OPTIONS] <JSON>
 
 Runs one JSON action from an argument. Honors `--pretty`. `--adapter` translates OpenAI/Anthropic shapes before dispatch.
 
+### `batch`
+
+```
+usage: computer-use batch [OPTIONS] <JSON>
+```
+
+Runs a batch of JSON actions from an argument. The argument is a JSON object whose `action` field is `batch` and whose `actions` array holds the steps. Every step shares one target and one cache revision sequence, so element indices are re-validated between steps. A nested `batch` is rejected with `invalid_arguments`.
+
+A step's own `return_state` and `state_diff` are ignored: the batch attaches one post-state at the end, shaped by the top-level flags.
+
+### `cursor-position`
+
+```
+usage: computer-use cursor-position [OPTIONS]
+```
+
+Prints the pointer position. Alias: `cursor_position`. The same action is available in JSON as `cursor_position`.
+
 ### `overlay`
 
 ```
@@ -629,7 +696,7 @@ The protocol is `src/protocol.rs::Action`. The tag is `action`; the rename rule 
 | `perform_action` | `name` | |
 | `scroll_to` | none | Aliases: `scroll-to`, `scroll_to_visible`, `scroll-to-visible`. |
 | `get_state` | none | Alias: `get-state`. |
-| `cursor_position` | none | |
+| `cursor_position` | none | Also reachable as the CLI command `cursor-position`. |
 | `wait` | `ms`, `seconds` | |
 | `displays` | none | |
 | `isolation` | none | |
@@ -653,7 +720,7 @@ The protocol is `src/protocol.rs::Action`. The tag is `action`; the rename rule 
 | `dock_list` | none | Aliases: `dock-list`, `dock_list`. |
 | `dock_click` | `title` | Aliases: `dock-click`, `dock_click`. |
 | `spaces` | none | |
-| `batch` | `actions` (array of native actions), `stop_on_error` | Nested batch is `invalid_arguments`. |
+| `batch` | `actions` (array of native actions), `stop_on_error` | Nested batch is `invalid_arguments`. Also reachable as the CLI command `batch`. |
 | `browser_tabs` | none | `cdp` feature. |
 | `browser_activate` | `target_id` | `cdp` feature. |
 | `browser_navigate` | `url`, `target_id` | `cdp` feature. |
