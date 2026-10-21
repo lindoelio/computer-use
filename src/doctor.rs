@@ -902,11 +902,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn a_symlinked_helper_is_still_the_helper() {
         // The install layout points the install directory at the executable
         // inside the bundle. Resolving the link has to keep the bundle
         // recognizable, or the doctor recommends a layout that fails its own
-        // check.
+        // check. The helper bundle is a macOS concept, and the marker the
+        // check looks for is a path separator macOS uses.
         let dir = std::env::temp_dir().join(format!(
             "computer-use-bundle-{}-{}",
             std::process::id(),
@@ -921,10 +923,7 @@ mod tests {
         let real = bundle.join("computer-use");
         std::fs::write(&real, b"#!/bin/sh\n").expect("the helper is writable");
         let link = dir.join("computer-use");
-        #[cfg(unix)]
         std::os::unix::fs::symlink(&real, &link).expect("the symlink is creatable");
-        #[cfg(windows)]
-        std::fs::copy(&real, &link).expect("the copy is writable");
 
         let resolved = std::fs::canonicalize(&link).unwrap_or(link.clone());
         assert!(
