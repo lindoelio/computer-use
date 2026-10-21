@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows [Semantic Versioning](https://semver.org/).
 
+## [0.3.1] - 2026-10-20
+
+### Fixed
+
+- The doctor no longer reports a symlinked helper as a bare binary. `current_exe` on macOS returns the path as it was invoked, and the install layout points `~/.local/bin/computer-use` at the executable inside `Computer Use.app`. The path is now resolved through symlinks, so the binary inside the bundle is recognized as the helper and the doctor stops recommending a layout that failed its own check.
+
 ## [0.3.0] - 2026-10-20
 
 ### Added

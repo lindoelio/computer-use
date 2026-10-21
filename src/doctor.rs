@@ -402,10 +402,16 @@ pub fn parse_token_lines(text: &str) -> (Option<bool>, Option<String>) {
 }
 
 /// Path of this executable, when the OS will say.
+///
+/// The path is resolved through symlinks. The install layout points
+/// `~/.local/bin/computer-use` at the executable inside the app bundle, and
+/// on macOS `current_exe` reports the path as it was invoked. Without the
+/// resolution the binary inside the bundle would look like a bare binary,
+/// and the recommendation the doctor gives would not satisfy its own check.
 pub fn current_executable() -> Option<String> {
-    std::env::current_exe()
-        .ok()
-        .map(|path| path.to_string_lossy().into_owned())
+    let path = std::env::current_exe().ok()?;
+    let resolved = std::fs::canonicalize(&path).unwrap_or(path);
+    Some(resolved.to_string_lossy().into_owned())
 }
 
 /// Fix for one permission id. Unknown ids use the Privacy & Security root.
@@ -893,6 +899,40 @@ mod tests {
             None
         ));
         assert!(!is_helper_bundle(Some("/tmp/computer-use"), None, None));
+    }
+
+    #[test]
+    fn a_symlinked_helper_is_still_the_helper() {
+        // The install layout points the install directory at the executable
+        // inside the bundle. Resolving the link has to keep the bundle
+        // recognizable, or the doctor recommends a layout that fails its own
+        // check.
+        let dir = std::env::temp_dir().join(format!(
+            "computer-use-bundle-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let bundle = dir.join("Computer Use.app/Contents/MacOS");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&bundle).expect("the bundle directory is creatable");
+        let real = bundle.join("computer-use");
+        std::fs::write(&real, b"#!/bin/sh\n").expect("the helper is writable");
+        let link = dir.join("computer-use");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).expect("the symlink is creatable");
+        #[cfg(windows)]
+        std::fs::copy(&real, &link).expect("the copy is writable");
+
+        let resolved = std::fs::canonicalize(&link).unwrap_or(link.clone());
+        assert!(
+            is_helper_bundle(Some(&resolved.to_string_lossy()), None, None),
+            "{resolved:?} should be recognized as the helper bundle"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
