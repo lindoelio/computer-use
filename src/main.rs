@@ -1475,7 +1475,10 @@ fn command_action(
                 ttl_secs: Some(*ttl),
             },
         },
-        CliCommand::Serve | CliCommand::Exec { .. } | CliCommand::Batch { .. } | CliCommand::Overlay { .. } => {
+        CliCommand::Serve
+        | CliCommand::Exec { .. }
+        | CliCommand::Batch { .. }
+        | CliCommand::Overlay { .. } => {
             return Err(Response::failure(
                 "invalid_arguments",
                 "internal error: serve, exec, batch, and overlay are not desktop actions",

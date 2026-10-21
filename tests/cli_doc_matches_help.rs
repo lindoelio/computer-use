@@ -381,7 +381,8 @@ fn version_matches_the_manifest() {
         .expect("run computer-use --version");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let manifest = fs::read_to_string(repo_root().join("Cargo.toml")).expect("Cargo.toml is readable");
+    let manifest =
+        fs::read_to_string(repo_root().join("Cargo.toml")).expect("Cargo.toml is readable");
     let version = manifest
         .lines()
         .find_map(|line| line.strip_prefix("version = \""))

@@ -972,7 +972,8 @@ fn merge_file(
             if let Some(builtin) = parsed.builtin_deny.as_ref() {
                 for entry in &builtin.exempt {
                     let entry = entry.trim();
-                    if !entry.is_empty() && !policy.builtin_exempt.iter().any(|item| item == entry) {
+                    if !entry.is_empty() && !policy.builtin_exempt.iter().any(|item| item == entry)
+                    {
                         policy.builtin_exempt.push(entry.to_string());
                     }
                 }
