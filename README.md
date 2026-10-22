@@ -48,6 +48,8 @@ cargo install computer-use
 
 Rust 1.91 is the supported minimum. On Linux, install the native libraries listed under [Permissions](#permissions) before building.
 
+The default build carries no optional feature. On Linux, `cargo install computer-use --features portal` gives the same capability as the release binary: per-window capture and event-tier input on a Wayland session.
+
 ## Usage
 
 Every action writes one JSON object to stdout and a trailing newline. A failed action exits with status 1 and a `{"ok":false,"error":{...}}` body. A bad command line (missing flags, unknown arguments) exits with status 2 and still prints JSON. `--help` and `--version` stay human-readable and exit 0.
@@ -84,7 +86,7 @@ computer-use --pretty exec '{"id":"a","action":"displays"}'
 | --- | --- | --- |
 | (default) | Screenshots, mouse, keyboard, accessibility tree, OCR, isolation, the macOS helper `.app` plumbing. | always |
 | `cdp` | `chromiumoxide` 0.9.1 + a small `tokio`. Required for `computer-use --cdp browser ...`. | off |
-| `portal` | `ashpd` 0.13.13 ScreenCast + RemoteDesktop, `pipewire` 0.9, `reis` 0.7. Linux only. | on in the Linux release binary; off in the default CI build |
+| `portal` | `ashpd` 0.13.13 ScreenCast + RemoteDesktop, `pipewire` 0.9, `reis` 0.7. Linux only. | on in the Linux release binary; off unless you ask for it |
 | `skylight` | macOS private SkyLight focus path behind `--tier synthetic` / `--synthetic-focus`. | off |
 | `virtual-display` | macOS private `CGVirtualDisplayDescriptor` probe; probe-only, never creates a display. | off |
 
@@ -347,7 +349,7 @@ cargo test --all-targets
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-Tests do not move the pointer, capture the screen, or require Screen Recording or Accessibility. macOS-only tests behind `#[cfg(target_os = "macos")]` are skipped on Linux and Windows runners. The CI matrix is Ubuntu (default + `--features portal`), macOS (default, with `bash -n`/`shellcheck` on `scripts/package-macos-app.sh` and an ad-hoc bundle check on the debug binary), and Windows (default).
+Tests do not move the pointer, capture the screen, or require Screen Recording or Accessibility. macOS-only tests behind `#[cfg(target_os = "macos")]` are skipped on Linux and Windows runners. The CI matrix is Ubuntu, macOS, and Windows, and every one of them checks that the default feature set compiles and that the `--all-features` build passes clippy and the tests. Ubuntu additionally checks the `--features portal` build, which links PipeWire and never contacts a portal daemon.
 
 `~/.grok-prompts/linux-check.sh` runs the same checks inside `rust:1-bookworm` when Docker is available; otherwise CI is the gate.
 

@@ -43,7 +43,7 @@ Raise `package.rust-version` from `1.81` to `1.91` in P1. The local toolchain is
 
 Do not pin `ashpd` below 0.13.6. Releases 0.13.0 through 0.13.5 advertise an MSRV of 1.92.
 
-Versions below were the crates.io maxima checked on 2026-10-18. Re-check once at the start of the phase that adds the crate. If a patch release breaks the API, stay on the version named here.
+Versions below were the crates.io maxima checked on 2026-10-18. Re-check them before a release that changes one of these dependencies. If a patch release breaks the API, stay on the version named here.
 
 | Crate | Version | Phase | Role |
 | --- | --- | --- | --- |
