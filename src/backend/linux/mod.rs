@@ -314,6 +314,9 @@ enum EventRoute {
     /// Plain X11: XTest.
     X11Test,
     /// Wayland with `portal` compiled in: the RemoteDesktop portal.
+    // Only the portal build constructs this arm; the variant stays so the
+    // model is the same three states in either build.
+    #[cfg_attr(not(feature = "portal"), allow(dead_code))]
     Portal,
     /// Wayland without `portal`: nothing can do this.
     // Only the non-portal build constructs this arm; the variant stays so the
@@ -388,7 +391,6 @@ fn perform_activate_tier(
 fn perform_event_tier(job: &InputJob) -> Result<InputReport, ComputerError> {
     match event_route() {
         EventRoute::X11Test => x11_event_tier(job),
-        #[cfg(feature = "portal")]
         EventRoute::Portal => portal::perform_event_tier(job),
         EventRoute::Unsupported => Err(unsupported(
             "tier event on Wayland needs the `portal` feature; this build does not have it",

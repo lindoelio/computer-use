@@ -39,6 +39,11 @@
 //! See `docs/ROADMAP.md` P13 for the design this implements.
 
 #![cfg(target_os = "linux")]
+// The portal path is compiled out of a default build, but these helpers stay
+// so their unit tests run on any Linux host without PipeWire or a portal
+// daemon. That leaves them unused in the library build, and the warning is
+// silenced for that combination only.
+#![cfg_attr(not(feature = "portal"), allow(dead_code))]
 
 use crate::backend::WindowTarget;
 use crate::error::ComputerError;
@@ -882,6 +887,23 @@ pub(crate) fn perform_event_tier(
     }
 
     crate::backend::linux::runtime::block_on(run_remote_desktop(job.kind.clone()))?
+}
+
+/// The `event` tier in a build without the `portal` feature.
+///
+/// A Wayland session never reaches this route: `event_route` reports
+/// `EventRoute::Unsupported` there, and the caller answers that with the same
+/// refusal. This stub exists so the match over `EventRoute` stays exhaustive
+/// in both builds — the variant is part of the model in either one.
+#[cfg(not(feature = "portal"))]
+pub(crate) fn perform_event_tier(
+    _job: &crate::tier::InputJob,
+) -> Result<crate::tier::InputReport, ComputerError> {
+    Err(ComputerError::Unsupported(
+        "this build does not have the `portal` feature, so the XDG RemoteDesktop portal cannot \
+         post events"
+            .into(),
+    ))
 }
 
 #[cfg(feature = "portal")]

@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows [Semantic Versioning](https://semver.org/).
 
+## [0.3.2] - 2026-10-21
+
+### Fixed
+
+- The crate compiles on Linux with the default feature set. The `event` tier matched on `EventRoute::Portal` behind `#[cfg(feature = "portal")]`, but the variant itself is part of the model in every build, so a default build on Linux stopped at a non-exhaustive match. `cargo install computer-use` on Linux failed for the same reason. The branch now exists in both builds: the no-feature build answers with the same refusal the Wayland path already gave.
+- A default build on Linux no longer warns about fifteen unused portal helpers. They stay in the crate so their unit tests run without PipeWire, and the warning is silenced for that combination only.
+
+### Changed
+
+- CI checks that the default feature set compiles on every platform and runs its tests on Linux. An `--all-features` build alone cannot catch a branch that only the default build takes, and the published crate is built with the default features.
+
 ## [0.3.1] - 2026-10-20
 
 ### Fixed

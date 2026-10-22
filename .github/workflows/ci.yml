@@ -56,6 +56,17 @@ jobs:
         # PipeWire and never contacts a portal daemon.
         if: matrix.os == 'ubuntu-latest'
         run: cargo check --features portal --all-targets
+      - name: Check the default feature set builds
+        # The published crate is built with the default features, so that set
+        # has to compile on every platform. An `--all-features` build cannot
+        # catch a branch that only the default build takes.
+        run: cargo check --all-targets
+      - name: Test the default feature set
+        # The portal helpers are compiled out here, and their unit tests are
+        # written to run without PipeWire or a portal daemon. On Linux the
+        # default build is the one that differs from the tested build.
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test --all-targets
       - name: Test
         run: cargo test --all-targets --all-features
       - name: Package ad-hoc Computer Use.app
