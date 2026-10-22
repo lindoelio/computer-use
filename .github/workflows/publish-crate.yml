@@ -11,9 +11,10 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Tag to publish. Its Cargo.toml version is the one that ships."
-        required: true
-        default: "v0.3.1"
+        description: >-
+          Tag to publish. Leave it empty to publish the ref the dispatch was
+          made from. The tag has to carry the Cargo.toml version.
+        required: false
 
 permissions:
   contents: read
