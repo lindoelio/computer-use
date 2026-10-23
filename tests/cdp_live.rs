@@ -3,8 +3,9 @@
 //! The suite starts one headless browser for the file and one in-process HTTP
 //! server, then runs the compiled binary against them. It is skipped when no
 //! Chromium executable can be found, so `cargo test` stays green on a machine
-//! without a browser. CI sets `CHROME_BIN` (or installs Chrome) and therefore
-//! always runs it.
+//! without a browser. CI sets `CHROME_BIN` (or installs Chrome) and sets
+//! `COMPUTER_USE_REQUIRE_LIVE=1`, which turns the skip into a failure: that job
+//! is supposed to exercise a real browser.
 
 #![cfg(feature = "cdp")]
 
@@ -85,6 +86,32 @@ fn chrome_binary() -> Option<PathBuf> {
         .iter()
         .map(PathBuf::from)
         .find(|path| path.exists())
+}
+
+/// Chromium, or `None` when this host has none and the suite may skip.
+///
+/// `COMPUTER_USE_REQUIRE_LIVE=1` (set by the `cdp-live` CI job, which installs
+/// Chrome) turns the skip into a failure: a job that is supposed to exercise a
+/// real browser must not pass while running nothing.
+fn chrome_or_skip() -> Option<PathBuf> {
+    let found = chrome_binary();
+    if found.is_none() && std::env::var("COMPUTER_USE_REQUIRE_LIVE").ok().as_deref() == Some("1") {
+        panic!("COMPUTER_USE_REQUIRE_LIVE=1 but no Chromium binary was found");
+    }
+    found
+}
+
+/// Skip the test when the host cannot run it.
+///
+/// Prints why, so a skipped run is visible in the log instead of looking like
+/// a pass with no output.
+macro_rules! skip_without_chrome {
+    () => {
+        if chrome_or_skip().is_none() {
+            eprintln!("skipping live CDP test: no Chromium binary found");
+            return;
+        }
+    };
 }
 
 fn start_browser() -> Option<Browser> {
@@ -212,10 +239,7 @@ fn base_url() -> String {
 
 #[test]
 fn tabs_contract_uses_kind() {
-    if chrome_binary().is_none() {
-        eprintln!("skipping live CDP test: no Chromium binary found");
-        return;
-    }
+    skip_without_chrome!();
     let fixture = fixture();
     let _guard = fixture.lock.lock().expect("test lock");
     let response = run_cdp(&["browser", "tabs"]);
@@ -230,10 +254,7 @@ fn tabs_contract_uses_kind() {
 
 #[test]
 fn navigate_snapshot_and_click_by_ref() {
-    if chrome_binary().is_none() {
-        eprintln!("skipping live CDP test: no Chromium binary found");
-        return;
-    }
+    skip_without_chrome!();
     let fixture = fixture();
     let _guard = fixture.lock.lock().expect("test lock");
     let url = base_url();
@@ -292,10 +313,7 @@ fn navigate_snapshot_and_click_by_ref() {
 
 #[test]
 fn type_and_secure_field_refusal() {
-    if chrome_binary().is_none() {
-        eprintln!("skipping live CDP test: no Chromium binary found");
-        return;
-    }
+    skip_without_chrome!();
     let fixture = fixture();
     let _guard = fixture.lock.lock().expect("test lock");
     let url = base_url();
@@ -353,10 +371,7 @@ fn type_and_secure_field_refusal() {
 
 #[test]
 fn browser_batch_runs_steps_in_one_call() {
-    if chrome_binary().is_none() {
-        eprintln!("skipping live CDP test: no Chromium binary found");
-        return;
-    }
+    skip_without_chrome!();
     let fixture = fixture();
     let _guard = fixture.lock.lock().expect("test lock");
     let url = base_url();
@@ -375,10 +390,7 @@ fn browser_batch_runs_steps_in_one_call() {
 
 #[test]
 fn agent_marker_is_visible() {
-    if chrome_binary().is_none() {
-        eprintln!("skipping live CDP test: no Chromium binary found");
-        return;
-    }
+    skip_without_chrome!();
     let fixture = fixture();
     let _guard = fixture.lock.lock().expect("test lock");
     let url = base_url();
@@ -412,10 +424,7 @@ fn agent_marker_is_visible() {
 
 #[test]
 fn blocked_url_is_refused_before_connecting() {
-    if chrome_binary().is_none() {
-        eprintln!("skipping live CDP test: no Chromium binary found");
-        return;
-    }
+    skip_without_chrome!();
     let fixture = fixture();
     let _guard = fixture.lock.lock().expect("test lock");
     let policy = fixture.cache.join("live-policy.toml");

@@ -8,12 +8,17 @@
 //! ```
 //! use computer_use::{dispatch, Action};
 //!
-//! let response = dispatch(Action::Wait {
-//!     ms: Some(0),
-//!     seconds: None,
-//! });
+//! let response = dispatch(Action::wait_sleep(Some(0), None));
 //! assert!(response.ok);
 //! assert_eq!(response.to_value()["waited_ms"].as_u64(), Some(0));
+//!
+//! // JSON requests take the same path.
+//! let request = computer_use::parse_request(serde_json::json!({
+//!     "action": "wait",
+//!     "ms": 0
+//! }))
+//! .unwrap();
+//! assert!(dispatch(request.action).ok);
 //! ```
 
 #![deny(unsafe_code)]

@@ -45,6 +45,10 @@ jobs:
         shell: bash
         run: echo "CHROME_BIN=${{ steps.chrome.outputs.chrome-path }}" >> "$GITHUB_ENV"
       - name: Live CDP tests
+        env:
+          # This job installs Chrome, so a missing browser must fail the build
+          # instead of silently skipping every live test.
+          COMPUTER_USE_REQUIRE_LIVE: "1"
         run: cargo test --features cdp --test cdp_live -- --test-threads=1
 
   test:
@@ -131,6 +135,10 @@ jobs:
           rm -f cov-fixture.json
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Doc tests
+        # `cargo test --all-targets` does not run doctests, so the crate-root
+        # example can rot without this step.
+        run: cargo test --doc --all-features
       - name: Check the portal feature builds
         # `--all-features` only builds `portal` on Linux (the deps are
         # Linux-gated), so this is the explicit P13b compile gate. It links
@@ -216,6 +224,10 @@ jobs:
         run: echo "CHROME_BIN=${{ steps.chrome.outputs.chrome-path }}" >> "$GITHUB_ENV"
       - name: Measure line coverage
         shell: bash
+        env:
+          # Chrome is installed above; a missing browser would silently drop
+          # the live-CDP lines from the measurement.
+          COMPUTER_USE_REQUIRE_LIVE: "1"
         run: cargo llvm-cov --all-targets --all-features --json --output-path cov.json
       - name: Enforce the floor
         if: matrix.enforce == '1'
