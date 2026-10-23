@@ -4651,7 +4651,7 @@ fn evaluate_condition(
                     .view_element(&tree_query(context), *index)?
                     .map(|view| view.subtree_text)
                     .unwrap_or_default(),
-                None => backend.tree(&tree_query(context))?.full_text,
+                None => backend.observe_tree(&tree_query(context))?.full_text,
             };
             let matched = wait::contains(&text, needle, *ignore_case);
             Ok((
@@ -4660,7 +4660,7 @@ fn evaluate_condition(
             ))
         }
         wait::Condition::TreeChange => {
-            let report = backend.tree(&tree_query(context))?;
+            let report = backend.observe_tree(&tree_query(context))?;
             let diff = report.diff.clone().unwrap_or_default();
             let matched = !diff.trim().is_empty();
             Ok((matched, json!({"diff": diff, "revision": report.revision})))
@@ -6358,6 +6358,85 @@ mod tests {
                 .contains("element state"),
             "{value:?}"
         );
+    }
+
+    #[test]
+    fn wait_text_observes_without_consuming_the_baseline() {
+        let backend = StubBackend::default();
+        backend
+            .tree_values
+            .lock()
+            .unwrap()
+            .extend(["idle".to_string(), "Ready".to_string()]);
+        let response = dispatch_with_context(
+            &backend,
+            wait_action_with(None, None, Some("Ready"), None, None),
+            &ctx("Notes"),
+        );
+        assert!(response.ok, "{:?}", response.to_value());
+        assert!(backend.tree_observations.load(Ordering::SeqCst) >= 1);
+        assert_eq!(
+            backend.tree_stores.load(Ordering::SeqCst),
+            0,
+            "a wait loop must not write the session baseline"
+        );
+    }
+
+    #[test]
+    fn tree_change_compares_against_the_caller_baseline() {
+        let backend = StubBackend::default();
+        let context = ctx("Notes");
+        *backend.stub_value.lock().unwrap() = "a".into();
+        let seed = backend.tree(&tree_query(&context)).unwrap();
+        assert!(
+            seed.diff.is_none(),
+            "the seed observation created a baseline"
+        );
+
+        *backend.stub_value.lock().unwrap() = "b".into();
+        let stores = backend.tree_stores.load(Ordering::SeqCst);
+        let response = dispatch_with_context(
+            &backend,
+            Action::Wait {
+                ms: None,
+                seconds: None,
+                element: None,
+                element_state: None,
+                text: None,
+                value: None,
+                within_element: None,
+                window_state: None,
+                tree_change: true,
+                app_running: None,
+                title: None,
+                ignore_case: false,
+                timeout_ms: Some(150),
+                poll_ms: Some(25),
+            },
+            &context,
+        );
+        assert!(response.ok, "{:?}", response.to_value());
+        assert_eq!(response.to_value()["condition"], "tree_change");
+        assert_eq!(
+            backend.tree_stores.load(Ordering::SeqCst),
+            stores,
+            "the wait must leave the caller's baseline in place"
+        );
+        assert!(backend.tree_observations.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn plain_tree_still_stores_the_baseline() {
+        let backend = StubBackend::default();
+        let context = ctx("Notes");
+        let first = dispatch_with_context(&backend, Action::Tree, &context);
+        assert!(first.ok, "{:?}", first.to_value());
+        assert_eq!(backend.tree_stores.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.tree_observations.load(Ordering::SeqCst), 0);
+
+        let second = dispatch_with_context(&backend, Action::Tree, &context);
+        assert!(second.ok, "{:?}", second.to_value());
+        assert_eq!(backend.tree_stores.load(Ordering::SeqCst), 2);
     }
 
     #[test]

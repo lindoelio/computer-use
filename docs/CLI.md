@@ -418,6 +418,8 @@ Exactly one condition is accepted:
 
 `--ignore-case` relaxes text, value, title, and app comparisons. Timeout is `timeout`.
 
+Element (`--element`) and value (`--value`) conditions need an accessibility backend: macOS and Windows implement them; Linux returns `unsupported` rather than guessing that an element is gone. `--text`, `--window-state`, `--tree-change`, `--app-running`, and `--title` work wherever `tree`, `list-windows`, and `list-apps` do.
+
 ### `verify`
 
 ```

@@ -271,6 +271,22 @@ pub trait DesktopBackend: Send + Sync {
         Err(unsupported("tree"))
     }
 
+    /// The same tree walk, without writing the session-cache baseline.
+    ///
+    /// `wait`/`verify` poll this so a condition loop does not consume the
+    /// caller's diff baseline. macOS overrides it; platforms whose `tree`
+    /// does not store share the default.
+    fn observe_tree(&self, query: &TreeQuery) -> Result<TreeReport, ComputerError> {
+        #[cfg(target_os = "macos")]
+        {
+            macos::observe_tree(query)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.tree(query)
+        }
+    }
+
     /// Restore accessibility flags recorded for `session`.
     ///
     /// The returned pids are the processes whose flags were written back.
@@ -393,12 +409,16 @@ pub trait DesktopBackend: Send + Sync {
         #[cfg(target_os = "linux")]
         {
             let _ = (query, index);
-            Ok(None)
+            Err(unsupported(
+                "element state conditions need macOS or Windows accessibility",
+            ))
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
         {
             let _ = (query, index);
-            Ok(None)
+            Err(unsupported(
+                "element state conditions need macOS or Windows accessibility",
+            ))
         }
     }
 
@@ -1023,5 +1043,22 @@ mod tests {
     fn create_desktop_backend_is_a_trait_object() {
         let backend = create_desktop_backend();
         let _backend: &dyn DesktopBackend = backend.as_ref();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_element_state_fails_closed() {
+        let backend = create_desktop_backend();
+        let query = TreeQuery {
+            app: None,
+            window: None,
+            full: false,
+            diff: false,
+            session: None,
+        };
+        let error = backend
+            .view_element(&query, 0)
+            .expect_err("Linux cannot observe an element");
+        assert_eq!(error.code(), "unsupported");
     }
 }

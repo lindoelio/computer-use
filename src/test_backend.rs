@@ -39,6 +39,10 @@ pub enum StubCaptureFault {
 pub struct StubBackend {
     pub clicks: AtomicU32,
     pub moves: AtomicU32,
+    /// `tree` calls that wrote a baseline.
+    pub tree_stores: AtomicU32,
+    /// `observe_tree` calls, which must not write one.
+    pub tree_observations: AtomicU32,
     pub scrolls: Mutex<Vec<(i32, i32)>>,
     pub typed: Mutex<Vec<String>>,
     pub keys: Mutex<Vec<(Vec<Modifier>, String)>>,
@@ -186,6 +190,8 @@ impl Default for StubBackend {
         Self {
             clicks: AtomicU32::new(0),
             moves: AtomicU32::new(0),
+            tree_stores: AtomicU32::new(0),
+            tree_observations: AtomicU32::new(0),
             scrolls: Mutex::new(Vec::new()),
             typed: Mutex::new(Vec::new()),
             keys: Mutex::new(Vec::new()),
@@ -586,69 +592,13 @@ impl DesktopBackend for StubBackend {
     }
 
     fn tree(&self, query: &TreeQuery) -> Result<TreeReport, ComputerError> {
-        self.accessibility_apps
-            .lock()
-            .expect("accessibility apps")
-            .push(query.app.clone());
-        if self.fail_accessibility {
-            return Err(ComputerError::Unsupported(
-                "accessibility is unavailable".into(),
-            ));
-        }
-        let (info, window_id, title, _) = self.resolve_tree_target(query)?;
-        let pid = info.pid;
-        let value = {
-            let mut queue = self.tree_values.lock().expect("tree values");
-            if queue.len() > 1 {
-                queue.pop_front().unwrap_or_default()
-            } else {
-                queue
-                    .front()
-                    .cloned()
-                    .unwrap_or_else(|| self.stub_value.lock().expect("stub value").clone())
-            }
-        };
-        let mut window = UiNode::bare("AXWindow");
-        window.title = Some(title);
-        window.frame = Some(NodeFrame {
-            x: 0.0,
-            y: 0.0,
-            width: 800.0,
-            height: 600.0,
-        });
-        let mut text = UiNode::bare("AXTextArea");
-        text.value = Some(value);
-        window.children = vec![text];
-        let rendered = tree::render(&window);
-        let key = (query.session.clone().unwrap_or_default(), pid, window_id);
-        self.element_fixtures.lock().expect("fixtures").insert(
-            key.clone(),
-            ElementFixture {
-                ui: window.clone(),
-                revision_override: None,
-            },
-        );
-        let mut baselines = self.baselines.lock().expect("baselines");
-        let previous = baselines.get(&key).cloned();
-        let diff = previous
-            .as_ref()
-            .map(|previous| tree::diff_trees(previous, &rendered.root));
-        let printed = tree::choose_text(previous.as_ref(), &rendered, query.full);
-        baselines.insert(key, rendered.root.clone());
-        let app = info.bundle_id.clone().or_else(|| Some(info.name.clone()));
-        Ok(TreeReport {
-            pid,
-            window_id,
-            revision: tree::revision_of(&rendered.root),
-            source: "stub".into(),
-            truncated: rendered.truncated,
-            tree: printed,
-            full_text: rendered.text,
-            diff,
-            app,
-            note: None,
-            legacy: None,
-        })
+        self.tree_stores.fetch_add(1, Ordering::SeqCst);
+        self.build_stub_tree(query, true)
+    }
+
+    fn observe_tree(&self, query: &TreeQuery) -> Result<TreeReport, ComputerError> {
+        self.tree_observations.fetch_add(1, Ordering::SeqCst);
+        self.build_stub_tree(query, false)
     }
 
     fn end_session(&self, _session: Option<&str>) -> Result<Vec<i32>, ComputerError> {
@@ -1205,6 +1155,74 @@ impl DesktopBackend for StubBackend {
 }
 
 impl StubBackend {
+    fn build_stub_tree(&self, query: &TreeQuery, store: bool) -> Result<TreeReport, ComputerError> {
+        self.accessibility_apps
+            .lock()
+            .expect("accessibility apps")
+            .push(query.app.clone());
+        if self.fail_accessibility {
+            return Err(ComputerError::Unsupported(
+                "accessibility is unavailable".into(),
+            ));
+        }
+        let (info, window_id, title, _) = self.resolve_tree_target(query)?;
+        let pid = info.pid;
+        let value = {
+            let mut queue = self.tree_values.lock().expect("tree values");
+            if queue.len() > 1 {
+                queue.pop_front().unwrap_or_default()
+            } else {
+                queue
+                    .front()
+                    .cloned()
+                    .unwrap_or_else(|| self.stub_value.lock().expect("stub value").clone())
+            }
+        };
+        let mut window = UiNode::bare("AXWindow");
+        window.title = Some(title);
+        window.frame = Some(NodeFrame {
+            x: 0.0,
+            y: 0.0,
+            width: 800.0,
+            height: 600.0,
+        });
+        let mut text = UiNode::bare("AXTextArea");
+        text.value = Some(value);
+        window.children = vec![text];
+        let rendered = tree::render(&window);
+        let key = (query.session.clone().unwrap_or_default(), pid, window_id);
+        self.element_fixtures.lock().expect("fixtures").insert(
+            key.clone(),
+            ElementFixture {
+                ui: window.clone(),
+                revision_override: None,
+            },
+        );
+        let mut baselines = self.baselines.lock().expect("baselines");
+        let previous = baselines.get(&key).cloned();
+        let diff = previous
+            .as_ref()
+            .map(|previous| tree::diff_trees(previous, &rendered.root));
+        let printed = tree::choose_text(previous.as_ref(), &rendered, query.full);
+        if store {
+            baselines.insert(key, rendered.root.clone());
+        }
+        let app = info.bundle_id.clone().or_else(|| Some(info.name.clone()));
+        Ok(TreeReport {
+            pid,
+            window_id,
+            revision: tree::revision_of(&rendered.root),
+            source: "stub".into(),
+            truncated: rendered.truncated,
+            tree: printed,
+            full_text: rendered.text,
+            diff,
+            app,
+            note: None,
+            legacy: None,
+        })
+    }
+
     /// What the stub reports for one verified scroll.
     ///
     /// This models the macOS contract: the wheel event is posted, the scroll

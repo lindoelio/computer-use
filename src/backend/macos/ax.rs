@@ -158,6 +158,15 @@ pub(crate) fn tree(query: &TreeQuery) -> Result<TreeReport, ComputerError> {
     }
 }
 
+/// The `tree` walk without the session-cache write.
+pub(crate) fn observe_tree(query: &TreeQuery) -> Result<TreeReport, ComputerError> {
+    match build_observation(query) {
+        Ok(report) => Ok(report),
+        Err(WalkError::Failed { app, window_id }) => fallback_osascript(app.as_ref(), window_id),
+        Err(error) => Err(error.into_computer()),
+    }
+}
+
 /// Revalidate `request` against the session cache and perform it.
 ///
 /// The built-in deny list runs before any accessibility call on the target.
@@ -614,7 +623,15 @@ pub(crate) fn annotate_matches(windows: &mut [WindowInfo]) -> Option<String> {
 
 fn build_tree(query: &TreeQuery) -> Result<TreeReport, WalkError> {
     let live = read_live(query, false)?;
-    finish_report(query, &live)
+    finish_report(query, &live, true)
+}
+
+/// Walk the tree without touching the session baseline. The wait engine polls
+/// this so a `--text`/`--tree-change` loop neither consumes the caller's diff
+/// baseline nor makes `--tree-change` compare against its own previous poll.
+fn build_observation(query: &TreeQuery) -> Result<TreeReport, WalkError> {
+    let live = read_live(query, false)?;
+    finish_report(query, &live, false)
 }
 
 /// Walk the tree a second time and return just the root `UiNode` plus the
@@ -752,7 +769,11 @@ fn read_live(query: &TreeQuery, retain_nodes: bool) -> Result<LiveWindow, WalkEr
     })
 }
 
-fn finish_report(query: &TreeQuery, live: &LiveWindow) -> Result<TreeReport, WalkError> {
+fn finish_report(
+    query: &TreeQuery,
+    live: &LiveWindow,
+    store: bool,
+) -> Result<TreeReport, WalkError> {
     let app = &live.app;
     let window_id = live.window_id;
     let rendered = tree::render(&live.root);
@@ -786,16 +807,18 @@ fn finish_report(query: &TreeQuery, live: &LiveWindow) -> Result<TreeReport, Wal
         observed_revision: Some(revision),
     };
     let mut note = None;
-    if let Err(error) = cache::store(query.session.as_deref(), &snapshot) {
-        note = Some(format!("session cache was not written: {error}"));
-    }
-    for (pid, edit) in &live.edits {
-        if *pid == app.pid {
-            continue;
+    if store {
+        if let Err(error) = cache::store(query.session.as_deref(), &snapshot) {
+            note = Some(format!("session cache was not written: {error}"));
         }
-        snapshot.pid = *pid;
-        snapshot.electron = Some(edit.clone());
-        let _ = cache::store(query.session.as_deref(), &snapshot);
+        for (pid, edit) in &live.edits {
+            if *pid == app.pid {
+                continue;
+            }
+            snapshot.pid = *pid;
+            snapshot.electron = Some(edit.clone());
+            let _ = cache::store(query.session.as_deref(), &snapshot);
+        }
     }
     Ok(TreeReport {
         pid: app.pid,
