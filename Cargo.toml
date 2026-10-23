@@ -50,7 +50,7 @@ path = "src/main.rs"
 default = []
 # Crate dependencies are attached in the phase that uses them.
 # P1 declares the names so `--all-features` compiles on every OS.
-# P10/CDP v2: `cdp` pulls chromiumoxide and a minimal tokio for CDP attach
+# P10/CDP: `cdp` pulls chromiumoxide and a minimal tokio for CDP attach
 # and managed launch. Off in a default `cargo install`; the release binaries
 # are built with it.
 cdp = ["dep:chromiumoxide", "dep:tokio", "dep:futures"]
