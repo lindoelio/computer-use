@@ -2,7 +2,9 @@
   "target": 90.0,
   "threshold": 82.0,
   "per_file_threshold": 0,
+  "roots": ["src"],
   "notes": [
+    "Only files under roots count; target/ and dependencies never do.",
     "target is the goal for measurable code (scripts/coverage-gate.py prints the gap).",
     "threshold is the enforced regression floor; raise it as tests land, then set it to target.",
     "per_file_threshold is 0 (disabled) while the target is still being worked toward.",

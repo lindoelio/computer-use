@@ -18,13 +18,29 @@ failing, which is what the Linux and Windows jobs do for now.
 
 ## Policy
 
-`coverage-allowlist.json` holds three numbers and the exclusion list:
+`coverage-allowlist.json` holds the numbers, the measured roots, and the
+exclusion list:
 
 | Key | Meaning |
 | --- | --- |
+| `roots` | Paths that count. **`src/` only**: that is the codebase under test. |
 | `target` | The goal for measurable code, **90%**. The gate prints the gap. |
 | `threshold` | The enforced regression floor. Raise it as tests land, then make it equal to `target`. |
 | `per_file_threshold` | Per-file floor. `0` while the target is still being worked toward. |
+
+### Only the codebase counts
+
+`target/` is Cargo's build output (compiled artifacts, build-script and bindgen
+output, incremental state). It is git-ignored and never measured. The gate
+enforces this: a file is counted only when it resolves inside the repository
+**and** under `roots`; anything else is printed under `ignored` and left out of
+the total. There is no basename fallback, so a dependency or `target/` path
+cannot silently join the total. The repository has no `build.rs` and no
+generated source committed under `src/`.
+
+The current report contains 57 files, every one under `src/` — dependencies,
+test files, and build output are already absent from the `cargo llvm-cov`
+output, and the gate would ignore them anyway.
 
 An allowlist entry is excluded from both the per-file check and the total. Every
 entry names the runner (`os`) and a reason. The rule for admitting one: the code

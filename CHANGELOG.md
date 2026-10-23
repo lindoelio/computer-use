@@ -68,7 +68,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Tests
 
-- `scripts/coverage-gate.py` and `coverage-allowlist.json` gate line coverage from a `cargo llvm-cov --json` report; the new `coverage` CI job enforces a floor on macOS (82% today, 90% target, ~1,700 lines to go) and reports the number on Linux and Windows. `docs/COVERAGE.md` lists every exclusion with its reason.
+- `scripts/coverage-gate.py` and `coverage-allowlist.json` gate line coverage from a `cargo llvm-cov --json` report. Only the codebase under test counts (`roots: ["src"]`): Cargo's `target/` build output, dependencies, and any other generated path are ignored and printed, never folded into the total, and there is no basename fallback. The new `coverage` CI job enforces a floor on macOS (82% today, 90% target, ~1,700 lines to go) and reports the number on Linux and Windows, and a fixture step checks the ignore rule. `docs/COVERAGE.md` lists every exclusion with its reason.
 - `tests/cli.rs` sweeps the whole command surface with the cross-process pause marker set, so every mutating command is exercised — and refused — without posting input; a second sweep decodes every browser action through `exec`.
 - Unit tests cover the `DesktopBackend` trait defaults through a minimal backend, the policy `[security]`/`[audit]`/`[window]`/`[builtin_deny]` merge and error paths, the wait state parsers and condition descriptions, and the wait observation/snippet behavior.
 - `tests/ocr_live.rs` runs `ocr --image` through the compiled binary against a committed PNG fixture (macOS Vision, no TCC needed).

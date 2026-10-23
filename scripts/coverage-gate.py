@@ -4,10 +4,13 @@
     cargo llvm-cov --all-targets --all-features --json --output-path cov.json
     scripts/coverage-gate.py cov.json
 
-The allowlist (coverage-allowlist.json) lists files that cannot execute on a
-given runner, each with a reason. Allowlisted files are excluded from both the
-per-file check and the total, so the floor applies to measurable code only.
-Use `--mode report` to print the numbers without failing.
+Only the codebase under test counts: files under the configured roots
+(`src/` by default). Build output (`target/`), dependencies, and other
+generated or third-party paths are ignored and listed, never folded into the
+total. The allowlist (coverage-allowlist.json) lists files inside the roots
+that cannot execute on a given runner, each with a reason; they are excluded
+from both the per-file check and the total. Use `--mode report` to print the
+numbers without failing.
 """
 
 from __future__ import annotations
@@ -46,11 +49,16 @@ def allowlisted(config: dict, target_os: str) -> dict[str, str]:
     return out
 
 
-def repo_relative(filename: str, root: Path) -> str:
+def repo_relative(filename: str, root: Path) -> str | None:
+    """Workspace-relative path, or `None` for anything outside the workspace.
+
+    There is no basename fallback: a dependency or a build-output path must
+    never be folded into the total under a bare file name.
+    """
     try:
         return str(Path(filename).resolve().relative_to(root.resolve()))
     except ValueError:
-        return Path(filename).name
+        return None
 
 
 def main() -> int:
@@ -81,6 +89,7 @@ def main() -> int:
         else config.get("per_file_threshold", 90.0)
     )
     allowed = allowlisted(config, args.os)
+    roots = tuple(config.get("roots", ["src"]))
 
     data = json.loads(Path(args.report).read_text(encoding="utf-8"))
     exported = data["data"][0]
@@ -88,9 +97,16 @@ def main() -> int:
     total_count = 0
     total_covered = 0
     skipped = []
+    ignored = []
     for entry in exported["files"]:
         name = repo_relative(entry["filename"], root)
         lines = entry["summary"]["lines"]
+        if name is None:
+            ignored.append((entry["filename"], lines["count"], "outside the workspace"))
+            continue
+        if not name.startswith(tuple(f"{root_dir}/" for root_dir in roots)):
+            ignored.append((name, lines["count"], "outside the measured roots"))
+            continue
         if name in allowed:
             skipped.append((name, lines["percent"], lines["count"]))
             continue
@@ -132,6 +148,12 @@ def main() -> int:
         print(f"\nexcluded by {args.allowlist} for {args.os}: {len(skipped)} files")
         for name, file_percent, count in sorted(skipped):
             print(f"  {file_percent:6.1f}%  {count:<5d} lines  {name}")
+    if ignored:
+        print(
+            f"\nignored (not the codebase under test; only {', '.join(roots)}/ counts):"
+        )
+        for name, count, why in sorted(ignored, key=lambda item: item[0]):
+            print(f"  {count:<5d} lines  {name}  ({why})")
 
     if failures and args.mode == "enforce":
         print("\ncoverage gate failed:", file=sys.stderr)
