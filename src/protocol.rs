@@ -4435,89 +4435,85 @@ fn wait_args(action: &Action) -> WaitArgs<'_> {
     }
 }
 
-#[allow(unused_assignments)]
 fn wait_spec(
     action: &Action,
     default_timeout_ms: u64,
 ) -> Result<Option<wait::WaitSpec>, ComputerError> {
     let args = wait_args(action);
-    let mut conditions = 0usize;
-    let condition = if let Some(index) = args.element {
-        conditions += 1;
-        let state = match args.element_state {
-            Some(value) => wait::ElementState::parse(value)?,
-            None => wait::ElementState::Exists,
-        };
-        Some(wait::Condition::Element { index, state })
-    } else if args.value.is_some() {
+    if args.element_state.is_some() && args.element.is_none() {
         return Err(ComputerError::InvalidArguments(
-            "value requires --element".into(),
+            "element-state requires --element".into(),
         ));
-    } else if let Some(needle) = args.text {
-        conditions += 1;
-        Some(wait::Condition::Text {
+    }
+    if args.within_element.is_some() && args.text.is_none() {
+        return Err(ComputerError::InvalidArguments(
+            "within-element requires --text".into(),
+        ));
+    }
+    let mut conditions: Vec<wait::Condition> = Vec::new();
+    // `--value` names the element it reads, so it does not add a second
+    // element-state condition when both flags are present.
+    if args.value.is_none() {
+        if let Some(index) = args.element {
+            let state = match args.element_state {
+                Some(value) => wait::ElementState::parse(value)?,
+                None => wait::ElementState::Exists,
+            };
+            conditions.push(wait::Condition::Element { index, state });
+        }
+    }
+    if let Some(needle) = args.text {
+        conditions.push(wait::Condition::Text {
             needle: needle.to_string(),
             ignore_case: args.ignore_case,
             within_element: args.within_element,
-        })
-    } else if let Some(value) = args.window_state {
-        conditions += 1;
-        Some(wait::Condition::Window {
-            state: wait::WindowState::parse(value)?,
-            selector: None,
-        })
-    } else if args.tree_change {
-        conditions += 1;
-        Some(wait::Condition::TreeChange)
-    } else if let Some(name) = args.app_running {
-        conditions += 1;
-        Some(wait::Condition::AppRunning {
-            name: name.to_string(),
-            ignore_case: args.ignore_case,
-        })
-    } else if let Some(needle) = args.title {
-        conditions += 1;
-        Some(wait::Condition::Title {
-            needle: needle.to_string(),
-            ignore_case: args.ignore_case,
-        })
-    } else {
-        None
-    };
-    if args.value.is_some() {
+        });
+    }
+    if let Some(needle) = args.value {
         let index = args
             .element
             .ok_or_else(|| ComputerError::InvalidArguments("value requires --element".into()))?;
-        conditions += 1;
-        let condition = wait::Condition::Value {
+        conditions.push(wait::Condition::Value {
             index,
-            needle: args.value.unwrap_or_default().to_string(),
+            needle: needle.to_string(),
             ignore_case: args.ignore_case,
-        };
-        return Ok(Some(wait::WaitSpec::new(
-            condition,
+        });
+    }
+    if let Some(value) = args.window_state {
+        conditions.push(wait::Condition::Window {
+            state: wait::WindowState::parse(value)?,
+            selector: None,
+        });
+    }
+    if args.tree_change {
+        conditions.push(wait::Condition::TreeChange);
+    }
+    if let Some(name) = args.app_running {
+        conditions.push(wait::Condition::AppRunning {
+            name: name.to_string(),
+            ignore_case: args.ignore_case,
+        });
+    }
+    if let Some(needle) = args.title {
+        conditions.push(wait::Condition::Title {
+            needle: needle.to_string(),
+            ignore_case: args.ignore_case,
+        });
+    }
+    match conditions.len() {
+        0 if matches!(action, Action::Verify { .. }) => Err(ComputerError::InvalidArguments(
+            "verify needs a condition".into(),
+        )),
+        0 => Ok(None),
+        1 => Ok(Some(wait::WaitSpec::new(
+            conditions.pop().expect("one condition"),
             args.timeout_ms.unwrap_or(default_timeout_ms),
             args.poll_ms.unwrap_or(wait::DEFAULT_POLL_MS),
-        )?));
-    }
-    let Some(condition) = condition else {
-        if matches!(action, Action::Verify { .. }) {
-            return Err(ComputerError::InvalidArguments(
-                "verify needs a condition".into(),
-            ));
-        }
-        return Ok(None);
-    };
-    if conditions > 1 {
-        return Err(ComputerError::InvalidArguments(
+        )?)),
+        _ => Err(ComputerError::InvalidArguments(
             "wait and verify accept exactly one condition".into(),
-        ));
+        )),
     }
-    Ok(Some(wait::WaitSpec::new(
-        condition,
-        args.timeout_ms.unwrap_or(default_timeout_ms),
-        args.poll_ms.unwrap_or(wait::DEFAULT_POLL_MS),
-    )?))
 }
 
 #[allow(unused_assignments)]
@@ -5232,6 +5228,11 @@ fn window_move_action(
     y: Option<i32>,
     to_display: Option<u32>,
 ) -> Result<Value, ComputerError> {
+    if to_display.is_some() && (x.is_some() || y.is_some()) {
+        return Err(ComputerError::InvalidArguments(
+            "window move takes --to-display or --x/--y, not both".into(),
+        ));
+    }
     let current = require_window_row(backend, context)?;
     let (x, y) = match to_display {
         Some(id) => {
@@ -6167,6 +6168,91 @@ mod tests {
         }
     }
 
+    fn wait_action_with(
+        element: Option<u32>,
+        element_state: Option<&str>,
+        text: Option<&str>,
+        value: Option<&str>,
+        within_element: Option<u32>,
+    ) -> Action {
+        Action::Wait {
+            ms: None,
+            seconds: None,
+            element,
+            element_state: element_state.map(str::to_string),
+            text: text.map(str::to_string),
+            value: value.map(str::to_string),
+            within_element,
+            window_state: None,
+            tree_change: false,
+            app_running: None,
+            title: None,
+            ignore_case: false,
+            timeout_ms: Some(150),
+            poll_ms: Some(25),
+        }
+    }
+
+    #[test]
+    fn wait_rejects_conflicting_or_incomplete_conditions() {
+        let backend = StubBackend::default();
+        let two = dispatch_with_context(
+            &backend,
+            wait_action_with(Some(1), None, Some("hello"), None, None),
+            &ctx("Notes"),
+        );
+        assert_eq!(two.to_value()["error"]["code"], "invalid_arguments");
+
+        let value_without_element = dispatch_with_context(
+            &backend,
+            wait_action_with(None, None, None, Some("x"), None),
+            &ctx("Notes"),
+        );
+        assert_eq!(
+            value_without_element.to_value()["error"]["code"],
+            "invalid_arguments"
+        );
+
+        let state_without_element = dispatch_with_context(
+            &backend,
+            wait_action_with(None, Some("visible"), None, None, None),
+            &ctx("Notes"),
+        );
+        assert_eq!(
+            state_without_element.to_value()["error"]["code"],
+            "invalid_arguments"
+        );
+
+        let within_without_text = dispatch_with_context(
+            &backend,
+            wait_action_with(None, None, None, None, Some(2)),
+            &ctx("Notes"),
+        );
+        assert_eq!(
+            within_without_text.to_value()["error"]["code"],
+            "invalid_arguments"
+        );
+    }
+
+    #[test]
+    fn wait_value_reads_the_element_it_names() {
+        let backend = StubBackend::default();
+        backend
+            .element_views
+            .lock()
+            .unwrap()
+            .extend([None, Some(view("AXTextField"))]);
+        // `--element` provides the index; `--value` is the single condition,
+        // so the pair is accepted.
+        let response = dispatch_with_context(
+            &backend,
+            wait_action_with(Some(3), None, None, Some("ready"), None),
+            &ctx("Notes"),
+        );
+        assert!(response.ok, "{:?}", response.to_value());
+        assert_eq!(response.to_value()["condition"], "value");
+    }
+
     #[test]
     fn wait_text_returns_when_it_appears() {
         let backend = StubBackend::default();
@@ -6333,6 +6419,22 @@ mod tests {
         assert_eq!(calls.len(), 1, "{calls:?}");
         assert!(calls[0].contains("x=200"), "{}", calls[0]);
         assert!(calls[0].contains("y=150"), "{}", calls[0]);
+    }
+
+    #[test]
+    fn window_move_rejects_display_and_coordinates_together() {
+        let backend = StubBackend::default();
+        let response = dispatch_with_context(
+            &backend,
+            Action::WindowMove {
+                x: Some(10),
+                y: Some(20),
+                to_display: Some(1),
+            },
+            &ctx("Notes"),
+        );
+        assert_eq!(response.to_value()["error"]["code"], "invalid_arguments");
+        assert!(backend.window_calls.lock().unwrap().is_empty());
     }
 
     #[test]
