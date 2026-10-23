@@ -20,7 +20,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Actionability: `browser click` checks visibility and disabled state, scrolls into view, and `--force` bypasses the checks.
 - `--on-dialog accept|dismiss|fail` handles JavaScript dialogs opened by an action; `browser dialog` handles one explicitly over a raw CDP connection.
 - `browser batch` runs a JSON array of browser actions in one process, so a whole flow is one shell call and one permission prompt.
-- The visible agent marker: `--agent-overlay auto|on|off` injects a badge, a cursor ring that follows click/type/hover/scroll, and a 🤖 tab title prefix. `auto` is on for `browser launch` and off for an attach.
+- The visible agent marker: `--agent-overlay auto|on|off` injects a badge, a cursor ring that follows click/type/hover/scroll, a 🤖 tab title prefix, and a robot favicon. `auto` is on for `browser launch` and off for an attach.
 - New error code `timeout`.
 - The release binaries are built with `--features cdp`; `cargo install` keeps the optional `cdp` feature.
 

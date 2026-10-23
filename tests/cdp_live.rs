@@ -390,7 +390,7 @@ fn agent_marker_is_visible() {
         "browser",
         "eval",
         "--eval",
-        "(() => ({host: document.getElementById('__cu-agent-host') !== null, title: document.title}))()",
+        "(() => { const icon = document.querySelector('link[rel~=icon]'); return {host: document.getElementById('__cu-agent-host') !== null, title: document.title, icon: icon ? icon.href : null}; })()",
     ]);
     assert_eq!(response["ok"], true, "{response}");
     assert_eq!(response["result"]["host"], true, "{response}");
@@ -400,6 +400,13 @@ fn agent_marker_is_visible() {
             .unwrap_or_default()
             .starts_with('\u{1F916}'),
         "title was not prefixed: {response}"
+    );
+    assert!(
+        response["result"]["icon"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("data:image/svg+xml"),
+        "favicon was not replaced: {response}"
     );
 }
 

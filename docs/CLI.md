@@ -719,8 +719,8 @@ one process, so a whole flow is one call: `computer-use --cdp browser batch
 '[{"action":"browser_navigate","url":"https://example.com"},{"action":"browser_snapshot"}]'`.
 
 The global `--agent-overlay auto|on|off` controls the visible agent marker:
-a badge, a cursor ring that follows click/type/hover/scroll, and a tab title
-prefixed with 🤖. `auto` is on for `browser launch` and off for an attach.
+a badge, a cursor ring that follows click/type/hover/scroll, a tab title
+prefixed with 🤖, and a robot favicon. `auto` is on for `browser launch` and off for an attach.
 
 The CLI flag is `--cdp` and the JSON field is `cdp: true`. A binary built
 without the feature returns `unsupported`; without `--cdp` the CLI returns

@@ -429,6 +429,10 @@ const AGENT_MARKER_JS: &str = r##"(() => {
       hide() { ring.classList.remove('on', 'click'); }
     };
     if (!document.title.startsWith('\u{1F916} ')) document.title = '\u{1F916} ' + document.title;
+    const robot = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><text y="50" font-size="52">\u{1F916}</text></svg>');
+    let icon = document.querySelector('link[rel~="icon"]');
+    if (!icon) { icon = document.createElement('link'); icon.rel = 'icon'; (document.head || document.documentElement).appendChild(icon); }
+    icon.href = robot;
     const title = document.querySelector('title');
     if (title) {
       new MutationObserver(() => {
