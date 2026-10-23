@@ -5428,12 +5428,27 @@ fn list_windows(
     } else {
         crate::target::hide_system_windows(&windows)
     };
-    let rows: Vec<Value> = visible.iter().map(window_json).collect();
+    // `index` is what `--window N` resolves, so `--all` output stays
+    // addressable. System rows keep their platform `z` and carry no index.
+    let mut app_index = 0u32;
+    let rows: Vec<Value> = visible
+        .iter()
+        .map(|window| {
+            let mut value = window_json(window);
+            if crate::target::is_system_window(window) {
+                value["index"] = Value::Null;
+            } else {
+                value["index"] = json!(app_index);
+                app_index += 1;
+            }
+            value
+        })
+        .collect();
     let mut body = json!({"windows": rows, "count": rows.len()});
     if !all && system_count > 0 {
         body["system_hidden"] = json!(system_count);
         body["note"] = json!(format!(
-            "{system_count} system windows hidden; pass --all or use id:<n>"
+            "{system_count} system windows hidden; pass --all to list them, use `index` for `--window`, or reach one with id:<n>"
         ));
     }
     if let Some(note) = listed.note {
@@ -6956,6 +6971,11 @@ mod tests {
         assert!(windows.iter().all(|window| window["kind"] == "app"));
         assert_eq!(value["system_hidden"], 1);
         assert!(value["note"].as_str().unwrap().contains("--all"));
+        // Every visible row is addressable and `index` agrees with `z`.
+        for (position, row) in windows.iter().enumerate() {
+            assert_eq!(row["index"], position as u64, "{row:?}");
+            assert_eq!(row["z"], position as u64, "{row:?}");
+        }
 
         let response = dispatch_with(&backend, Action::ListWindows { all: true });
         let value = response.to_value();
@@ -6964,6 +6984,16 @@ mod tests {
         assert!(windows.iter().any(|window| window["system"] == true));
         assert!(windows.iter().any(|window| window["kind"] == "panel"));
         assert!(value.get("system_hidden").is_none());
+        // The panel is z 0 and carries no index; the app rows keep the same
+        // index they have in the default view, so `--window N` still matches.
+        let panel = &windows[0];
+        assert_eq!(panel["z"], 0);
+        assert!(panel["index"].is_null(), "{panel:?}");
+        let app_indexes: Vec<u64> = windows
+            .iter()
+            .filter_map(|row| row["index"].as_u64())
+            .collect();
+        assert_eq!(app_indexes, vec![0, 1, 2], "{windows:?}");
 
         // Index resolution skips the system row: window 0 is the Notes window.
         let listed = backend.list_windows().unwrap();
@@ -7072,7 +7102,9 @@ mod tests {
         assert_eq!(windows.as_array().unwrap().len(), 2);
         assert_eq!(windows[0]["z"], 0);
         assert_eq!(windows[0]["id"], 100);
+        assert_eq!(windows[0]["index"], 0);
         assert_eq!(windows[1]["z"], 1);
+        assert_eq!(windows[1]["index"], 1);
         assert_eq!(windows[1]["title"], "Welcome");
         assert_eq!(windows[0]["ax_matched"], true);
         assert!(value.get("note").is_none());

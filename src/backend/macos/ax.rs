@@ -1532,8 +1532,12 @@ pub(crate) fn window_status(
     })
 }
 
-/// The `AXWindow` element for `app`/`window`, matched by title and frame and
-/// falling back to the main window, then the first window.
+/// The `AXWindow` element for `app`/`window`.
+///
+/// With an explicit window selector the match must be real: title and frame,
+/// then title alone, then frame alone when the title is unknown (Screen
+/// Recording off). Guessing the app's main window from a failed match used to
+/// move a different window than the one the caller named.
 fn resolve_ax_window(
     app: &str,
     window: Option<&str>,
@@ -1545,29 +1549,76 @@ fn resolve_ax_window(
     let application = application(info.pid).map_err(|error| error.into_computer())?;
     let deadline = Instant::now() + Duration::from_secs(2);
     let windows = copy_windows(&application, deadline).map_err(attr_error_to_computer)?;
-    let chosen = target
-        .as_ref()
-        .and_then(|target| {
-            windows.iter().position(|candidate| {
-                candidate.title.eq_ignore_ascii_case(&target.title)
-                    && candidate
-                        .frame
-                        .map(|frame| bounds_match_frame(target.bounds, frame))
-                        .unwrap_or(false)
-            })
+    let candidates: Vec<AxWindowCandidate> = windows
+        .iter()
+        .map(|window| AxWindowCandidate {
+            title: window.title.clone(),
+            frame: window.frame,
+            main: window.main,
         })
-        .or_else(|| windows.iter().position(|candidate| candidate.main))
-        .or_else(|| (!windows.is_empty()).then_some(0));
-    let Some(index) = chosen else {
-        let label = target
-            .as_ref()
-            .map(|target| target.title.clone())
-            .filter(|title| !title.is_empty())
-            .or_else(|| window.map(str::to_string))
-            .unwrap_or_else(|| app.to_string());
-        return Err(ComputerError::WindowNotFound(label));
+        .collect();
+    let chosen = choose_ax_window(&candidates, target.as_ref());
+    if let Some(index) = chosen {
+        return Ok(windows.into_iter().nth(index).expect("index").element);
+    }
+    let label = target
+        .as_ref()
+        .map(|target| target.title.clone())
+        .filter(|title| !title.is_empty())
+        .or_else(|| window.map(str::to_string))
+        .unwrap_or_else(|| app.to_string());
+    Err(ComputerError::WindowNotFound(format!(
+        "{label} (the accessibility windows did not match; Screen Recording off? titles need it)"
+    )))
+}
+
+/// One `AXWindows` entry, reduced to what target selection needs.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AxWindowCandidate {
+    /// `AXTitle`.
+    pub title: String,
+    /// `AXPosition`/`AXSize` frame.
+    pub frame: Option<NodeFrame>,
+    /// `AXMain`.
+    pub main: bool,
+}
+
+/// Index of the window that matches `target`.
+///
+/// `None` means an explicit target was given and nothing matched, so the
+/// caller must fail instead of acting on an unrelated window. With no target
+/// the main window, then the first window, is acceptable.
+fn choose_ax_window(
+    candidates: &[AxWindowCandidate],
+    target: Option<&WindowInfo>,
+) -> Option<usize> {
+    let Some(target) = target else {
+        return candidates
+            .iter()
+            .position(|candidate| candidate.main)
+            .or_else(|| (!candidates.is_empty()).then_some(0));
     };
-    Ok(windows.into_iter().nth(index).expect("index").element)
+    if target.title.is_empty() {
+        // Screen Recording is off, so titles are empty but frames are known.
+        return candidates.iter().position(|candidate| {
+            candidate
+                .frame
+                .map(|frame| bounds_match_frame(target.bounds, frame))
+                .unwrap_or(false)
+        });
+    }
+    if let Some(index) = candidates.iter().position(|candidate| {
+        candidate.title.eq_ignore_ascii_case(&target.title)
+            && candidate
+                .frame
+                .map(|frame| bounds_match_frame(target.bounds, frame))
+                .unwrap_or(false)
+    }) {
+        return Some(index);
+    }
+    candidates
+        .iter()
+        .position(|candidate| candidate.title.eq_ignore_ascii_case(&target.title))
 }
 
 fn ax_value_point(x: f64, y: f64) -> Result<CFRetained<AXValue>, ComputerError> {
@@ -2379,5 +2430,91 @@ mod tests {
         assert!(message.contains("Accessibility permission is required"));
         assert!(message.contains("System Settings → Privacy & Security → Accessibility"));
         assert!(message.contains("Grok Bot"));
+    }
+
+    fn candidate(title: &str, frame: (f64, f64, f64, f64), main: bool) -> AxWindowCandidate {
+        AxWindowCandidate {
+            title: title.into(),
+            frame: Some(NodeFrame {
+                x: frame.0,
+                y: frame.1,
+                width: frame.2,
+                height: frame.3,
+            }),
+            main,
+        }
+    }
+
+    fn window_info(title: &str, bounds: (i32, i32, u32, u32)) -> WindowInfo {
+        WindowInfo {
+            id: 1,
+            pid: 10,
+            app: "Notes".into(),
+            title: title.into(),
+            z: 0,
+            bounds: WindowBounds {
+                x: bounds.0,
+                y: bounds.1,
+                width: bounds.2,
+                height: bounds.3,
+            },
+            layer: 0,
+            on_screen: true,
+            ax_matched: false,
+        }
+    }
+
+    #[test]
+    fn target_selection_prefers_title_and_frame() {
+        let candidates = vec![
+            candidate("Notes", (0.0, 0.0, 400.0, 300.0), true),
+            candidate("Welcome", (10.0, 20.0, 800.0, 600.0), false),
+        ];
+        let target = window_info("Welcome", (10, 20, 800, 600));
+        assert_eq!(choose_ax_window(&candidates, Some(&target)), Some(1));
+    }
+
+    #[test]
+    fn target_selection_falls_back_to_title_then_frame() {
+        let candidates = vec![
+            candidate("Notes", (0.0, 0.0, 400.0, 300.0), true),
+            candidate("Welcome", (10.0, 20.0, 800.0, 600.0), false),
+        ];
+        // Same title, moved frame: the title alone still identifies it.
+        let moved = window_info("Welcome", (500, 500, 800, 600));
+        assert_eq!(choose_ax_window(&candidates, Some(&moved)), Some(1));
+
+        // No title (Screen Recording off): the frame identifies it.
+        let untitled = window_info("", (10, 20, 800, 600));
+        assert_eq!(choose_ax_window(&candidates, Some(&untitled)), Some(1));
+    }
+
+    #[test]
+    fn explicit_target_with_no_match_refuses_instead_of_guessing() {
+        let candidates = vec![
+            candidate("Notes", (0.0, 0.0, 400.0, 300.0), true),
+            candidate("Welcome", (10.0, 20.0, 800.0, 600.0), false),
+        ];
+        let missing = window_info("Somewhere Else", (1, 2, 3, 4));
+        assert_eq!(choose_ax_window(&candidates, Some(&missing)), None);
+
+        let unknown = window_info("", (900, 900, 3, 4));
+        assert_eq!(choose_ax_window(&candidates, Some(&unknown)), None);
+    }
+
+    #[test]
+    fn no_target_uses_main_then_first() {
+        let candidates = vec![
+            candidate("Notes", (0.0, 0.0, 400.0, 300.0), false),
+            candidate("Welcome", (10.0, 20.0, 800.0, 600.0), true),
+        ];
+        assert_eq!(choose_ax_window(&candidates, None), Some(1));
+        let no_main = vec![candidate("Notes", (0.0, 0.0, 400.0, 300.0), false)];
+        assert_eq!(choose_ax_window(&no_main, None), Some(0));
+        assert_eq!(choose_ax_window(&[], None), None);
+        assert_eq!(
+            choose_ax_window(&[], Some(&window_info("Notes", (0, 0, 1, 1)))),
+            None
+        );
     }
 }
