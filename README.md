@@ -259,8 +259,8 @@ The `Action` enum in `src/protocol.rs` is the protocol. `id` is echoed on the re
 | `verify` | Same condition fields as `wait`; `timeout_ms` default 2000 | Assertion, not a sleep. Failure is `verification_failed` with the last `observed` in the body. |
 | `displays` | none | List displays without capturing pixels. |
 | `isolation` | none | Pure report: what this build can isolate. |
-| `list_apps` | `all`, `match` | `all: true` includes accessory and prohibited apps. `match` is a substring or `*` glob over name, bundle id, and path; rows carry `kind` and `system`. |
-| `list_windows` | `all` | z-order; index 0 is front. System rows (menubar, Dock, notifications) are hidden by default; `--all` includes them and rows carry `kind`/`system`. Use `id:` for a system row. |
+| `list_apps` | `all`, `match` | `all: true` includes accessory and prohibited apps. `match` is a substring or `*` glob over name, bundle id, and path; rows carry `kind` and `system` and are sorted by name (`active: true` is the frontmost app). |
+| `list_windows` | `all` | z-order; index 0 is front. System rows (menubar, Dock, notifications) are hidden by default; `--all` includes them and rows carry `kind`/`system`/`index`. `index` is the `--window N` selector; `null` on system rows in `--all`. Use `id:` for a system row. |
 | `launch` | `app` (sibling) | Launch via `NSWorkspace` on macOS; otherwise `unsupported`. |
 | `activate` | `app`, `window` | `--window` is checked first. |
 | `quit` | `force` | `--force` is a confirm-gated terminate. |

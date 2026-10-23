@@ -628,7 +628,7 @@ enum CliCommand {
         /// Seconds to sleep. Fractions are allowed.
         #[arg(long, value_name = "N")]
         seconds: Option<f64>,
-        /// Wait until this element index is in `--state`.
+        /// Wait until this element index is in `--element-state`.
         #[arg(long, value_name = "N")]
         element: Option<u32>,
         /// Element state: exists (default), gone, visible, enabled.
@@ -670,7 +670,7 @@ enum CliCommand {
     ///
     /// Example: computer-use verify --app Notes --element 12 --element-state enabled
     Verify {
-        /// Assert this element index is in `--state`.
+        /// Assert this element index is in `--element-state`.
         #[arg(long, value_name = "N")]
         element: Option<u32>,
         /// Element state: exists (default), gone, visible, enabled.

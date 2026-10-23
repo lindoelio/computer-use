@@ -33,7 +33,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `wait` is now a condition engine: `--element N --element-state exists|gone|visible|enabled`, `--text` (+`--within-element`), `--value`, `--window-state exists|gone`, `--tree-change`, `--app-running`, and `--title`, with `--ignore-case`, `--timeout-ms` (default 10000, max 300000), and `--poll-ms` (default 100, min 25). The duration form (`--ms`/`--seconds`) is unchanged when no condition is given.
 - New `verify` command and `verify` JSON action: the same conditions with a 2000 ms default and the dedicated `verification_failed` error code carrying the last `observed` value.
 - New `window` command group (`move`, `resize`, `set`, `state`, `info`) over `AXPosition`/`AXSize` on macOS, with `window move --to-display` centering and `[window] clamp` (default true) keeping moves and resizes inside a display.
-- `list-windows` hides system windows (menubar, Dock, notifications at layer >= 20) by default, adds `kind`/`system` per row and `system_hidden` plus a note; `--all` includes them. Index `0` and `--window N` always resolve app windows; `id:` reaches a system row.
+- `list-windows` hides system windows (menubar, Dock, notifications at layer >= 20) by default, adds `kind`/`system` per row and `system_hidden` plus a note; `--all` includes them. Every row also carries `index`, the value `--window N` resolves: it matches the renumbered `z` in the default view, and with `--all` the app rows keep that index while system rows carry `null`. `id:` reaches a system row.
 - `list-apps` gained `--match` (substring or `*` glob over name, bundle id, path) and reports `kind`/`system` plus `hidden_count`.
 - `ocr --image <PATH>` runs OCR on a file: `source` is `"image"`, `screen` equals the image pixel, and the response reports `width`/`height`. Secure-field redaction does not apply to a file.
 - macOS full-screen capture now uses ScreenCaptureKit with the desktop image as a non-terminal fallback (the warning names the ScreenCaptureKit error).
@@ -45,12 +45,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- `list-apps` rows are sorted by name. The platform order was arbitrary (`NSWorkspace` order on macOS); `active: true` still marks the frontmost app, so callers should branch on that field instead of `apps[0]`.
+- The confirm word list (`delete`, `erase`, `pay`, `purchase`, `send`, `submit`) gained `trash`, `discard`, and `uninstall`. It is shared by coordinate clicks and element presses as well as the new menu-path check, so a click or `press` on a control whose title contains one of those words now needs the confirm hook too.
+- `wait --ms`/`--seconds` combined with a condition is `invalid_arguments` instead of silently ignoring the duration.
+- `COMPUTER_USE_AUDIT_MAX_BYTES` can only raise the rotation threshold, matching its documentation.
+- `audit tail` reads the newest lines backwards in fixed chunks instead of loading the log and its backups whole.
 - The CDP driver keeps one runtime alive for the whole command. The previous code created the runtime inside `connect`, spawned the chromiumoxide handler, and dropped the runtime before the command ran.
 - `browser navigate` requires `--target` when more than one page target exists.
 - The `browser` CLI help and `docs/CLI.md` document the new surface; `browser activate --target` is required.
 
 ### Fixed
 
+- `wait --text` and `verify --text` no longer panic when the matched text is preceded by a 3- or 4-byte character (curly quotes, ellipsis, arrows, emoji, CJK). The snippet window snaps to character boundaries, and it is sliced from the original text so `--ignore-case` keeps the real casing.
+- The JSON protocol can express the `wait`/`verify` element condition. `element` was consumed by the shared request context before the action deserialized, so `{"action":"wait","element":12}` failed with "requires --element" and `{"action":"verify","element":3}` with "needs a condition". Batch steps had the same defect.
+- `wait --text` and `wait --tree-change` no longer rewrite the session cache: the polling loop used the storing `tree` walk, which consumed the caller's `--session` diff baseline (and made `--tree-change` compare against its own previous poll). They use a non-storing observation; the `tree` action and post-action state still store.
+- `verification_failed` is a `ComputerError::VerificationFailed` variant, so `ComputerError::code()` produces it as the documented contract says.
+- Linux `wait`/`verify` element and value conditions return `unsupported` instead of `Ok(None)`, which made `--element-state gone` match immediately and `exists` time out.
+- macOS `window move`/`resize`/`state` target the window the selector names. A failed title+frame match used to fall back to the app's main window; it now falls back to title alone, then frame alone when titles are unknown, and otherwise returns `window_not_found`.
 - `list-windows` indexes no longer count system rows: `--window 0` cannot land on the menubar, and app windows with small non-zero layers stay addressable.
 - `browser text` on `<input>`, `<textarea>`, and `<select>` reads `value` instead of an empty `innerText`.
 - Browser commands report `unsupported` when the feature is off and `invalid_arguments` when `--cdp` is missing, matching the CLI gate.

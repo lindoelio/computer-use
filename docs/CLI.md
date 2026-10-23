@@ -522,6 +522,20 @@ clamp = true                 # keep window moves and resizes inside a display (d
 
 `secure_focus` decides text-inserting actions without `--element`: the CLI reads the focused element first and refuses a secure field (`deny`, the default) or proceeds with a warning (`warn`). `unreadable_focus` covers platforms or apps that cannot report focus.
 
+### What needs confirmation
+
+With no confirm hook (`[confirm].command`, `--confirm-cmd`, or `COMPUTER_USE_CONFIRM_CMD`) these actions return `confirm_required`; with a hook they run only if it exits 0.
+
+| Trigger | Notes |
+| --- | --- |
+| `quit`, including `--force` | |
+| `clipboard set` | |
+| `apple-event`, `shortcuts run` | The hook document carries `extra.script_bytes`/`extra.script_hash` or `extra.name`. |
+| Sensitive key combinations | `cmd+q`, `cmd+shift+q`, `ctrl+cmd+q`, `cmd+alt+esc`, `cmd+shift+delete` (macOS); `alt+F4` and the lock key on Windows and X11. The document carries `extra.combo`. |
+| A click, `press`, or menu path on a sensitive title | Any word in the title matching delete, erase, pay, purchase, send, submit, trash, discard, or uninstall. Menu clicks carry `extra.path`. |
+
+A menu path is checked segment by segment, so `File > Empty Trash` is gated by `trash`; the hook document names the full path in `extra.path`.
+
 ### `pause`
 
 ```
@@ -848,8 +862,8 @@ The protocol is `src/protocol.rs::Action`. The tag is `action`; the rename rule 
 | `verify` | same condition fields as `wait`; `timeout_ms` default 2000 | Failure is `verification_failed` and the body carries `condition` and the last `observed`. |
 | `displays` | none | |
 | `isolation` | none | |
-| `list_apps` | `all`, `match` | Alias: `list-apps`. `match` accepts a substring or a `*` glob over name, bundle id, and path; rows carry `kind` and `system`. |
-| `list_windows` | `all` | Alias: `list-windows`. System windows are hidden by default; the response adds `system_hidden` and a `note`, and rows carry `kind` and `system`. Index `0` and `--window N` always resolve app windows; use `id:` for a system row. |
+| `list_apps` | `all`, `match` | Alias: `list-apps`. `match` accepts a substring or a `*` glob over name, bundle id, and path; rows carry `kind` and `system` and are sorted by name. `active: true` marks the frontmost app. |
+| `list_windows` | `all` | Alias: `list-windows`. System windows are hidden by default; the response adds `system_hidden` and a `note`, and rows carry `kind`, `system`, and `index`. `index` is the `--window N` selector; with `--all` the app rows keep it and system rows carry `null`. Use `id:` for a system row. |
 | `launch` | none (uses `--app`) | |
 | `activate` | none (uses `--app`/`--window`) | |
 | `quit` | `force` | |
