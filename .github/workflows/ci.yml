@@ -21,6 +21,7 @@ jobs:
   cdp-live:
     name: cdp-live (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -54,6 +55,8 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # Backstop: nextest kills individual hangs; this bounds the whole job.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -64,6 +67,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
       - name: Install Linux build dependencies
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -155,9 +159,9 @@ jobs:
         # written to run without PipeWire or a portal daemon. On Linux the
         # default build is the one that differs from the tested build.
         if: matrix.os == 'ubuntu-latest'
-        run: cargo test --all-targets
+        run: cargo nextest run --all-targets
       - name: Test
-        run: cargo test --all-targets --all-features
+        run: cargo nextest run --all-targets --all-features
       - name: Package ad-hoc Computer Use.app
         if: success() && matrix.os == 'macos-latest'
         shell: bash
@@ -187,6 +191,7 @@ jobs:
     name: coverage (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     needs: test
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:

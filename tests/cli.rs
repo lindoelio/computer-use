@@ -1,11 +1,14 @@
 //! Binary tests that do not touch the desktop.
 //!
-//! Every command gets a temp `XDG_CACHE_HOME` so a test cannot write
-//! `~/.cache/computer-use`.
+//! Every test runs against its own `XDG_*` tree, so two tests running in
+//! parallel cannot see each other's cache, policy, or pause marker, and a test
+//! cannot write `~/.cache/computer-use`. The tree is removed when the test's
+//! thread ends, including while unwinding from a failed assertion.
 
+use std::cell::RefCell;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
 
 use serde_json::Value;
 
@@ -13,15 +16,76 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_computer-use")
 }
 
-fn cache_home() -> &'static str {
-    static DIR: OnceLock<String> = OnceLock::new();
-    DIR.get_or_init(|| {
-        let dir =
-            std::env::temp_dir().join(format!("computer-use-cli-cache-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp cache dir");
+/// A temp directory that removes itself on drop.
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(label: &str) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "computer-use-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        Self(dir)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    fn child(&self, name: &str) -> String {
+        let dir = self.0.join(name);
+        std::fs::create_dir_all(&dir).expect("temp child dir");
         dir.to_string_lossy().into_owned()
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+thread_local! {
+    /// One tree per test thread. `libtest` runs each test on its own thread, so
+    /// this is per-test isolation without a `tempfile` dependency, and the
+    /// `Drop` runs on panic too.
+    static TEST_DIR: RefCell<Option<TempDir>> = const { RefCell::new(None) };
+}
+
+fn with_test_dir<T>(f: impl FnOnce(&TempDir) -> T) -> T {
+    TEST_DIR.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let dir = slot.get_or_insert_with(|| TempDir::new("cli"));
+        f(dir)
     })
-    .as_str()
+}
+
+fn cache_home() -> String {
+    with_test_dir(|dir| dir.child("cache"))
+}
+
+fn config_home() -> String {
+    with_test_dir(|dir| dir.child("config"))
+}
+
+fn state_home() -> String {
+    with_test_dir(|dir| dir.child("state"))
+}
+
+/// A path that does not exist, so the admin policy file is absent.
+fn missing_admin() -> String {
+    with_test_dir(|dir| {
+        dir.path()
+            .join("no-admin-policy.toml")
+            .to_string_lossy()
+            .into_owned()
+    })
 }
 
 fn command(args: &[&str]) -> Command {
@@ -34,39 +98,6 @@ fn command(args: &[&str]) -> Command {
         .env("COMPUTER_USE_ADMIN_POLICY", missing_admin())
         .env_remove("COMPUTER_USE_CONFIRM_CMD");
     command
-}
-
-fn config_home() -> &'static str {
-    static DIR: OnceLock<String> = OnceLock::new();
-    DIR.get_or_init(|| {
-        let dir =
-            std::env::temp_dir().join(format!("computer-use-cli-config-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp config dir");
-        dir.to_string_lossy().into_owned()
-    })
-    .as_str()
-}
-
-fn state_home() -> &'static str {
-    static DIR: OnceLock<String> = OnceLock::new();
-    DIR.get_or_init(|| {
-        let dir =
-            std::env::temp_dir().join(format!("computer-use-cli-state-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp state dir");
-        dir.to_string_lossy().into_owned()
-    })
-    .as_str()
-}
-
-fn missing_admin() -> &'static str {
-    static PATH: OnceLock<String> = OnceLock::new();
-    PATH.get_or_init(|| {
-        std::env::temp_dir()
-            .join(format!("computer-use-cli-no-admin-{}", std::process::id()))
-            .to_string_lossy()
-            .into_owned()
-    })
-    .as_str()
 }
 
 fn run(args: &[&str]) -> std::process::Output {
@@ -446,15 +477,9 @@ fn run_in_state(args: &[&str], state: &str) -> std::process::Output {
 /// JSON object and must not panic.
 #[test]
 fn cli_surface_sweep_is_guarded_and_well_formed() {
-    let state = std::env::temp_dir().join(format!("computer-use-sweep-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&state);
-    std::fs::create_dir_all(&state).expect("sweep state dir");
-    let state = state.to_string_lossy().into_owned();
-    let shot = std::env::temp_dir().join(format!(
-        "computer-use-sweep-shot-{}.png",
-        std::process::id()
-    ));
-    let shot = shot.to_string_lossy().into_owned();
+    let dir = TempDir::new("sweep");
+    let state = dir.child("state");
+    let shot = dir.path().join("shot.png").to_string_lossy().into_owned();
 
     let paused = run_in_state(&["pause"], &state);
     assert!(
@@ -574,8 +599,7 @@ fn cli_surface_sweep_is_guarded_and_well_formed() {
         "stderr: {}",
         String::from_utf8_lossy(&resumed.stderr)
     );
-    let _ = std::fs::remove_file(&shot);
-    let _ = std::fs::remove_dir_all(&state);
+    // `dir` drops here and removes the whole tree, on panic too.
 }
 
 /// Every browser action is decodable through `exec` even when the CDP
@@ -691,7 +715,7 @@ fn policy_check_reports_builtin_and_user_deny() {
     assert_eq!(value["decision"], "deny", "{value}");
     assert_eq!(value["source"], "user");
 
-    let audit = std::path::Path::new(state_home())
+    let audit = std::path::Path::new(&state_home())
         .join("computer-use")
         .join("audit.jsonl");
     let text = std::fs::read_to_string(&audit).unwrap_or_default();

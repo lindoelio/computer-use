@@ -1,0 +1,24 @@
+# Test-runner policy. `cargo test` still works; CI uses `cargo nextest run`,
+# which runs each test in its own process (so process-global state cannot leak
+# between tests) and enforces the timeouts below.
+#
+# A test that runs longer than 90 s is reported as slow; after three periods it
+# is killed, so a hung test cannot hold a CI job until the runner limit. The
+# slowest current test is the macOS Vision OCR fixture at ~45 s.
+[profile.default]
+slow-timeout = { period = "90s", terminate-after = 3 }
+fail-fast = false
+
+[profile.ci]
+slow-timeout = { period = "90s", terminate-after = 3 }
+fail-fast = false
+
+# Each live CDP test starts its own Chromium (process-per-test), so run them
+# one at a time instead of six browsers in parallel.
+[[profile.default.overrides]]
+filter = 'binary(cdp_live)'
+threads-required = "num-cpus"
+
+[[profile.ci.overrides]]
+filter = 'binary(cdp_live)'
+threads-required = "num-cpus"

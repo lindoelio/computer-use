@@ -44,13 +44,53 @@ pub fn builtin_exemptions() -> Vec<String> {
         .clone()
 }
 
+#[cfg(test)]
+std::thread_local! {
+    /// Overrides the process-wide registry for the current test thread.
+    static TEST_BUILTIN_EXEMPT: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Restores the previous test override when dropped.
+#[cfg(test)]
+pub struct ExemptGuard {
+    previous: Option<Vec<String>>,
+}
+
+#[cfg(test)]
+impl Drop for ExemptGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        TEST_BUILTIN_EXEMPT.with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+/// Shadow the process-wide exemption registry for this thread.
+///
+/// The registry itself stays process-wide; this override exists so one unit
+/// test cannot leak exemptions into another running on a different thread.
+#[cfg(test)]
+pub fn push_test_exemptions(items: &[String]) -> ExemptGuard {
+    let previous = TEST_BUILTIN_EXEMPT.with(|slot| slot.borrow_mut().replace(items.to_vec()));
+    ExemptGuard { previous }
+}
+
+/// Exemptions in force: the test override first, then the process-wide list.
+fn current_exemptions() -> Vec<String> {
+    #[cfg(test)]
+    if let Some(items) = TEST_BUILTIN_EXEMPT.with(|slot| slot.borrow().clone()) {
+        return items;
+    }
+    builtin_exemptions()
+}
+
 /// True when `value` names a built-in entry the policy exempts.
 fn is_exempt(value: &str) -> bool {
     let value = value.trim();
     if value.is_empty() {
         return false;
     }
-    builtin_exemptions()
+    current_exemptions()
         .iter()
         .any(|item| item.trim().eq_ignore_ascii_case(value))
 }
@@ -2040,6 +2080,59 @@ mod tests {
             "{decision:?}"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn builtin_exemption_prunes_the_bundle_and_path_deny() {
+        // No override: the built-in list refuses the bundle.
+        assert!(identity_denial(Some("com.apple.Terminal"), None, None, None).is_some());
+
+        // The thread-local override shadows the process-wide registry, so this
+        // test cannot leak exemptions into another one.
+        let _guard = push_test_exemptions(&["app.crynta.terax".to_string()]);
+        assert!(identity_denial(Some("app.crynta.terax"), None, None, None).is_none());
+        assert!(identity_denial(Some("APP.CRYNTA.TERAX"), None, None, None).is_none());
+        // A different bundle id is untouched.
+        assert!(identity_denial(Some("com.apple.Terminal"), None, None, None).is_some());
+    }
+
+    #[test]
+    fn builtin_exemption_matches_the_executable_name_and_trims_exe() {
+        let _guard = push_test_exemptions(&["Terminal".to_string()]);
+        let path = Path::new("/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal");
+        assert!(identity_denial(None, Some(path), None, None).is_none());
+        assert!(identity_denial(Some("com.apple.Terminal"), Some(path), None, None).is_none());
+
+        let _exe = push_test_exemptions(&["powershell".to_string()]);
+        assert!(identity_denial(
+            None,
+            Some(Path::new("C:/Windows/powershell.exe")),
+            None,
+            None
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn system_settings_privacy_window_is_refused() {
+        let denial = identity_denial(
+            Some("com.apple.Settings"),
+            None,
+            Some("Privacy & Security"),
+            None,
+        )
+        .expect("privacy window is refused");
+        assert_eq!(denial.source, "system-settings");
+        assert!(denial.message.contains("Privacy"));
+        assert!(identity_denial(Some("com.apple.Settings"), None, Some("General"), None).is_none());
+        // The identifier form counts too.
+        assert!(identity_denial(
+            Some("com.apple.Settings"),
+            None,
+            None,
+            Some("security-pane")
+        )
+        .is_some());
     }
 
     fn temp_dir(label: &str) -> PathBuf {
