@@ -7020,6 +7020,16 @@ mod tests {
         let value = response.to_value();
         assert_eq!(value["hidden_count"], 1, "{value:?}");
         assert!(value["note"].as_str().unwrap().contains("--all"));
+        // Rows are sorted by name; `active` marks the frontmost app.
+        let names: Vec<&str> = value["apps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|app| app["name"].as_str())
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted, "{value:?}");
 
         let response = dispatch_with(
             &backend,
