@@ -787,20 +787,26 @@ enum CliCommand {
         command: OverlayCommand,
     },
 
-    /// Chrome DevTools Protocol (CDP) subcommands. Requires `--cdp` and a
-    /// binary built with `--features cdp`.
+    /// Chrome DevTools Protocol (CDP) subcommands. Requires `--cdp`; the
+    /// release binaries include the feature.
     ///
-    /// Attach-only. The user already started Chrome with
-    /// `--remote-debugging-port=N`. We never spawn, restart, or quit Chrome.
-    /// The default attach endpoint is derived from `--app`'s argv on macOS
-    /// and Linux, or `ws://127.0.0.1:9222` when `--app` is absent. Pass
-    /// `--cdp-url` to override.
+    /// Attach mode connects to a Chrome the user started with
+    /// `--remote-debugging-port=N` (and, on Chrome 136+, a non-default
+    /// `--user-data-dir`). `browser launch` starts a managed Chromium with
+    /// an isolated profile and an ephemeral debug port; `browser quit`
+    /// stops it. Pass `--cdp-url` to override the endpoint.
     ///
     /// URLs are matched against `[browser].blocked_urls` in the policy
     /// before they leave this process. A match returns `blocked_url` and the
     /// websocket is never opened.
     ///
+    /// `browser snapshot` returns a compact tree with `ref=eN` handles;
+    /// actions accept `--selector` or `--ref`. `browser batch` runs a whole
+    /// flow in one call. `--agent-overlay` shows a badge, a cursor ring, a
+    /// robot favicon, and a 🤖 tab title prefix.
+    ///
     /// Example: computer-use --cdp browser tabs
+    /// Example: computer-use --cdp browser launch --headless
     /// Example: computer-use --cdp --app "Google Chrome" browser navigate --url "https://example.com"
     #[command(name = "browser", subcommand)]
     Browser(#[command(subcommand)] CliBrowserCommand),
