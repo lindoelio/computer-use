@@ -21,6 +21,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `--on-dialog accept|dismiss|fail` handles JavaScript dialogs opened by an action; `browser dialog` handles one explicitly over a raw CDP connection.
 - `browser batch` runs a JSON array of browser actions in one process, so a whole flow is one shell call and one permission prompt.
 - The visible agent marker: `--agent-overlay auto|on|off` injects a badge, a cursor ring that follows click/type/hover/scroll, a 🤖 tab title prefix, and a robot favicon. `auto` is on for `browser launch` and off for an attach.
+- macOS `cursor-position` reads the pointer with `CGEventGetLocation` and no longer needs the input permission that enigo required.
+- `get-state` without `--app` keeps `ok: true` and returns displays/cursor/frontmost when the frontmost app is on the deny list; the tree fields are null and a `policy` object explains the omission. `tree` for a denied app stays `policy_denied`.
+- `apple-event` and `shortcuts run` are confirm-gated. The confirm document now carries `extra` (`script_bytes`/`script_hash` for Apple events, `name` for Shortcuts), so a hook can allowlist a specific script without seeing its body.
+- `shortcuts run` honours `SHORTCUTS_TIMEOUT_SECS` (60 s); the previous code used the 30 s Apple-event timeout.
 - New error code `timeout`.
 - The release binaries are built with `--features cdp`; `cargo install` keeps the optional `cdp` feature.
 

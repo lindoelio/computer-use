@@ -389,7 +389,9 @@ explicit `--amount` when you need a specific distance.
 usage: computer-use get-state [OPTIONS]
 ```
 
-Reports `{platform, displays, screen, cursor, frontmost_app, frontmost_window, accessibility, note}`. Missing fields are `null` and `note` explains why.
+Reports `{platform, displays, screen, cursor, frontmost_app, frontmost_window, accessibility, note}`. Missing fields are `null` and `note` explains why. On macOS the cursor is read with `CGEventGetLocation`, which needs no input permission.
+
+When `get-state` has no explicit `--app` and the frontmost app is on the deny list, the response stays `ok: true` with the metadata and a `policy` object (`decision: "deny"`), and the `tree` fields are `null`. `tree` itself stays `policy_denied` for a denied app.
 
 ### `wait`
 
@@ -552,7 +554,7 @@ Options:
       --language <LANGUAGE>   applescript (default) or javascript.
 ```
 
-Script body is never logged verbatim; the audit line records `script_bytes` and a stable FNV-1a 64-bit hash.
+Script body is never logged verbatim; the audit line records `script_bytes` and a stable FNV-1a 64-bit hash. `apple-event` runs arbitrary code, so it is confirm-gated: without a confirm hook it returns `confirm_required`. The hook document carries `extra.script_bytes` and `extra.script_hash` so a hook can allowlist a specific script without seeing its body.
 
 ### `shortcuts`
 
@@ -563,7 +565,7 @@ Commands:
   run <NAME>    Run a Shortcuts workflow by name.
 ```
 
-`shortcuts run` invokes `["shortcuts", "run", name]` with a 60 s timeout.
+`shortcuts run` invokes `["shortcuts", "run", name]` with a 60 s timeout. A workflow can do anything, so it is confirm-gated like `apple-event`; the hook document carries `extra.name`.
 
 ### `dock`
 
@@ -629,7 +631,7 @@ A step's own `return_state` and `state_diff` are ignored: the batch attaches one
 usage: computer-use cursor-position [OPTIONS]
 ```
 
-Prints the pointer position. Alias: `cursor_position`. The same action is available in JSON as `cursor_position`.
+Prints the pointer position. Alias: `cursor_position`. The same action is available in JSON as `cursor_position`. On macOS this uses `CGEventGetLocation` and needs no permission; off macOS it initializes the input backend.
 
 ### `overlay`
 

@@ -243,6 +243,8 @@ The `Action` enum in `src/protocol.rs` is the protocol. `id` is echoed on the re
 | `zoom` | `region` (required), `output`/`path`, `format`, `max_width`, `canvas`, `base64` | Window-local coordinates when `--app`/`--window` is set. |
 | `clipboard_get` | none | Text wins; `kind: "empty"` is reported. An image is written to the session cache and `kind: "image"` is reported with a `path`. |
 | `clipboard_set` | `text`, `image` (PNG path) | Requires a confirm hook. Empty `text` is `invalid_arguments`. |
+| `apple_event` | `app` (override), `script`, `language` | Requires a confirm hook; the hook document carries `extra.script_bytes` and `extra.script_hash`. |
+| `shortcuts_run` | `name` | Requires a confirm hook; the hook document carries `extra.name`. |
 | `focus` | none | Sets `AXFocused` on the `--element`. |
 | `set_value` | `value` | Refused for secure fields (`policy_denied`; the value is never read). |
 | `select_text` | `start`, `end` | Refused for secure fields. |
@@ -326,7 +328,7 @@ The JSON `error.code` is one of the strings below. `ComputerError::code()` is th
 | `stale_element` | The path's role, identifier, or frame (beyond 2 points) changed, or the cached pid, window, or revision header does not match. Action not performed. Body includes the new tree. |
 | `permission_required` | Accessibility or Screen Recording is off. The `doctor` `fix` object names the Settings pane. |
 | `policy_denied` | Built-in or configured deny. |
-| `confirm_required` | Sensitive action and no confirm hook is configured. |
+| `confirm_required` | Sensitive action (quit, clipboard set, `apple-event`, `shortcuts run`, `cmd+q`/`alt+F4`) and no confirm hook is configured. |
 | `confirm_denied` | Hook exited non-zero or timed out. |
 | `blocked_url` | Browser URL matched the block list. |
 | `paused` | Local user input tripped the kill switch. |

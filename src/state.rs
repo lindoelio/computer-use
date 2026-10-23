@@ -43,7 +43,57 @@ fn recovered_state() -> Value {
     })
 }
 
+/// Metadata-only snapshot: displays, cursor, and frontmost window, with the
+/// accessibility fields explicitly null. Used when the frontmost app is on
+/// the deny list: the agent still gets orientation without a tree from a
+/// denied app.
+pub fn collect_state_metadata(backend: &dyn DesktopBackend) -> Value {
+    match catch_unwind(AssertUnwindSafe(|| {
+        let (mut body, mut notes) = metadata(backend);
+        if let (Some(body), Value::Object(fields)) = (body.as_object_mut(), empty_tree()) {
+            for (key, value) in fields {
+                body.insert(key, value);
+            }
+        }
+        body["note"] = note_value(&mut notes);
+        body
+    })) {
+        Ok(value) => value,
+        Err(_) => recovered_state(),
+    }
+}
+
 fn collect_state_inner(backend: &dyn DesktopBackend, query: &TreeQuery) -> Value {
+    let (mut body, mut notes) = metadata(backend);
+    let tree = match catch_unwind(AssertUnwindSafe(|| backend.tree(query))) {
+        Ok(Ok(report)) => tree_value(&report, &mut notes),
+        Ok(Err(error)) => {
+            notes.push(error.to_string());
+            empty_tree()
+        }
+        Err(_) => {
+            notes.push("accessibility inspection panicked and was recovered".into());
+            empty_tree()
+        }
+    };
+    if let (Some(body), Value::Object(fields)) = (body.as_object_mut(), tree) {
+        for (key, value) in fields {
+            body.insert(key, value);
+        }
+    }
+    body["note"] = note_value(&mut notes);
+    body
+}
+
+fn note_value(notes: &mut [String]) -> Value {
+    if notes.is_empty() {
+        Value::Null
+    } else {
+        Value::String(notes.join("; "))
+    }
+}
+
+fn metadata(backend: &dyn DesktopBackend) -> (Value, Vec<String>) {
     let mut notes = Vec::new();
 
     let displays = match guard("displays", || backend.list_displays()) {
@@ -74,33 +124,17 @@ fn collect_state_inner(backend: &dyn DesktopBackend, query: &TreeQuery) -> Value
         notes.push(note);
     }
 
-    let tree = match catch_unwind(AssertUnwindSafe(|| backend.tree(query))) {
-        Ok(Ok(report)) => tree_value(&report, &mut notes),
-        Ok(Err(error)) => {
-            notes.push(error.to_string());
-            empty_tree()
-        }
-        Err(_) => {
-            notes.push("accessibility inspection panicked and was recovered".into());
-            empty_tree()
-        }
-    };
-
-    let mut body = json!({
-        "platform": platform_name(),
-        "displays": displays,
-        "screen": screen,
-        "cursor": cursor,
-        "frontmost_app": front.app,
-        "frontmost_window": front.window,
-        "note": if notes.is_empty() { Value::Null } else { Value::String(notes.join("; ")) }
-    });
-    if let (Some(body), Value::Object(fields)) = (body.as_object_mut(), tree) {
-        for (key, value) in fields {
-            body.insert(key, value);
-        }
-    }
-    body
+    (
+        json!({
+            "platform": platform_name(),
+            "displays": displays,
+            "screen": screen,
+            "cursor": cursor,
+            "frontmost_app": front.app,
+            "frontmost_window": front.window,
+        }),
+        notes,
+    )
 }
 
 fn empty_tree() -> Value {

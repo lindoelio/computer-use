@@ -14,7 +14,7 @@ scripts/package-macos-app.sh target/release/computer-use dist
 
 The first argument is the binary. It defaults to `target/release/computer-use`, or to `COMPUTER_USE_BINARY`. Pass an arm64 or universal binary the same way. The second argument is the output directory (`COMPUTER_USE_OUTPUT_DIR`, default `dist`).
 
-With no `MACOS_SIGN_IDENTITY`, the script ad-hoc signs the bundle (`codesign --force --sign -`). That is enough for TCC on the Mac that built it. The zip is `computer-use-macos-arm64-app-unsigned.zip`. The script prints the zip path.
+With no `MACOS_SIGN_IDENTITY`, the script ad-hoc signs the bundle (`codesign --force --sign -`). That is enough for TCC on the Mac that built it, but the grant follows the ad-hoc code requirement: replacing the binary on update can invalidate Accessibility, Screen Recording, Input Monitoring, and Post Event, and the user must grant them again. Configure `MACOS_SIGN_IDENTITY`, `APPLE_ID`, `APPLE_APP_SPECIFIC_PASSWORD`, and `APPLE_TEAM_ID` for a Developer ID signature plus notarization, which keeps the grant stable across updates. The ad-hoc zip is `computer-use-macos-arm64-app-unsigned.zip`. The script prints the zip path.
 
 Check the bundle:
 

@@ -57,6 +57,8 @@ pub struct StubBackend {
     pub doctor_report: DoctorReport,
     /// Value shown on the stub text node. Tests change it to force a diff.
     pub stub_value: Mutex<String>,
+    /// Frontmost app name the stub reports. `None` means Finder.
+    pub frontmost_app: Option<String>,
     /// In-memory tree baselines keyed by session, pid, and window id.
     pub baselines: Mutex<HashMap<(String, i32, u32), SigNode>>,
     /// `type --element` uses `AXValue` when this is true.
@@ -184,6 +186,7 @@ impl Default for StubBackend {
             accessibility_apps: Mutex::new(Vec::new()),
             doctor_report: fixture_doctor(),
             stub_value: Mutex::new("a".into()),
+            frontmost_app: Some("Finder".into()),
             baselines: Mutex::new(HashMap::new()),
             value_settable: true,
             char_count: None,
@@ -365,7 +368,11 @@ impl DesktopBackend for StubBackend {
 
     fn frontmost(&self) -> FrontmostInfo {
         FrontmostInfo {
-            app: Some("Finder".into()),
+            app: Some(
+                self.frontmost_app
+                    .clone()
+                    .unwrap_or_else(|| "Finder".into()),
+            ),
             window: Some("Desktop".into()),
             note: None,
         }

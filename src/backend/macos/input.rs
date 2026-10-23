@@ -1413,7 +1413,7 @@ fn stamp(event: &objc2_core_graphics::CGEvent, target: &EventTarget) {
 }
 
 #[cfg(not(test))]
-fn cursor_xy() -> Option<(f64, f64)> {
+pub(crate) fn cursor_xy() -> Option<(f64, f64)> {
     use objc2_core_graphics::CGEvent;
     let event = CGEvent::new(None)?;
     let point = CGEvent::location(Some(&event));

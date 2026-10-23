@@ -12,7 +12,7 @@ use serde::Serialize;
 
 use crate::backend::command::stderr_snippet;
 use crate::error::ComputerError;
-use crate::protocol::APPLE_EVENT_TIMEOUT_SECS;
+use crate::protocol::SHORTCUTS_TIMEOUT_SECS;
 
 /// What `shortcuts run` returned.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -24,8 +24,7 @@ pub struct ShortcutsReport {
 }
 
 /// Run `shortcuts run <name>` and wait for completion. The process is killed
-/// after [`APPLE_EVENT_TIMEOUT_SECS`] (the same timeout the macOS backend
-/// applies to `osascript`).
+/// after [`SHORTCUTS_TIMEOUT_SECS`] (60 seconds).
 pub fn run(name: &str) -> Result<ShortcutsReport, ComputerError> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
@@ -33,7 +32,7 @@ pub fn run(name: &str) -> Result<ShortcutsReport, ComputerError> {
             "shortcuts run requires a workflow name".into(),
         ));
     }
-    let timeout = Duration::from_secs(APPLE_EVENT_TIMEOUT_SECS);
+    let timeout = Duration::from_secs(SHORTCUTS_TIMEOUT_SECS);
     let output = crate::backend::command::run_timeout("shortcuts", &["run", trimmed], timeout)
         .map_err(ComputerError::ExecutionFailed)?;
     let exit_status = output.status.code().unwrap_or(-1);

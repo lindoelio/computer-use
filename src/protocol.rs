@@ -1301,6 +1301,48 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
     }
     let prepared = prepare_action(backend, &action, context);
     if let Some(response) = prepared.stop {
+        // `get-state` without an explicit app still returns the metadata
+        // (displays, cursor, frontmost window) when the frontmost app is on
+        // the deny list. The tree is omitted; the agent gets orientation
+        // instead of a bare policy_denied.
+        if matches!(action, Action::GetState)
+            && context.app.is_none()
+            && response
+                .error
+                .as_ref()
+                .is_some_and(|error| error.code == "policy_denied")
+        {
+            let mut value = crate::state::collect_state_metadata(backend);
+            let reason = response
+                .error
+                .as_ref()
+                .map(|error| error.message.clone())
+                .unwrap_or_default();
+            value["policy"] = json!({
+                "decision": "deny",
+                "source": prepared.source,
+                "reason": reason,
+            });
+            let extra =
+                "the frontmost app is on the deny list, so the accessibility tree is omitted";
+            let note = value
+                .get("note")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(|text| format!("{text}; {extra}"))
+                .unwrap_or_else(|| extra.to_string());
+            value["note"] = json!(note);
+            return finish_action(
+                context,
+                label,
+                &prepared.subject,
+                prepared.warning.as_deref(),
+                "deny",
+                prepared.source,
+                chars,
+                Response::success(value),
+            );
+        }
         return finish_action(
             context,
             label,
@@ -1723,6 +1765,7 @@ enum PolicyClass {
     Quit,
     Key,
     ClipboardSet,
+    Script,
 }
 
 fn policy_class(action: &Action) -> PolicyClass {
@@ -1758,6 +1801,7 @@ fn policy_class(action: &Action) -> PolicyClass {
         Action::Key { .. } | Action::HoldKey { .. } => PolicyClass::Key,
         Action::ClipboardGet => PolicyClass::Benign,
         Action::ClipboardSet { .. } => PolicyClass::ClipboardSet,
+        Action::AppleEvent { .. } | Action::ShortcutsRun { .. } => PolicyClass::Script,
         _ => PolicyClass::Mutate,
     }
 }
@@ -1847,6 +1891,7 @@ fn prepare_action(
                 combo: String::new(),
             },
             PolicyClass::ClipboardSet => policy::PolicyAction::ClipboardSet,
+            PolicyClass::Script => policy::PolicyAction::Script,
         },
     };
     let decision = policy::decide(&loaded, &subject, &policy_action);
@@ -1873,7 +1918,11 @@ fn prepare_action(
     }
     let mutating = matches!(
         class,
-        PolicyClass::Mutate | PolicyClass::Quit | PolicyClass::Key | PolicyClass::ClipboardSet
+        PolicyClass::Mutate
+            | PolicyClass::Quit
+            | PolicyClass::Key
+            | PolicyClass::ClipboardSet
+            | PolicyClass::Script
     );
     if mutating && policy::is_paused() {
         let (decision_name, source) = decision_record(&decision);
@@ -1910,8 +1959,7 @@ fn prepare_action(
         }
     }
     if let policy::Decision::Confirm { reason } = &decision {
-        if let Err(error) = confirm_action(context, &loaded, &subject, action_label(action), reason)
-        {
+        if let Err(error) = confirm_action(context, &loaded, &subject, action, reason) {
             return Prepared {
                 stop: Some(Response::from_error(error)),
                 warning,
@@ -1943,7 +1991,7 @@ fn confirm_action(
     context: &CallContext,
     loaded: &policy::LoadedPolicy,
     subject: &policy::Subject,
-    action: &str,
+    action: &Action,
     reason: &str,
 ) -> Result<(), ComputerError> {
     let command = policy::confirm_program(loaded, context.confirm_cmd.as_deref());
@@ -1951,15 +1999,31 @@ fn confirm_action(
         command.as_deref(),
         loaded.timeout_secs(),
         &policy::ConfirmDocument {
-            action,
+            action: action_label(action),
             bundle_id: subject.bundle_id.as_deref(),
             path: subject.path.as_deref(),
             pid: subject.pid,
             window_id: subject.window_id,
             element: context.element,
             reason,
+            extra: confirm_extra(action),
         },
     )
+}
+
+/// Action-specific detail for the confirm hook. Never the script body.
+fn confirm_extra(action: &Action) -> Option<Value> {
+    match action {
+        Action::AppleEvent {
+            script, language, ..
+        } => Some(json!({
+            "script_bytes": script.len(),
+            "script_hash": policy::script_hash(script.as_bytes()),
+            "language": language.unwrap_or_default().as_str(),
+        })),
+        Action::ShortcutsRun { name } => Some(json!({"name": name})),
+        _ => None,
+    }
 }
 
 fn refuse_blocked_url(
@@ -3400,6 +3464,7 @@ fn confirm_title(context: &CallContext, action: &str, reason: &str) -> Result<()
             window_id: None,
             element: context.element,
             reason,
+            extra: None,
         },
     )
 }
@@ -4867,6 +4932,70 @@ mod tests {
         }
     }
 
+    /// A confirm hook that always allows. Returns the command and a directory
+    /// the caller can remove.
+    fn allow_confirm_hook() -> (String, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "computer-use-confirm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let allow = dir.join("allow.sh");
+            std::fs::write(&allow, "#!/bin/sh\ncat >/dev/null\nexit 0\n").unwrap();
+            std::fs::set_permissions(&allow, std::fs::Permissions::from_mode(0o700)).unwrap();
+            (allow.display().to_string(), dir)
+        }
+        #[cfg(windows)]
+        {
+            ("cmd /C exit 0".to_string(), dir)
+        }
+    }
+
+    #[test]
+    fn get_state_degrades_when_frontmost_is_denied() {
+        let backend = StubBackend {
+            frontmost_app: Some("Terminal".into()),
+            ..StubBackend::default()
+        };
+        let response = dispatch_with(&backend, Action::GetState);
+        let value = response.to_value();
+        assert_eq!(value["ok"], true, "{value:?}");
+        assert_eq!(value["frontmost_app"], "Terminal");
+        assert!(value["tree"].is_null(), "{value:?}");
+        assert_eq!(value["policy"]["decision"], "deny", "{value:?}");
+        assert!(
+            value["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("deny list"),
+            "{value:?}"
+        );
+    }
+
+    #[test]
+    fn script_actions_require_confirmation_by_default() {
+        let backend = StubBackend::default();
+        let response = dispatch_with(
+            &backend,
+            Action::AppleEvent {
+                app: Some("Notes".into()),
+                script: "get name".into(),
+                language: None,
+            },
+        );
+        assert!(!response.ok);
+        assert_eq!(response.to_value()["error"]["code"], "confirm_required");
+        assert!(backend.apple_event_calls.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn stub_inventory_launch_and_doctor() {
         let backend = StubBackend::default();
@@ -5935,6 +6064,9 @@ mod tests {
         let backend = StubBackend::default();
         *backend.apple_event_stdout.lock().unwrap() = "Notes".into();
         let secret = "system prompt with token ABCDEFG";
+        let (allow, dir) = allow_confirm_hook();
+        let mut context = ctx("Notes");
+        context.confirm_cmd = Some(allow);
         let response = dispatch_with_context(
             &backend,
             Action::AppleEvent {
@@ -5942,7 +6074,7 @@ mod tests {
                 script: secret.into(),
                 language: Some(AppleEventLanguage::AppleScript),
             },
-            &ctx("Notes"),
+            &context,
         );
         assert!(response.ok, "{:?}", response.to_value());
         let value = response.to_value();
@@ -5955,11 +6087,15 @@ mod tests {
         assert_eq!(recorded[0].1, AppleEventLanguage::AppleScript);
         // Audit-style storage must not capture the body verbatim.
         assert_eq!(recorded[0].2, secret.len());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn p9_apple_event_records_language_javascript() {
         let backend = StubBackend::default();
+        let (allow, dir) = allow_confirm_hook();
+        let mut context = ctx("Notes");
+        context.confirm_cmd = Some(allow);
         let response = dispatch_with_context(
             &backend,
             Action::AppleEvent {
@@ -5967,10 +6103,11 @@ mod tests {
                 script: "Application('Notes').name()".into(),
                 language: Some(AppleEventLanguage::JavaScript),
             },
-            &ctx("Notes"),
+            &context,
         );
         assert!(response.ok);
         assert_eq!(response.to_value()["language"], "JavaScript");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -5980,6 +6117,9 @@ mod tests {
             ..Default::default()
         };
         *backend.apple_event_stderr.lock().unwrap() = "execution error: 42".into();
+        let (allow, dir) = allow_confirm_hook();
+        let mut context = ctx("Notes");
+        context.confirm_cmd = Some(allow);
         let response = dispatch_with_context(
             &backend,
             Action::AppleEvent {
@@ -5987,10 +6127,11 @@ mod tests {
                 script: "1/0".into(),
                 language: None,
             },
-            &ctx("Notes"),
+            &context,
         );
         assert!(!response.ok);
         assert_eq!(response.to_value()["error"]["code"], "execution_failed");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -6111,7 +6252,10 @@ mod tests {
             let value = response.to_value();
             let code = value["error"]["code"].as_str().unwrap_or_default();
             assert!(
-                matches!(code, "execution_failed" | "unsupported"),
+                matches!(
+                    code,
+                    "execution_failed" | "unsupported" | "confirm_required"
+                ),
                 "{value:?}"
             );
         }

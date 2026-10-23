@@ -205,10 +205,24 @@ pub(crate) fn scroll(dx: i32, dy: i32) -> Result<(), ComputerError> {
 }
 
 pub(crate) fn cursor_position() -> Result<(i32, i32), ComputerError> {
-    let session = session()?;
-    session
-        .location()
-        .map_err(|error| ComputerError::ExecutionFailed(format!("cursor position failed: {error}")))
+    // macOS: CGEventGetLocation reads the pointer without the input
+    // permission that enigo's `location()` needs. Off macOS (and in tests,
+    // which use the stub backend) the enigo path stays.
+    #[cfg(all(target_os = "macos", not(test)))]
+    {
+        crate::backend::macos::input::cursor_xy()
+            .map(|(x, y)| (x.round() as i32, y.round() as i32))
+            .ok_or_else(|| {
+                ComputerError::ExecutionFailed("could not read the pointer position".into())
+            })
+    }
+    #[cfg(not(all(target_os = "macos", not(test))))]
+    {
+        let session = session()?;
+        session.location().map_err(|error| {
+            ComputerError::ExecutionFailed(format!("cursor position failed: {error}"))
+        })
+    }
 }
 
 /// Return an error when `key` is not a known name or a single character.

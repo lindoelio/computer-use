@@ -432,6 +432,8 @@ pub enum PolicyAction {
     },
     /// `clipboard_set` (P8). Classified here so that phase can call [`decide`].
     ClipboardSet,
+    /// `apple-event` and `shortcuts run`. Arbitrary script or workflow.
+    Script,
 }
 
 /// Allow, refuse, or ask the confirm hook.
@@ -680,6 +682,12 @@ fn quit_protected(target: &Subject) -> bool {
 }
 
 fn confirm_reason(action: &PolicyAction) -> Option<String> {
+    if matches!(action, PolicyAction::Script) {
+        return Some(
+            "runs an arbitrary Apple event script or Shortcuts workflow; configure a confirm hook to allow it"
+                .into(),
+        );
+    }
     match action {
         PolicyAction::Quit => Some("quit".into()),
         PolicyAction::ClipboardSet => Some("clipboard_set".into()),
@@ -1196,6 +1204,10 @@ pub struct ConfirmDocument<'a> {
     pub element: Option<u32>,
     /// Why this action is sensitive.
     pub reason: &'a str,
+    /// Action-specific detail that does not contain the secret body: script
+    /// bytes and hash for `apple-event`, the workflow name for `shortcuts`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra: Option<serde_json::Value>,
 }
 
 /// Spawn the hook. Exit 0 proceeds. Any other result is `confirm_denied`.
@@ -1223,6 +1235,7 @@ pub fn run_confirm(
         "window_id": document.window_id,
         "element": document.element,
         "reason": document.reason,
+        "extra": document.extra,
     });
     let bytes = serde_json::to_vec(&payload).map_err(|error| {
         ComputerError::ExecutionFailed(format!("confirm document encode failed: {error}"))
@@ -1291,6 +1304,19 @@ pub fn sensitive_title(title: &str) -> bool {
                 "delete" | "erase" | "pay" | "purchase" | "send" | "submit"
             )
         })
+}
+
+/// Stable FNV-1a 64-bit hex hash. Used by the audit log and the confirm
+/// document so a hook can identify a script without seeing its body.
+pub fn script_hash(bytes: &[u8]) -> String {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut hash = OFFSET;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    format!("{hash:016x}")
 }
 
 /// `cmd+q` and `alt+f4`.
@@ -1815,6 +1841,7 @@ mod tests {
             window_id: None,
             element: None,
             reason: "quit",
+            extra: None,
         };
         #[cfg(unix)]
         let (allow, deny) = {
