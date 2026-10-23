@@ -2150,6 +2150,143 @@ mod tests {
     }
 
     #[test]
+    fn user_sections_set_security_audit_window_and_confirm() {
+        let dir = temp_dir("sections");
+        let user = dir.join("user.toml");
+        std::fs::write(
+            &user,
+            r#"version = 1
+
+[security]
+secure_focus = "warn"
+unreadable_focus = "deny"
+
+[audit]
+enabled = false
+max_bytes = 4096
+keep = 9
+
+[window]
+clamp = false
+
+[confirm]
+command = "/usr/local/bin/computer-use-confirm"
+timeout_secs = 400
+
+[builtin_deny]
+exempt = ["app.crynta.terax", "  ", "app.crynta.terax"]
+"#,
+        )
+        .unwrap();
+        let policy = load_paths(Some(&user), None).unwrap();
+        assert_eq!(policy.secure_focus(), FocusDecision::Warn);
+        assert_eq!(policy.unreadable_focus(), FocusDecision::Deny);
+        assert!(!policy.audit_enabled());
+        assert_eq!(policy.audit_max_bytes(), 4096);
+        assert_eq!(policy.audit_keep(), 5, "keep is clamped to 5");
+        assert!(!policy.window_clamp());
+        assert_eq!(policy.timeout_secs(), 120, "the hook timeout is capped");
+        assert_eq!(policy.builtin_exempt(), ["app.crynta.terax"]);
+        assert_eq!(
+            confirm_program(&policy, None).as_deref(),
+            Some("/usr/local/bin/computer-use-confirm")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn admin_sections_win_over_user_and_errors_name_the_line() {
+        let dir = temp_dir("sections-admin");
+        let admin = dir.join("admin.toml");
+        let user = dir.join("user.toml");
+        std::fs::write(
+            &admin,
+            "version = 1\n[security]\nsecure_focus = \"deny\"\n[window]\nclamp = true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &user,
+            "version = 1\n[security]\nsecure_focus = \"warn\"\n[window]\nclamp = false\n",
+        )
+        .unwrap();
+        let policy = load_paths(Some(&user), Some(&admin)).unwrap();
+        assert_eq!(
+            policy.secure_focus(),
+            FocusDecision::Deny,
+            "the admin file owns the section"
+        );
+        assert!(policy.window_clamp(), "the admin file owns the section");
+
+        let bad = dir.join("bad.toml");
+        std::fs::write(&bad, "version = 1\n[security]\nsecure_focus = \"maybe\"\n").unwrap();
+        let error = load_paths(Some(&bad), None).unwrap_err();
+        assert_eq!(error.code(), "invalid_arguments");
+        assert!(error.to_string().contains("secure_focus"), "{error}");
+
+        std::fs::write(&bad, "version = 1\n[audit]\nmax_bytes = 10\n").unwrap();
+        let error = load_paths(Some(&bad), None).unwrap_err();
+        assert!(error.to_string().contains("at least 1024"), "{error}");
+
+        std::fs::write(&bad, "version = 2\n").unwrap();
+        let error = load_paths(Some(&bad), None).unwrap_err();
+        assert!(error.to_string().contains("version must be 1"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn builtin_exemption_parses_and_dedupes() {
+        let dir = temp_dir("exempt");
+        let user = dir.join("user.toml");
+        std::fs::write(
+            &user,
+            "version = 1\n[builtin_deny]\nexempt = [\"app.crynta.terax\", \"  \", \"app.crynta.terax\"]\n",
+        )
+        .unwrap();
+        let policy = load_paths(Some(&user), None).unwrap();
+        assert_eq!(
+            policy.builtin_exempt(),
+            ["app.crynta.terax"],
+            "blank entries are dropped and repeats collapse"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn url_in_text_only_accepts_http_and_file_tokens() {
+        assert_eq!(
+            url_in_text("open https://example.com/a now"),
+            Some("https://example.com/a")
+        );
+        assert_eq!(
+            url_in_text("(http://example.com)"),
+            Some("http://example.com")
+        );
+        assert_eq!(url_in_text("file:///tmp/x"), Some("file:///tmp/x"));
+        assert_eq!(url_in_text("ftp://example.com"), None);
+        assert_eq!(url_in_text("no url here"), None);
+    }
+
+    #[test]
+    fn browser_detection_matches_names_paths_and_bundle_ids() {
+        assert!(is_browser(
+            Some("com.google.Chrome"),
+            None,
+            Some("Google Chrome")
+        ));
+        assert!(is_browser(
+            None,
+            Some(Path::new("/Applications/Safari.app/Contents/MacOS/Safari")),
+            None
+        ));
+        assert!(is_browser(None, None, Some("Firefox")));
+        assert!(!is_browser(
+            Some("com.apple.Notes"),
+            Some(Path::new("/Applications/Notes.app/Contents/MacOS/Notes")),
+            Some("Notes")
+        ));
+    }
+
+    #[test]
     fn confirm_hook_exit_codes() {
         let dir = temp_dir("confirm");
         let document = ConfirmDocument {

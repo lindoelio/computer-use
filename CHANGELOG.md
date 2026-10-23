@@ -68,6 +68,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Tests
 
+- `scripts/coverage-gate.py` and `coverage-allowlist.json` gate line coverage from a `cargo llvm-cov --json` report; the new `coverage` CI job enforces a floor on macOS (82% today, 90% target, ~1,700 lines to go) and reports the number on Linux and Windows. `docs/COVERAGE.md` lists every exclusion with its reason.
+- `tests/cli.rs` sweeps the whole command surface with the cross-process pause marker set, so every mutating command is exercised — and refused — without posting input; a second sweep decodes every browser action through `exec`.
+- Unit tests cover the `DesktopBackend` trait defaults through a minimal backend, the policy `[security]`/`[audit]`/`[window]`/`[builtin_deny]` merge and error paths, the wait state parsers and condition descriptions, and the wait observation/snippet behavior.
 - `tests/ocr_live.rs` runs `ocr --image` through the compiled binary against a committed PNG fixture (macOS Vision, no TCC needed).
 - Wait/verify, audit rotation, secure-focus, sensitive-menu, list-windows/apps, window-control, and doctor `--full` unit coverage; `docs/CLI.md` and `tests/cli_doc_matches_help.rs` list the new actions and subcommands.
 - New `tests/cdp_live.rs` starts a real headless Chromium with an isolated profile and an in-process HTTP fixture server. It covers `tabs` (`kind`), navigate, snapshot, click by ref, type, secure-field refusal, and blocked URLs. The new `cdp-live` CI job runs it on macOS, Linux, and Windows.

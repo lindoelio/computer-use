@@ -425,6 +425,206 @@ fn json_flag_wait_roundtrip() {
     assert_json_wait(&["--json"]);
 }
 
+/// Run the binary with an isolated state directory.
+fn run_in_state(args: &[&str], state: &str) -> std::process::Output {
+    let mut command = Command::new(bin());
+    command
+        .args(args)
+        .env("XDG_CACHE_HOME", cache_home())
+        .env("XDG_CONFIG_HOME", config_home())
+        .env("XDG_STATE_HOME", state)
+        .env("COMPUTER_USE_ADMIN_POLICY", missing_admin())
+        .env_remove("COMPUTER_USE_CONFIRM_CMD");
+    command.output().expect("spawn computer-use")
+}
+
+/// Exercise every top-level command once.
+///
+/// The state directory starts paused, so mutating actions answer `paused`
+/// before any input is posted or any app is touched. Read-only commands run
+/// for real (a capture, a list, a permission probe). Every call must print one
+/// JSON object and must not panic.
+#[test]
+fn cli_surface_sweep_is_guarded_and_well_formed() {
+    let state = std::env::temp_dir().join(format!("computer-use-sweep-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&state);
+    std::fs::create_dir_all(&state).expect("sweep state dir");
+    let state = state.to_string_lossy().into_owned();
+    let shot = std::env::temp_dir().join(format!(
+        "computer-use-sweep-shot-{}.png",
+        std::process::id()
+    ));
+    let shot = shot.to_string_lossy().into_owned();
+
+    let paused = run_in_state(&["pause"], &state);
+    assert!(
+        paused.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&paused.stderr)
+    );
+
+    let invocations: &[&[&str]] = &[
+        // Read-only surface.
+        &["displays"],
+        &["isolation"],
+        &["cursor-position"],
+        &["get-state"],
+        &["doctor"],
+        &["doctor", "--full"],
+        &["list-apps"],
+        &["list-apps", "--all", "--match", "N*"],
+        &["list-windows"],
+        &["list-windows", "--all"],
+        &["policy", "check", "--app", "Finder"],
+        &["session", "prune", "--dry-run"],
+        &["audit", "path"],
+        &["audit", "tail", "--lines", "5"],
+        &["spaces"],
+        &["spaces", "move", "--to-space", "2"],
+        &["window", "info"],
+        &["window", "state", "--app", "no-such-app-xyz"],
+        &["screenshot", "--region", "0,0,2,2", "--output", &shot],
+        &["zoom", "--region", "0,0,2,2", "--output", &shot],
+        &["tree", "--app", "Finder"],
+        &["ocr", "--app", "Finder"],
+        &["ocr", "--image", "/definitely/missing/image.png"],
+        &["wait", "--ms", "1"],
+        &["wait", "--text", "x", "--timeout-ms", "50"],
+        &["verify", "--element", "1", "--element-state", "bogus"],
+        &["clipboard", "get"],
+        // Mutating surface: the pause marker refuses each one.
+        &["click", "--x", "1", "--y", "1"],
+        &["click", "--x", "1", "--y", "1", "--count", "2"],
+        &["move", "--x", "1", "--y", "1"],
+        &["type", "--text", "sweep"],
+        &["key", "cmd+s"],
+        &["hold-key", "--keys", "a", "--ms", "1"],
+        &["scroll", "--dy", "1"],
+        &["drag", "--path", "1,1,2,2"],
+        &["mouse-down", "--x", "1", "--y", "1"],
+        &["mouse-up", "--x", "1", "--y", "1"],
+        &["press", "--app", "Finder", "--element", "0"],
+        &["focus", "--app", "Finder", "--element", "0"],
+        &[
+            "set-value",
+            "--app",
+            "Finder",
+            "--element",
+            "0",
+            "--value",
+            "x",
+        ],
+        &["select-text", "--app", "Finder", "--element", "0"],
+        &[
+            "perform-action",
+            "--app",
+            "Finder",
+            "--element",
+            "0",
+            "--name",
+            "AXPress",
+        ],
+        &["scroll-to", "--app", "Finder", "--element", "0"],
+        &["clipboard", "set", "--text", "sweep"],
+        &["launch", "--app", "no-such-app-xyz"],
+        &["activate", "--app", "no-such-app-xyz"],
+        &["quit", "--app", "no-such-app-xyz"],
+        &["window", "move", "--x", "1", "--y", "1"],
+        &["window", "resize", "--width", "100", "--height", "100"],
+        &["window", "set", "--width", "100"],
+        // The rest of the surface, refused before acting.
+        &["menu", "list", "--app", "Finder"],
+        &["menu", "click", "--app", "Finder", "--path", "File > Save"],
+        &["apple-event", "--app", "Finder", "--script", "get name"],
+        &["shortcuts", "run", "no-such-shortcut"],
+        &["dock", "list"],
+        &["dock", "click", "--title", "no-such-dock-item"],
+        &["overlay"],
+        &["browser"],
+        &["--cdp", "browser", "sessions"],
+        &["exec", r#"{"action":"isolation"}"#],
+        &["batch", r#"{"action":"batch","actions":[]}"#],
+    ];
+
+    for args in invocations {
+        let output = run_in_state(args, &state);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("panicked at"),
+            "`{}` panicked: {stderr}",
+            args.join(" ")
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let value: Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|error| {
+            panic!(
+                "`{}` did not print one JSON object: {stdout:?} ({error})",
+                args.join(" ")
+            )
+        });
+        assert!(
+            value.get("ok").is_some(),
+            "`{}` returned no ok field: {value}",
+            args.join(" ")
+        );
+    }
+
+    let resumed = run_in_state(&["resume"], &state);
+    assert!(
+        resumed.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    let _ = std::fs::remove_file(&shot);
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+/// Every browser action is decodable through `exec` even when the CDP
+/// feature is built in but no browser is reachable.
+#[test]
+fn exec_sweeps_the_browser_actions() {
+    let actions: &[&str] = &[
+        "browser_tabs",
+        "browser_activate",
+        "browser_navigate",
+        "browser_back",
+        "browser_forward",
+        "browser_reload",
+        "browser_wait",
+        "browser_snapshot",
+        "browser_click",
+        "browser_text",
+        "browser_type",
+        "browser_press",
+        "browser_hover",
+        "browser_scroll",
+        "browser_select",
+        "browser_check",
+        "browser_upload",
+        "browser_dialog",
+        "browser_screenshot",
+        "browser_eval",
+        "browser_tab_new",
+        "browser_tab_close",
+        "browser_launch",
+        "browser_quit",
+        "browser_sessions",
+        "browser_batch",
+    ];
+    for action in actions {
+        let line = format!(r#"{{"action":"{action}","target_id":"none"}}"#);
+        let output = run(&["exec", &line]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("panicked at"),
+            "{action} panicked: {stderr}"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let value: Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|error| panic!("{action}: {stdout:?} ({error})"));
+        assert!(value.get("ok").is_some(), "{action}: {value}");
+    }
+}
+
 fn assert_json_wait(args: &[&str]) {
     let mut child = command(args)
         .stdin(Stdio::piped())

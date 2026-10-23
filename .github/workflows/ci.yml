@@ -157,3 +157,62 @@ jobs:
           test "${short}" = "${version}"
           "${app}/Contents/MacOS/computer-use" doctor > "${tmp}/doctor.json"
           python3 -c 'import json,sys; report=json.load(open(sys.argv[1])); assert report["ok"] is True; assert report["bundle_id"]=="ai.lindoelio.computer-use"; assert report["identity"]["bundled"] is True; assert report["identity"]["bundle_id"]=="ai.lindoelio.computer-use"' "${tmp}/doctor.json"
+
+  coverage:
+    name: coverage (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            coverage_os: macos
+            enforce: "1"
+          - os: ubuntu-latest
+            coverage_os: linux
+            enforce: "0"
+          - os: windows-latest
+            coverage_os: windows
+            enforce: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux build dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libxdo-dev libx11-dev libxcb1-dev \
+            libxrandr-dev libdbus-1-dev libxkbcommon-dev libatspi2.0-dev \
+            libpipewire-0.3-dev libclang-dev clang
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Install Chrome for Testing
+        id: chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+      - name: Point the tests at Chrome
+        shell: bash
+        run: echo "CHROME_BIN=${{ steps.chrome.outputs.chrome-path }}" >> "$GITHUB_ENV"
+      - name: Measure line coverage
+        shell: bash
+        run: cargo llvm-cov --all-targets --all-features --json --output-path cov.json
+      - name: Enforce the floor
+        if: matrix.enforce == '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          py=python3
+          command -v python3 >/dev/null 2>&1 || py=python
+          "$py" scripts/coverage-gate.py cov.json --os ${{ matrix.coverage_os }}
+      - name: Report the floor
+        if: matrix.enforce != '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          py=python3
+          command -v python3 >/dev/null 2>&1 || py=python
+          "$py" scripts/coverage-gate.py cov.json --os ${{ matrix.coverage_os }} --mode report

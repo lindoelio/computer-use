@@ -338,4 +338,83 @@ mod tests {
         assert_eq!(snippet("anything", "absent", false), "");
         assert_eq!(snippet("", "x", false), "");
     }
+
+    #[test]
+    fn state_parsers_reject_unknown_tokens() {
+        let error = ElementState::parse("maybe").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("exists, gone, visible, or enabled"));
+        let error = WindowState::parse("maybe").unwrap_err();
+        assert!(error.to_string().contains("exists or gone"));
+        assert_eq!(ElementState::parse("  GONE  ").unwrap(), ElementState::Gone);
+        assert_eq!(ElementState::Exists.as_str(), "exists");
+        assert_eq!(ElementState::Gone.as_str(), "gone");
+        assert_eq!(ElementState::Visible.as_str(), "visible");
+        assert_eq!(ElementState::Enabled.as_str(), "enabled");
+        assert_eq!(WindowState::Exists.as_str(), "exists");
+        assert_eq!(WindowState::Gone.as_str(), "gone");
+    }
+
+    #[test]
+    fn spec_bounds_and_descriptions() {
+        assert!(WaitSpec::new(Condition::TreeChange, MAX_TIMEOUT_MS + 1, 100).is_err());
+        assert!(WaitSpec::new(Condition::TreeChange, 1_000, MAX_POLL_MS + 1).is_err());
+        assert!(WaitSpec::new(Condition::TreeChange, 1_000, MIN_POLL_MS).is_ok());
+
+        let conditions = vec![
+            Condition::Element {
+                index: 4,
+                state: ElementState::Visible,
+            },
+            Condition::Text {
+                needle: "hi".into(),
+                ignore_case: false,
+                within_element: None,
+            },
+            Condition::Text {
+                needle: "hi".into(),
+                ignore_case: false,
+                within_element: Some(2),
+            },
+            Condition::Value {
+                index: 1,
+                needle: "v".into(),
+                ignore_case: false,
+            },
+            Condition::Window {
+                state: WindowState::Gone,
+                selector: Some("id:9".into()),
+            },
+            Condition::Window {
+                state: WindowState::Exists,
+                selector: None,
+            },
+            Condition::TreeChange,
+            Condition::AppRunning {
+                name: "Notes".into(),
+                ignore_case: false,
+            },
+            Condition::Title {
+                needle: "Save".into(),
+                ignore_case: false,
+            },
+        ];
+        for condition in &conditions {
+            assert!(!condition.as_str().is_empty());
+            assert!(!condition.describe().is_empty(), "{condition:?}");
+        }
+        assert_eq!(conditions[0].as_str(), "element");
+        assert_eq!(conditions[1].as_str(), "text");
+        assert_eq!(conditions[3].as_str(), "value");
+        assert_eq!(conditions[4].as_str(), "window");
+        assert_eq!(conditions[6].as_str(), "tree_change");
+        assert_eq!(conditions[7].as_str(), "app_running");
+        assert_eq!(conditions[8].as_str(), "title");
+        assert!(conditions[2].describe().contains("inside element 2"));
+        assert!(conditions[4].describe().contains("id:9"));
+
+        assert!(contains("anything", "", false), "an empty needle matches");
+        assert!(contains("anything", "", true));
+    }
 }

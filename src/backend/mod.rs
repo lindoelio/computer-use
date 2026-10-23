@@ -1045,6 +1045,112 @@ mod tests {
         let _backend: &dyn DesktopBackend = backend.as_ref();
     }
 
+    /// A backend that implements only the required methods, so every trait
+    /// default runs.
+    struct MinimalBackend;
+
+    impl DesktopBackend for MinimalBackend {
+        fn screenshot(&self, _region: Option<Region>) -> Result<Frame, ComputerError> {
+            Err(unsupported("screenshot"))
+        }
+        fn move_mouse(&self, _x: i32, _y: i32) -> Result<(), ComputerError> {
+            Err(unsupported("move"))
+        }
+        fn simulate_click(&self, _x: i32, _y: i32, _b: MouseButton) -> Result<(), ComputerError> {
+            Err(unsupported("click"))
+        }
+        fn simulate_type(&self, _text: &str) -> Result<(), ComputerError> {
+            Err(unsupported("type"))
+        }
+        fn simulate_key(&self, _m: &[Modifier], _k: &str) -> Result<(), ComputerError> {
+            Err(unsupported("key"))
+        }
+        fn simulate_scroll(&self, _dx: i32, _dy: i32) -> Result<(), ComputerError> {
+            Err(unsupported("scroll"))
+        }
+        fn cursor_position(&self) -> Result<(i32, i32), ComputerError> {
+            Err(unsupported("cursor"))
+        }
+        fn list_displays(&self) -> Result<Vec<crate::types::DisplayInfo>, ComputerError> {
+            Err(unsupported("displays"))
+        }
+        fn frontmost(&self) -> crate::types::FrontmostInfo {
+            crate::types::FrontmostInfo::default()
+        }
+        fn inspect_accessibility(&self, _app: Option<&str>) -> Result<String, ComputerError> {
+            Err(unsupported("tree"))
+        }
+    }
+
+    fn query() -> TreeQuery {
+        TreeQuery {
+            app: None,
+            window: None,
+            full: false,
+            diff: false,
+            session: None,
+        }
+    }
+
+    #[test]
+    fn trait_defaults_report_unsupported() {
+        let backend = MinimalBackend;
+        let unsupported_calls: Vec<(&str, ComputerError)> = vec![
+            ("list_apps", backend.list_apps(false).unwrap_err()),
+            ("list_windows", backend.list_windows().unwrap_err()),
+            ("launch", backend.launch("Notes").unwrap_err()),
+            ("activate", backend.activate("Notes", None).unwrap_err()),
+            ("quit", backend.quit("Notes", false).unwrap_err()),
+            ("menu_list", backend.menu_list("Notes", 2).unwrap_err()),
+            (
+                "menu_click",
+                backend
+                    .menu_click("Notes", &crate::menu_path::parse("File > Save").unwrap())
+                    .unwrap_err(),
+            ),
+            (
+                "apple_event",
+                backend
+                    .apple_event("Notes", "return 1", AppleEventLanguage::default())
+                    .unwrap_err(),
+            ),
+            ("dock_list", backend.dock_list().unwrap_err()),
+            ("dock_click", backend.dock_click("Notes").unwrap_err()),
+            ("spaces", backend.spaces().unwrap_err()),
+            ("doctor", backend.doctor(Default::default()).unwrap_err()),
+            ("tree", backend.tree(&query()).unwrap_err()),
+            (
+                "ocr",
+                backend
+                    .recognize_text(
+                        &image::RgbaImage::new(1, 1),
+                        &crate::image_util::ScreenshotMap::identity(1, 1),
+                    )
+                    .unwrap_err(),
+            ),
+        ];
+        for (name, error) in unsupported_calls {
+            assert_eq!(error.code(), "unsupported", "{name}: {error}");
+        }
+    }
+
+    #[test]
+    fn trait_defaults_are_empty_or_neutral() {
+        let backend = MinimalBackend;
+        assert!(backend.end_session(None).unwrap().is_empty());
+        assert!(backend.display_block().is_none());
+        assert!(backend
+            .marks_for_tree(&query(), &crate::image_util::ScreenshotMap::identity(1, 1))
+            .unwrap()
+            .is_empty());
+        assert!(backend
+            .secure_ocr_frames(&query(), &crate::image_util::ScreenshotMap::identity(1, 1))
+            .unwrap()
+            .is_empty());
+        backend.release_held().unwrap();
+        let _capabilities = backend.input_support();
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_element_state_fails_closed() {

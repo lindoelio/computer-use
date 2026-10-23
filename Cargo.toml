@@ -29,6 +29,7 @@ include = [
     "/docs/ISOLATION.md",
     "/docs/PACKAGING.md",
     "/docs/SKYLIGHT.md",
+    "/docs/COVERAGE.md",
     "/docs/policy.example.toml",
     # macOS .app packaging assets and the build script. The bundle id is
     # `ai.lindoelio.computer-use`; the script ad-hoc signs when no Developer
@@ -36,6 +37,10 @@ include = [
     "/packaging/macos/Info.plist",
     "/packaging/macos/entitlements.plist",
     "/scripts/package-macos-app.sh",
+    # CI helpers: the tag-release guard and the coverage gate.
+    "/scripts/check-macos-app-status.sh",
+    "/scripts/coverage-gate.py",
+    "/coverage-allowlist.json",
 ]
 
 [lib]

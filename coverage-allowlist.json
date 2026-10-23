@@ -1,0 +1,137 @@
+{
+  "target": 90.0,
+  "threshold": 82.0,
+  "per_file_threshold": 0,
+  "notes": [
+    "target is the goal for measurable code (scripts/coverage-gate.py prints the gap).",
+    "threshold is the enforced regression floor; raise it as tests land, then set it to target.",
+    "per_file_threshold is 0 (disabled) while the target is still being worked toward.",
+    "These entries cannot execute on the runner; see docs/COVERAGE.md for the reasoning."
+  ],
+  "allow": [
+    {
+      "path": "src/backend/macos/ax.rs",
+      "os": ["macos"],
+      "reason": "Accessibility TCC cannot be granted to a CI test binary; the live AX tree and element actions need a real desktop session."
+    },
+    {
+      "path": "src/backend/macos/capture.rs",
+      "os": ["macos"],
+      "reason": "ScreenCaptureKit frames need the Screen Recording grant."
+    },
+    {
+      "path": "src/backend/macos/input.rs",
+      "os": ["macos"],
+      "reason": "Posts real input events and moves the cursor; needs the Post Event grant."
+    },
+    {
+      "path": "src/backend/macos/menu.rs",
+      "os": ["macos"],
+      "reason": "AX menu-bar walk over the Accessibility trust."
+    },
+    {
+      "path": "src/backend/macos/dock.rs",
+      "os": ["macos"],
+      "reason": "AX Dock walk over the Accessibility trust."
+    },
+    {
+      "path": "src/backend/macos/apps.rs",
+      "os": ["macos"],
+      "reason": "NSWorkspace activation/termination and the on-screen window list need a live desktop session."
+    },
+    {
+      "path": "src/backend/macos/scroll_ax.rs",
+      "os": ["macos"],
+      "reason": "Reads AX scroll bars during a live scroll."
+    },
+    {
+      "path": "src/backend/macos/overlay.rs",
+      "os": ["macos"],
+      "reason": "Opens a click-through window and is compiled out of test builds."
+    },
+    {
+      "path": "src/backend/macos/focus.rs",
+      "os": ["macos"],
+      "reason": "Private SkyLight call, compiled only with the feature and outside test builds."
+    },
+    {
+      "path": "src/backend/macos/doctor.rs",
+      "os": ["macos"],
+      "reason": "codesign, AppKit bundle identity, and the TCC responsible-app chain of a signed bundle."
+    },
+    {
+      "path": "src/backend/linux/mod.rs",
+      "os": ["linux"],
+      "reason": "Display, window, and app enumeration need an X server or a portal session."
+    },
+    {
+      "path": "src/backend/linux/atspi.rs",
+      "os": ["linux"],
+      "reason": "AT-SPI needs a running accessibility bus and a live application tree."
+    },
+    {
+      "path": "src/backend/linux/portal.rs",
+      "os": ["linux"],
+      "reason": "XDG Desktop Portal capture and RemoteDesktop need a portal daemon and PipeWire."
+    },
+    {
+      "path": "src/backend/linux/x11.rs",
+      "os": ["linux"],
+      "reason": "XTest input needs an X server to post into."
+    },
+    {
+      "path": "src/backend/linux/runtime.rs",
+      "os": ["linux"],
+      "reason": "The lazily built tokio runtime is only reached through the AT-SPI and portal paths."
+    },
+    {
+      "path": "src/backend/windows/mod.rs",
+      "os": ["windows"],
+      "reason": "Win32 window enumeration and the integrity token probe need an interactive desktop."
+    },
+    {
+      "path": "src/backend/windows/uia.rs",
+      "os": ["windows"],
+      "reason": "UI Automation needs an interactive desktop session, which a hosted runner does not provide."
+    },
+    {
+      "path": "src/backend/windows/apps.rs",
+      "os": ["windows"],
+      "reason": "Win32 enumeration and process-image lookups need an interactive desktop."
+    },
+    {
+      "path": "src/backend/windows/capture.rs",
+      "os": ["windows"],
+      "reason": "Windows.Graphics.Capture needs a live compositor frame."
+    },
+    {
+      "path": "src/backend/windows/activate.rs",
+      "os": ["windows"],
+      "reason": "Foreground activation and the enigo retry need a real window."
+    },
+    {
+      "path": "src/backend/capture.rs",
+      "reason": "xcap monitor capture needs an enumerable display; the stub backend covers the dispatch."
+    },
+    {
+      "path": "src/backend/input.rs",
+      "reason": "Event posting for the event tier; the stub backend records the calls instead."
+    },
+    {
+      "path": "src/backend/held.rs",
+      "reason": "The process-global hold registry only matters over the real input path."
+    },
+    {
+      "path": "src/backend/clipboard.rs",
+      "reason": "Reads and writes the real system pasteboard; tests inject a stub."
+    },
+    {
+      "path": "src/browser/launch.rs",
+      "reason": "Spawns a managed Chromium; the live CDP suite starts its own browser. Remove this entry when a live test drives `browser launch`."
+    },
+    {
+      "path": "src/test_backend.rs",
+      "reason": "Test scaffolding compiled into test builds only."
+    }
+  ]
+}
