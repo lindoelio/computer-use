@@ -963,7 +963,7 @@ computer-use spaces
 Feature `cdp` only. Off by default in `cargo install`; **on in the release binaries** since 0.4.0.
 
 > **0.4.0 update.** The original P10 surface (seven commands, CSS only, no
-> waits) is superseded by the CDP v2 driver: `browser snapshot` with `ref=eN`
+> waits) is superseded by the complete CDP driver: `browser snapshot` with `ref=eN`
 > handles, wait modes, managed `browser launch/quit`, actionability,
 > secure-field refusal, tab redaction, and live tests in `tests/cdp_live.rs`.
 > The sections below describe the original phase and stay for history.

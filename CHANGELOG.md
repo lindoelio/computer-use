@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-#### Browser (CDP v2)
+#### Browser (CDP)
 
 - `browser snapshot` captures a compact accessibility tree with stable `ref=eN` handles and a `--diff` delta against the `--session` baseline. `browser click`, `text`, and `type` accept `--ref` in addition to `--selector`. A ref from a different document returns `stale_element` instead of acting on the wrong page.
 - `browser navigate` now waits by default: `--wait none|load|domcontentloaded|networkidle|selector:<css>|url:<glob>` with `--timeout-ms`. Navigation goes through `location.assign` plus polling so it does not depend on the chromiumoxide frame-manager load path.
