@@ -18,6 +18,35 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  cdp-live:
+    name: cdp-live (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux build dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libxdo-dev libx11-dev libxcb1-dev \
+            libxrandr-dev libdbus-1-dev libxkbcommon-dev libatspi2.0-dev \
+            libclang-dev clang
+      - name: Install Chrome for Testing
+        id: chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+      - name: Point the tests at Chrome
+        shell: bash
+        run: echo "CHROME_BIN=${{ steps.chrome.outputs.chrome-path }}" >> "$GITHUB_ENV"
+      - name: Live CDP tests
+        run: cargo test --features cdp --test cdp_live -- --test-threads=1
+
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

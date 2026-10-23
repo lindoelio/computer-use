@@ -1375,7 +1375,11 @@ fn slash_star_origin(pattern: &str, url: &str) -> bool {
     url == origin || url.starts_with(&format!("{origin}?"))
 }
 
-fn glob_match(pattern: &str, text: &str) -> bool {
+/// Match a `*` glob the same way `[browser].blocked_urls` does.
+///
+/// `*` matches any run of characters, including `/`. The comparison is
+/// case-sensitive, like the policy check.
+pub fn glob_match(pattern: &str, text: &str) -> bool {
     let parts: Vec<&str> = pattern.split('*').collect();
     if parts.len() == 1 {
         return pattern == text;

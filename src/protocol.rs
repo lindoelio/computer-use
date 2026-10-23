@@ -430,7 +430,7 @@ pub enum Action {
     /// between spaces; otherwise the action reports the visible state only.
     #[serde(alias = "spaces")]
     Spaces {},
-    /// List the tabs the running Chrome exposes. Requires `--features cdp`.
+    /// List the tabs the running Chromium exposes. Requires `--features cdp`.
     /// Without the feature this returns `unsupported`.
     #[serde(rename = "browser_tabs", alias = "browser-tabs")]
     BrowserTabs {},
@@ -441,65 +441,341 @@ pub enum Action {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target_id: Option<String>,
     },
-    /// Navigate the named tab (or first page) to `url`. The URL is checked
-    /// against `[browser].blocked_urls` before the websocket is touched.
+    /// Navigate a tab to `url`. Requires `--features cdp`.
     #[serde(rename = "browser_navigate", alias = "browser-navigate")]
     BrowserNavigate {
         /// Destination URL.
         url: String,
-        /// Restrict to one tab. Optional.
+        /// Restrict to one tab.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_id: Option<String>,
+        /// `none`, `load`, `domcontentloaded`, `networkidle`,
+        /// `selector:<css>`, or `url:<glob>`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wait: Option<String>,
+        /// Timeout in milliseconds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+        /// Open the URL in a new tab.
+        #[serde(default, skip_serializing_if = "is_false")]
+        new_tab: bool,
+    },
+    /// Go back in the tab's history.
+    #[serde(rename = "browser_back", alias = "browser-back")]
+    BrowserBack {
+        /// Restrict to one tab.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target_id: Option<String>,
     },
-    /// Click an element matched by CSS `selector`. Requires `--features cdp`.
+    /// Go forward in the tab's history.
+    #[serde(rename = "browser_forward", alias = "browser-forward")]
+    BrowserForward {
+        /// Restrict to one tab.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_id: Option<String>,
+    },
+    /// Reload the tab.
+    #[serde(rename = "browser_reload", alias = "browser-reload")]
+    BrowserReload {
+        /// Restrict to one tab.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_id: Option<String>,
+        /// Wait condition after the reload.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wait: Option<String>,
+        /// Timeout in milliseconds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+    },
+    /// Wait for a condition without navigating.
+    #[serde(rename = "browser_wait", alias = "browser-wait")]
+    BrowserWait {
+        /// Restrict to one tab.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_id: Option<String>,
+        /// `none`, `load`, `domcontentloaded`, `networkidle`,
+        /// `selector:<css>`, or `url:<glob>`.
+        wait: String,
+        /// Timeout in milliseconds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+    },
+    /// Capture a compact accessibility snapshot with stable refs.
+    #[serde(rename = "browser_snapshot", alias = "browser-snapshot")]
+    BrowserSnapshot {
+        /// Restrict to one tab.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_id: Option<String>,
+        /// Return only the delta against the cached snapshot.
+        #[serde(default, skip_serializing_if = "is_false")]
+        diff: bool,
+        /// Only actionable controls.
+        #[serde(default, skip_serializing_if = "is_false")]
+        interactive_only: bool,
+        /// Maximum rendered nodes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_nodes: Option<usize>,
+    },
+    /// Click an element by CSS selector or snapshot ref.
     #[serde(rename = "browser_click", alias = "browser-click")]
     BrowserClick {
-        /// CSS selector.
-        selector: String,
-        /// Restrict to one tab. Optional.
+        /// CSS selector. Mutually exclusive with `ref_id`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selector: Option<String>,
+        /// Snapshot ref such as `e12`. Mutually exclusive with `selector`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ref_id: Option<String>,
+        /// Restrict to one tab.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target_id: Option<String>,
+        /// Mouse button.
+        #[serde(default)]
+        button: MouseButton,
+        /// Click count: 1, 2, or 3.
+        #[serde(default = "default_press_count")]
+        count: u8,
+        /// Wait condition after the click.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wait: Option<String>,
+        /// Timeout in milliseconds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+        /// Skip visibility/enabled checks.
+        #[serde(default, skip_serializing_if = "is_false")]
+        force: bool,
     },
-    /// Read the `innerText` of the first element matched by CSS `selector`.
-    /// Requires `--features cdp`. The current page URL is checked against
-    /// `[browser].blocked_urls` first; a selector that matches nothing returns
-    /// `element_not_found`.
+    /// Read the `innerText` of an element by CSS selector or snapshot ref.
     #[serde(rename = "browser_text", alias = "browser-text")]
     BrowserText {
-        /// CSS selector whose `innerText` should be returned.
-        selector: String,
-        /// Restrict to one tab. Optional.
+        /// CSS selector. Mutually exclusive with `ref_id`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selector: Option<String>,
+        /// Snapshot ref such as `e12`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ref_id: Option<String>,
+        /// Restrict to one tab.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target_id: Option<String>,
     },
-    /// Type `text` into the element matched by `selector` (or the page body
-    /// when no selector is given). Requires `--features cdp`. Classified like
-    /// [`Action::Type`] for audit: the body is never stored, only its
-    /// character count. The current page URL is checked against
-    /// `[browser].blocked_urls` first.
+    /// Type `text` into an element. Refuses secure fields.
     #[serde(rename = "browser_type", alias = "browser-type")]
     BrowserType {
         /// Text to type.
         text: String,
-        /// Optional CSS selector. When omitted the page body receives input.
+        /// CSS selector. Mutually exclusive with `ref_id`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         selector: Option<String>,
-        /// Restrict to one tab. Optional.
+        /// Snapshot ref such as `e12`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ref_id: Option<String>,
+        /// Restrict to one tab.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target_id: Option<String>,
+        /// Clear the field before typing.
+        #[serde(default, skip_serializing_if = "is_false")]
+        clear: bool,
+        /// Press Enter after typing.
+        #[serde(default, skip_serializing_if = "is_false")]
+        submit: bool,
+        /// Wait condition after typing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wait: Option<String>,
+        /// Timeout in milliseconds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+    },
+    /// Press a key combination.
+    #[serde(rename = "browser_press", alias = "browser-press")]
+    BrowserPress {
+        /// Combination such as `Enter`, `cmd+a`, or `ctrl+shift+Tab`.
+        keys: String,
+        /// Optional element to focus first.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selector: Option<String>,
+        /// Optional snapshot ref to focus first.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ref_id: Option<String>,
+        /// Restrict to one tab.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_id: Option<String>,
+    },
+    /// Move the mouse over an element.
+    #[serde(rename = "browser_hover", alias = "browser-hover")]
+    BrowserHover {
+        /// CSS selector. Mutually exclusive with `ref_id`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selector: Option<String>,
+        /// Snapshot ref.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ref_id: Option<String>,
+        /// Restrict to one tab.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_id: Option<String>,
+    },
+    /// Scroll the page or an element.
+    #[serde(rename = "browser_scroll", alias = "browser-scroll")]
+    BrowserScroll {
+        /// CSS selector. Mutually exclusive with `ref_id`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selector: Option<String>,
+        /// Snapshot ref.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ref_id: Option<String>,
+        /// Restrict to one tab.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_id: Option<String>,
+        /// Horizontal wheel delta.
+        #[serde(default, skip_serializing_if = "is_zero_f64")]
+        dx: f64,
+        /// Vertical wheel delta. Positive is down.
+        #[serde(default, skip_serializing_if = "is_zero_f64")]
+        dy: f64,
+    },
+    /// Select an option in a `<select>`.
+    #[serde(rename = "browser_select", alias = "browser-select")]
+    BrowserSelect {
+        /// CSS selector. Mutually exclusive with `ref_id`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selector: Option<String>,
+        /// Snapshot ref.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ref_id: Option<String>,
+        /// Restrict to one tab.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_id: Option<String>,
+        /// Option value.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<String>,
+        /// Option label.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
+    /// Check or uncheck a checkbox or radio.
+    #[serde(rename = "browser_check", alias = "browser-check")]
+    BrowserCheck {
+        /// CSS selector. Mutually exclusive with `ref_id`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selector: Option<String>,
+        /// Snapshot ref.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ref_id: Option<String>,
+        /// Restrict to one tab.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_id: Option<String>,
+        /// Desired state. Default true.
+        #[serde(default = "default_true")]
+        checked: bool,
+    },
+    /// Set files on an `<input type=file>`.
+    #[serde(rename = "browser_upload", alias = "browser-upload")]
+    BrowserUpload {
+        /// CSS selector. Mutually exclusive with `ref_id`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selector: Option<String>,
+        /// Snapshot ref.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ref_id: Option<String>,
+        /// Restrict to one tab.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_id: Option<String>,
+        /// Absolute file paths.
+        files: Vec<String>,
+    },
+    /// Accept or dismiss a JavaScript dialog.
+    #[serde(rename = "browser_dialog", alias = "browser-dialog")]
+    BrowserDialog {
+        /// Restrict to one tab.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_id: Option<String>,
+        /// Accept when true, dismiss when false.
+        #[serde(default = "default_true")]
+        accept: bool,
+        /// Text for a prompt dialog.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_text: Option<String>,
+    },
+    /// Capture a page screenshot.
+    #[serde(rename = "browser_screenshot", alias = "browser-screenshot")]
+    BrowserScreenshot {
+        /// Restrict to one tab.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_id: Option<String>,
+        /// Output path. Defaults to a temp file.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+        /// Capture beyond the viewport.
+        #[serde(default, skip_serializing_if = "is_false")]
+        full_page: bool,
+        /// `png` or `jpeg`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        format: Option<String>,
+        /// JPEG quality.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quality: Option<i64>,
+        /// Include the image as base64 in the response.
+        #[serde(default, skip_serializing_if = "is_false")]
+        base64: bool,
     },
     /// Evaluate `script` in the page context and return the JSON value.
-    /// Requires `--features cdp`. The script body is never logged verbatim;
-    /// only its length and a small hash appear in the audit row.
     #[serde(rename = "browser_eval", alias = "browser-eval")]
     BrowserEval {
-        /// JavaScript source. Quoted on the CLI via `--eval`; here it is just
-        /// a string field that the caller has already prepared.
+        /// JavaScript source.
         script: String,
-        /// Restrict to one tab. Optional.
+        /// Restrict to one tab.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target_id: Option<String>,
+        /// Timeout in milliseconds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+        /// Await a returned promise.
+        #[serde(default, skip_serializing_if = "is_false")]
+        await_promise: bool,
     },
+    /// Open a new tab.
+    #[serde(rename = "browser_tab_new", alias = "browser-tab-new")]
+    BrowserTabNew {
+        /// URL to open. Defaults to `about:blank`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+    },
+    /// Close a tab.
+    #[serde(rename = "browser_tab_close", alias = "browser-tab-close")]
+    BrowserTabClose {
+        /// CDP `targetId`.
+        target_id: String,
+    },
+    /// Start a managed Chromium with an isolated profile.
+    #[serde(rename = "browser_launch", alias = "browser-launch")]
+    BrowserLaunch {
+        /// Browser executable name or path.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        browser: Option<String>,
+        /// Run headless.
+        #[serde(default, skip_serializing_if = "is_false")]
+        headless: bool,
+        /// Profile directory. Defaults to a session directory in the cache.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile: Option<String>,
+        /// Debug port. Default 0 (an ephemeral port).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        port: Option<u16>,
+        /// URL to open. Defaults to `about:blank`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+    },
+    /// Stop a managed Chromium.
+    #[serde(rename = "browser_quit", alias = "browser-quit")]
+    BrowserQuit {
+        /// Managed session id. Defaults to the newest one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<String>,
+        /// Remove the profile directory too.
+        #[serde(default, skip_serializing_if = "is_false")]
+        purge: bool,
+    },
+    /// List managed Chromium sessions.
+    #[serde(rename = "browser_sessions", alias = "browser-sessions")]
+    BrowserSessions {},
     /// Run OCR on the most recent capture for `--app`/window target. macOS
     /// only. Linux returns `unsupported`; Windows is a stub until P12.
     #[serde(rename = "ocr")]
@@ -508,6 +784,14 @@ pub enum Action {
         #[serde(default, skip_serializing_if = "is_false")]
         force: bool,
     },
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_zero_f64(value: &f64) -> bool {
+    *value == 0.0
 }
 
 fn is_false(value: &bool) -> bool {
@@ -618,6 +902,8 @@ pub struct CallContext {
     /// refuses the websocket connection (and the page activation) when the
     /// destination URL is in here.
     pub browser_blocked_urls: Vec<String>,
+    /// What to do when a JavaScript dialog opens: `accept`, `dismiss`, `fail`.
+    pub on_dialog: Option<String>,
 }
 
 /// A JSON request: an optional `id`, shared flags, and an [`Action`].
@@ -677,6 +963,7 @@ fn take_context(object: &mut Map<String, Value>) -> Result<CallContext, Computer
         cdp: take_bool(object, "cdp")?,
         cdp_url: take_stringish(object, "cdp_url")?,
         browser_blocked_urls: take_string_list(object, "browser_blocked_urls")?,
+        on_dialog: take_stringish(object, "on_dialog")?,
     })
 }
 
@@ -775,6 +1062,8 @@ pub struct LineOptions<'a> {
     pub cdp: bool,
     /// Process `--cdp-url` flag. A request field wins.
     pub cdp_url: Option<&'a str>,
+    /// Process `--on-dialog` flag. A request field wins.
+    pub on_dialog: Option<&'a str>,
 }
 
 /// Decode one JSON line. `cli_adapter` is the process `--adapter` flag.
@@ -824,6 +1113,11 @@ pub fn handle_request_line_opts(line: &str, options: LineOptions<'_>) -> Respons
             if request.context.cdp_url.is_none() {
                 if let Some(url) = options.cdp_url {
                     request.context.cdp_url = Some(url.to_string());
+                }
+            }
+            if request.context.on_dialog.is_none() {
+                if let Some(mode) = options.on_dialog {
+                    request.context.on_dialog = Some(mode.to_string());
                 }
             }
             dispatch_context(request.action, &request.context).with_id(request.id)
@@ -1184,53 +1478,26 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
             result_response(dock_click_action(backend, &title))
         }
         Action::Spaces {} => result_response(spaces_action(backend)),
-        Action::BrowserTabs {} => result_response(browser_tabs(context, &prepared.subject)),
-        Action::BrowserActivate { target_id } => result_response(browser_activate(
-            context,
-            &prepared.subject,
-            target_id.clone(),
-        )),
-        Action::BrowserNavigate { url, target_id } => result_response(browser_navigate(
-            context,
-            &prepared.subject,
-            url.clone(),
-            target_id.clone(),
-        )),
-        Action::BrowserClick {
-            selector,
-            target_id,
-        } => result_response(browser_click(
-            context,
-            &prepared.subject,
-            selector.clone(),
-            target_id.clone(),
-        )),
-        Action::BrowserText {
-            selector,
-            target_id,
-        } => result_response(browser_text(
-            context,
-            &prepared.subject,
-            selector.clone(),
-            target_id.clone(),
-        )),
-        Action::BrowserType {
-            text,
-            selector,
-            target_id,
-        } => result_response(browser_type(
-            context,
-            &prepared.subject,
-            text.clone(),
-            selector.clone(),
-            target_id.clone(),
-        )),
-        Action::BrowserEval { script, target_id } => result_response(browser_eval(
-            context,
-            &prepared.subject,
-            script.clone(),
-            target_id.clone(),
-        )),
+        other if is_browser_action(&other) => {
+            let response = match browser_command(&other, context) {
+                Ok(command) => match browser_options(context, &prepared.subject) {
+                    Ok(options) => result_response(crate::browser::run(command, &options)),
+                    Err(error) => Response::from_error(error),
+                },
+                Err(error) => Response::from_error(error),
+            };
+            let response = attach_post_state(backend, context, kind, response);
+            return finish_action(
+                context,
+                label,
+                &prepared.subject,
+                prepared.warning.as_deref(),
+                prepared.decision,
+                prepared.source,
+                chars,
+                response,
+            );
+        }
         Action::PolicyCheck => {
             let (response, subject) = policy_check(backend, context);
             let response = attach_post_state(backend, context, kind, response);
@@ -1247,6 +1514,9 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
         }
         Action::Pause => pause_response(true),
         Action::Resume => pause_response(false),
+        other => Response::from_error(ComputerError::InvalidArguments(format!(
+            "unsupported action in this build: {other:?}"
+        ))),
     };
     let response = attach_post_state(backend, context, kind, response);
     finish_action(
@@ -1393,10 +1663,28 @@ fn action_label(action: &Action) -> &'static str {
         Action::BrowserTabs { .. } => "browser_tabs",
         Action::BrowserActivate { .. } => "browser_activate",
         Action::BrowserNavigate { .. } => "browser_navigate",
+        Action::BrowserBack { .. } => "browser_back",
+        Action::BrowserForward { .. } => "browser_forward",
+        Action::BrowserReload { .. } => "browser_reload",
+        Action::BrowserWait { .. } => "browser_wait",
+        Action::BrowserSnapshot { .. } => "browser_snapshot",
         Action::BrowserClick { .. } => "browser_click",
         Action::BrowserText { .. } => "browser_text",
         Action::BrowserType { .. } => "browser_type",
+        Action::BrowserPress { .. } => "browser_press",
+        Action::BrowserHover { .. } => "browser_hover",
+        Action::BrowserScroll { .. } => "browser_scroll",
+        Action::BrowserSelect { .. } => "browser_select",
+        Action::BrowserCheck { .. } => "browser_check",
+        Action::BrowserUpload { .. } => "browser_upload",
+        Action::BrowserDialog { .. } => "browser_dialog",
+        Action::BrowserScreenshot { .. } => "browser_screenshot",
         Action::BrowserEval { .. } => "browser_eval",
+        Action::BrowserTabNew { .. } => "browser_tab_new",
+        Action::BrowserTabClose { .. } => "browser_tab_close",
+        Action::BrowserLaunch { .. } => "browser_launch",
+        Action::BrowserQuit { .. } => "browser_quit",
+        Action::BrowserSessions {} => "browser_sessions",
         Action::Ocr { .. } => "ocr",
     }
 }
@@ -1435,6 +1723,10 @@ fn policy_class(action: &Action) -> PolicyClass {
         | Action::Spaces { .. }
         | Action::BrowserTabs { .. }
         | Action::BrowserText { .. }
+        | Action::BrowserSnapshot { .. }
+        | Action::BrowserScreenshot { .. }
+        | Action::BrowserWait { .. }
+        | Action::BrowserSessions {}
         | Action::BrowserActivate { .. }
         | Action::Ocr { .. } => PolicyClass::Observe,
         Action::Quit { .. } => PolicyClass::Quit,
@@ -1921,11 +2213,24 @@ fn post_state_kind(action: &Action) -> PostKind {
         | Action::ShortcutsRun { .. }
         | Action::DockClick { .. }
         | Action::BrowserNavigate { .. }
+        | Action::BrowserBack { .. }
+        | Action::BrowserForward { .. }
+        | Action::BrowserReload { .. }
         | Action::BrowserClick { .. }
-        | Action::BrowserText { .. }
         | Action::BrowserType { .. }
+        | Action::BrowserPress { .. }
+        | Action::BrowserHover { .. }
+        | Action::BrowserScroll { .. }
+        | Action::BrowserSelect { .. }
+        | Action::BrowserCheck { .. }
+        | Action::BrowserUpload { .. }
+        | Action::BrowserDialog { .. }
         | Action::BrowserEval { .. }
         | Action::BrowserActivate { .. }
+        | Action::BrowserTabNew { .. }
+        | Action::BrowserTabClose { .. }
+        | Action::BrowserLaunch { .. }
+        | Action::BrowserQuit { .. }
         | Action::Ocr { .. } => PostKind::Mutating,
         Action::GetState
         | Action::Wait { .. }
@@ -1945,7 +2250,12 @@ fn post_state_kind(action: &Action) -> PostKind {
         | Action::MenuList { .. }
         | Action::DockList { .. }
         | Action::Spaces { .. }
-        | Action::BrowserTabs { .. } => PostKind::ReadOnly,
+        | Action::BrowserTabs { .. }
+        | Action::BrowserText { .. }
+        | Action::BrowserSnapshot { .. }
+        | Action::BrowserScreenshot { .. }
+        | Action::BrowserWait { .. }
+        | Action::BrowserSessions {} => PostKind::ReadOnly,
     }
 }
 
@@ -6468,9 +6778,11 @@ mod tests {
             Action::BrowserText {
                 selector,
                 target_id,
+                ref_id,
             } => {
-                assert_eq!(selector, "h1");
+                assert_eq!(selector.as_deref(), Some("h1"));
                 assert!(target_id.is_none());
+                assert!(ref_id.is_none());
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -6489,10 +6801,20 @@ mod tests {
                 text,
                 selector,
                 target_id,
+                ref_id,
+                clear,
+                submit,
+                wait,
+                timeout_ms,
             } => {
                 assert_eq!(text, "hi");
                 assert_eq!(selector.as_deref(), Some("#name"));
                 assert!(target_id.is_none());
+                assert!(ref_id.is_none());
+                assert!(!clear);
+                assert!(!submit);
+                assert!(wait.is_none());
+                assert!(timeout_ms.is_none());
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -6505,7 +6827,8 @@ mod tests {
     fn browser_text_label_is_browser_text_and_class_is_observe() {
         // BrowserText reads innerText; classified Observe (read-only).
         let action = Action::BrowserText {
-            selector: "h1".into(),
+            selector: Some("h1".into()),
+            ref_id: None,
             target_id: None,
         };
         assert_eq!(action_label(&action), "browser_text");
@@ -6519,7 +6842,12 @@ mod tests {
         let action = Action::BrowserType {
             text: "abc".into(),
             selector: Some("#name".into()),
+            ref_id: None,
             target_id: None,
+            clear: false,
+            submit: false,
+            wait: None,
+            timeout_ms: None,
         };
         assert_eq!(action_label(&action), "browser_type");
         assert!(matches!(policy_class(&action), PolicyClass::Mutate));
@@ -6530,7 +6858,8 @@ mod tests {
     fn browser_text_does_not_record_chars_in_audit() {
         // Reading innerText must not push a chars count into the audit row.
         let action = Action::BrowserText {
-            selector: "h1".into(),
+            selector: Some("h1".into()),
+            ref_id: None,
             target_id: None,
         };
         assert_eq!(clipboard_chars(&action), None);
@@ -6554,6 +6883,9 @@ mod tests {
             Action::BrowserNavigate {
                 url: "https://blocked.example.com".into(),
                 target_id: None,
+                wait: None,
+                timeout_ms: None,
+                new_tab: false,
             },
             &context,
         );
@@ -6578,6 +6910,9 @@ mod tests {
             Action::BrowserNavigate {
                 url: "https://example.com".into(),
                 target_id: None,
+                wait: None,
+                timeout_ms: None,
+                new_tab: false,
             },
             &context,
         );
@@ -7093,161 +7428,322 @@ mod tests {
 }
 
 // -----------------------------------------------------------------------------
-// P10: CDP-backed browser helpers. Always return a structured error when the
-// context flag is off or when the runtime refuses the URL.
-//
-// `allow(items_after_test_module)`: these helpers live after the test module
-// for convenience; they are only here because P10 grew on top of the existing
-// module. Adding a new module for them would cost more than it saves.
+// Browser command bridge. The typed driver lives in `crate::browser`; this
+// module only lifts the protocol action into a `BrowserCommand` and resolves
+// the shared options (policy block list, session, pid).
+
 #[allow(clippy::items_after_test_module)]
-fn browser_action_options(
+fn is_browser_action(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::BrowserTabs {}
+            | Action::BrowserActivate { .. }
+            | Action::BrowserNavigate { .. }
+            | Action::BrowserBack { .. }
+            | Action::BrowserForward { .. }
+            | Action::BrowserReload { .. }
+            | Action::BrowserWait { .. }
+            | Action::BrowserSnapshot { .. }
+            | Action::BrowserClick { .. }
+            | Action::BrowserText { .. }
+            | Action::BrowserType { .. }
+            | Action::BrowserPress { .. }
+            | Action::BrowserHover { .. }
+            | Action::BrowserScroll { .. }
+            | Action::BrowserSelect { .. }
+            | Action::BrowserCheck { .. }
+            | Action::BrowserUpload { .. }
+            | Action::BrowserDialog { .. }
+            | Action::BrowserScreenshot { .. }
+            | Action::BrowserEval { .. }
+            | Action::BrowserTabNew { .. }
+            | Action::BrowserTabClose { .. }
+            | Action::BrowserLaunch { .. }
+            | Action::BrowserQuit { .. }
+            | Action::BrowserSessions {}
+    )
+}
+
+fn browser_options(
     context: &CallContext,
     subject: &policy::Subject,
-    target_id: Option<String>,
-) -> crate::browser::ActionOptions {
-    // Merge per-request `browser_blocked_urls` with whatever the loaded policy
-    // says. The CLI sets the per-request field to an empty vec by default, so
-    // the policy file is the source. `--policy` (and `XDG_CONFIG_HOME`)
-    // configure the policy file location.
-    let mut policy_blocked_urls = context.browser_blocked_urls.clone();
-    if policy_blocked_urls.is_empty() {
+) -> Result<crate::browser::BrowserOptions, ComputerError> {
+    let mut blocked = context.browser_blocked_urls.clone();
+    if blocked.is_empty() {
         if let Ok(loaded) = policy::load_policy(context.policy.as_deref().map(Path::new)) {
-            policy_blocked_urls = loaded.blocked_urls().to_vec();
+            blocked = loaded.blocked_urls().to_vec();
         }
     }
-    crate::browser::ActionOptions {
+    Ok(crate::browser::BrowserOptions {
         debug_url: context.cdp_url.clone(),
         app: context.app.clone(),
         app_pid: subject.pid,
-        target_id,
-        url: None,
-        selector: None,
-        text: None,
-        script: None,
-        command_timeout: Duration::from_secs(30),
-        policy_blocked_urls,
-        policy_subject: Some(subject.clone()),
+        blocked_urls: blocked,
+        timeout_ms: None,
+        session: context.session.clone(),
+        on_dialog: match context.on_dialog.as_deref() {
+            Some(value) => crate::browser::DialogMode::parse(value)?,
+            None => crate::browser::DialogMode::Dismiss,
+        },
+    })
+}
+
+fn parse_wait(
+    value: Option<&str>,
+    default: crate::browser::WaitSpec,
+) -> Result<crate::browser::WaitSpec, ComputerError> {
+    match value {
+        Some(text) => crate::browser::WaitSpec::parse(text),
+        None => Ok(default),
     }
 }
 
-fn browser_require_cdp(context: &CallContext) -> Result<(), ComputerError> {
+fn browser_command(
+    action: &Action,
+    context: &CallContext,
+) -> Result<crate::browser::BrowserCommand, ComputerError> {
+    use crate::browser::{BrowserCommand, ScreenshotFormat, WaitSpec};
     if !context.cdp {
         return Err(ComputerError::Unsupported(
             "browser commands require --cdp (or `cdp: true` in the JSON request)".into(),
         ));
     }
-    Ok(())
-}
-
-fn browser_tabs(context: &CallContext, subject: &policy::Subject) -> Result<Value, ComputerError> {
-    browser_require_cdp(context)?;
-    let opts = browser_action_options(context, subject, None);
-    let tabs = crate::browser::cdp::list_tabs(&opts)?;
-    serde_json::to_value(&tabs)
-        .map_err(|error| ComputerError::ExecutionFailed(format!("encode tabs: {error}")))
-}
-
-fn browser_activate(
-    context: &CallContext,
-    subject: &policy::Subject,
-    target_id: Option<String>,
-) -> Result<Value, ComputerError> {
-    browser_require_cdp(context)?;
-    let target = target_id.ok_or_else(|| {
-        ComputerError::InvalidArguments("browser activate requires --target".into())
-    })?;
-    let opts = browser_action_options(context, subject, Some(target));
-    let active = crate::browser::cdp::activate_tab(&opts)?;
-    Ok(json!({ "url": active }))
-}
-
-fn browser_navigate(
-    context: &CallContext,
-    subject: &policy::Subject,
-    url: String,
-    target_id: Option<String>,
-) -> Result<Value, ComputerError> {
-    browser_require_cdp(context)?;
-    let opts = browser_action_options(context, subject, target_id);
-    let landed = crate::browser::cdp::navigate(&crate::browser::ActionOptions {
-        url: Some(url.clone()),
-        ..opts
-    })?;
-    Ok(json!({ "url": landed }))
-}
-
-fn browser_click(
-    context: &CallContext,
-    subject: &policy::Subject,
-    selector: String,
-    target_id: Option<String>,
-) -> Result<Value, ComputerError> {
-    browser_require_cdp(context)?;
-    let opts = browser_action_options(context, subject, target_id);
-    crate::browser::cdp::click(&crate::browser::ActionOptions {
-        selector: Some(selector.clone()),
-        ..opts
-    })?;
-    Ok(json!({ "selector": selector }))
-}
-
-fn browser_text(
-    context: &CallContext,
-    subject: &policy::Subject,
-    selector: String,
-    target_id: Option<String>,
-) -> Result<Value, ComputerError> {
-    browser_require_cdp(context)?;
-    let opts = browser_action_options(context, subject, target_id);
-    let text = crate::browser::cdp::read_inner_text(&crate::browser::ActionOptions {
-        selector: Some(selector.clone()),
-        ..opts
-    })?;
-    Ok(json!({ "selector": selector, "text": text }))
-}
-
-fn browser_type(
-    context: &CallContext,
-    subject: &policy::Subject,
-    text: String,
-    selector: Option<String>,
-    target_id: Option<String>,
-) -> Result<Value, ComputerError> {
-    browser_require_cdp(context)?;
-    let opts = browser_action_options(context, subject, target_id);
-    crate::browser::cdp::type_text(&crate::browser::ActionOptions {
-        selector,
-        text: Some(text.clone()),
-        ..opts
-    })?;
-    // Audit captures the character count via `clipboard_chars`; the text body
-    // never leaves this function.
-    Ok(json!({ "chars": text.chars().count() as u64 }))
-}
-
-fn browser_eval(
-    context: &CallContext,
-    subject: &policy::Subject,
-    script: String,
-    target_id: Option<String>,
-) -> Result<Value, ComputerError> {
-    browser_require_cdp(context)?;
-    let opts = browser_action_options(context, subject, target_id);
-    let value = crate::browser::cdp::eval(&crate::browser::ActionOptions {
-        script: Some(script.clone()),
-        ..opts
-    })?;
-    // The script body never leaves this function. The audit row only sees
-    // its length and a 16-byte blake3-ish hash so an auditor can spot
-    // duplicates without seeing the contents.
-    let length = script.chars().count() as u64;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    script.hash(&mut hasher);
-    let hash = hasher.finish();
-    Ok(json!({
-        "result": value,
-        "script_chars": length,
-        "script_hash": format!("{hash:016x}"),
-    }))
+    let command = match action {
+        Action::BrowserTabs {} => BrowserCommand::Tabs,
+        Action::BrowserActivate { target_id } => BrowserCommand::Activate {
+            target: target_id.clone().ok_or_else(|| {
+                ComputerError::InvalidArguments("browser activate requires --target".into())
+            })?,
+        },
+        Action::BrowserNavigate {
+            url,
+            target_id,
+            wait,
+            timeout_ms,
+            new_tab,
+        } => BrowserCommand::Navigate {
+            url: url.clone(),
+            target: target_id.clone(),
+            wait: parse_wait(wait.as_deref(), WaitSpec::Load)?,
+            timeout_ms: *timeout_ms,
+            new_tab: *new_tab,
+        },
+        Action::BrowserBack { target_id } => BrowserCommand::Back {
+            target: target_id.clone(),
+        },
+        Action::BrowserForward { target_id } => BrowserCommand::Forward {
+            target: target_id.clone(),
+        },
+        Action::BrowserReload {
+            target_id,
+            wait,
+            timeout_ms,
+        } => BrowserCommand::Reload {
+            target: target_id.clone(),
+            wait: parse_wait(wait.as_deref(), WaitSpec::Load)?,
+            timeout_ms: *timeout_ms,
+        },
+        Action::BrowserWait {
+            target_id,
+            wait,
+            timeout_ms,
+        } => BrowserCommand::Wait {
+            target: target_id.clone(),
+            wait: WaitSpec::parse(wait)?,
+            timeout_ms: *timeout_ms,
+        },
+        Action::BrowserSnapshot {
+            target_id,
+            diff,
+            interactive_only,
+            max_nodes,
+        } => BrowserCommand::Snapshot {
+            target: target_id.clone(),
+            diff: *diff,
+            interactive_only: *interactive_only,
+            max_nodes: *max_nodes,
+        },
+        Action::BrowserClick {
+            selector,
+            ref_id,
+            target_id,
+            button,
+            count,
+            wait,
+            timeout_ms,
+            force,
+        } => BrowserCommand::Click {
+            target: target_id.clone(),
+            selector: selector.clone(),
+            ref_id: ref_id.clone(),
+            button: *button,
+            count: (*count).clamp(1, 3),
+            wait: parse_wait(wait.as_deref(), WaitSpec::Load)?,
+            timeout_ms: *timeout_ms,
+            force: *force,
+        },
+        Action::BrowserText {
+            selector,
+            ref_id,
+            target_id,
+        } => BrowserCommand::Text {
+            target: target_id.clone(),
+            selector: selector.clone(),
+            ref_id: ref_id.clone(),
+        },
+        Action::BrowserType {
+            text,
+            selector,
+            ref_id,
+            target_id,
+            clear,
+            submit,
+            wait,
+            timeout_ms,
+        } => BrowserCommand::Type {
+            target: target_id.clone(),
+            selector: selector.clone(),
+            ref_id: ref_id.clone(),
+            text: text.clone(),
+            clear: *clear,
+            submit: *submit,
+            wait: parse_wait(wait.as_deref(), WaitSpec::Load)?,
+            timeout_ms: *timeout_ms,
+        },
+        Action::BrowserPress {
+            keys,
+            selector,
+            ref_id,
+            target_id,
+        } => BrowserCommand::Press {
+            target: target_id.clone(),
+            selector: selector.clone(),
+            ref_id: ref_id.clone(),
+            keys: keys.clone(),
+        },
+        Action::BrowserHover {
+            selector,
+            ref_id,
+            target_id,
+        } => BrowserCommand::Hover {
+            target: target_id.clone(),
+            selector: selector.clone(),
+            ref_id: ref_id.clone(),
+        },
+        Action::BrowserScroll {
+            selector,
+            ref_id,
+            target_id,
+            dx,
+            dy,
+        } => BrowserCommand::Scroll {
+            target: target_id.clone(),
+            selector: selector.clone(),
+            ref_id: ref_id.clone(),
+            dx: *dx,
+            dy: *dy,
+        },
+        Action::BrowserSelect {
+            selector,
+            ref_id,
+            target_id,
+            value,
+            label,
+        } => BrowserCommand::Select {
+            target: target_id.clone(),
+            selector: selector.clone(),
+            ref_id: ref_id.clone(),
+            value: value.clone(),
+            label: label.clone(),
+        },
+        Action::BrowserCheck {
+            selector,
+            ref_id,
+            target_id,
+            checked,
+        } => BrowserCommand::Check {
+            target: target_id.clone(),
+            selector: selector.clone(),
+            ref_id: ref_id.clone(),
+            checked: *checked,
+        },
+        Action::BrowserUpload {
+            selector,
+            ref_id,
+            target_id,
+            files,
+        } => BrowserCommand::Upload {
+            target: target_id.clone(),
+            selector: selector.clone(),
+            ref_id: ref_id.clone(),
+            files: files.clone(),
+        },
+        Action::BrowserDialog {
+            target_id,
+            accept,
+            prompt_text,
+        } => BrowserCommand::Dialog {
+            target: target_id.clone(),
+            accept: *accept,
+            prompt_text: prompt_text.clone(),
+        },
+        Action::BrowserScreenshot {
+            target_id,
+            output,
+            full_page,
+            format,
+            quality,
+            base64,
+        } => BrowserCommand::Screenshot {
+            target: target_id.clone(),
+            output: output.clone(),
+            full_page: *full_page,
+            format: match format.as_deref() {
+                Some(value) => ScreenshotFormat::parse(value)?,
+                None => ScreenshotFormat::Png,
+            },
+            quality: *quality,
+            base64: *base64,
+        },
+        Action::BrowserEval {
+            script,
+            target_id,
+            timeout_ms,
+            await_promise,
+        } => BrowserCommand::Eval {
+            target: target_id.clone(),
+            script: script.clone(),
+            timeout_ms: *timeout_ms,
+            await_promise: *await_promise,
+        },
+        Action::BrowserTabNew { url } => BrowserCommand::TabNew { url: url.clone() },
+        Action::BrowserTabClose { target_id } => BrowserCommand::TabClose {
+            target: target_id.clone(),
+        },
+        Action::BrowserLaunch {
+            browser,
+            headless,
+            profile,
+            port,
+            url,
+        } => BrowserCommand::Launch {
+            browser: browser.clone(),
+            headless: *headless,
+            profile: profile.clone(),
+            port: *port,
+            url: url.clone(),
+        },
+        Action::BrowserQuit { session, purge } => BrowserCommand::Quit {
+            session: session.clone(),
+            purge: *purge,
+        },
+        Action::BrowserSessions {} => BrowserCommand::Sessions,
+        _ => {
+            return Err(ComputerError::InvalidArguments(format!(
+                "{} is not a browser action",
+                context.app.clone().unwrap_or_else(|| "unknown".to_string())
+            )))
+        }
+    };
+    Ok(command)
 }

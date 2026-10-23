@@ -85,7 +85,7 @@ computer-use --pretty exec '{"id":"a","action":"displays"}'
 | Flag | What it pulls in | Default on this binary |
 | --- | --- | --- |
 | (default) | Screenshots, mouse, keyboard, accessibility tree, OCR, isolation, the macOS helper `.app` plumbing. | always |
-| `cdp` | `chromiumoxide` 0.9.1 + a small `tokio`. Required for `computer-use --cdp browser ...`. | off |
+| `cdp` | `chromiumoxide` 0.9.1 + a small `tokio`. Required for `computer-use --cdp browser ...`. | **on in the release binaries**; off for a default `cargo install` |
 | `portal` | `ashpd` 0.13.13 ScreenCast + RemoteDesktop, `pipewire` 0.9, `reis` 0.7. Linux only. | on in the Linux release binary; off unless you ask for it |
 | `skylight` | macOS private SkyLight focus path behind `--tier synthetic` / `--synthetic-focus`. | off |
 | `virtual-display` | macOS private `CGVirtualDisplayDescriptor` probe; probe-only, never creates a display. | off |
@@ -273,13 +273,30 @@ The `Action` enum in `src/protocol.rs` is the protocol. `id` is echoed on the re
 | `dock_click` | `title` | macOS only. Case-insensitive title match. |
 | `spaces` | none | Groups on-screen windows by screen. Mission Control moves are not attempted. |
 | `batch` | `actions`, `stop_on_error` | One resolved target, one revision sequence. Each step re-validates. Nested batch is `invalid_arguments`. |
-| `browser_tabs` | none | `cdp` feature. |
+| `browser_tabs` | none | `cdp` feature. Returns `{tabs, count}`; each tab has `kind`, `target_id`, `url`, `title`. |
 | `browser_activate` | `target_id` | `cdp` feature. |
-| `browser_navigate` | `url`, `target_id` | `cdp` feature. URL is checked against `[browser].blocked_urls`. |
-| `browser_click` | `selector`, `target_id` | `cdp` feature. CSS selector, clicked via `Input.dispatchMouseEvent`. |
-| `browser_text` | `selector`, `target_id` | `cdp` feature. Returns the matched element's `innerText`. |
-| `browser_type` | `text`, `selector` (optional), `target_id` | `cdp` feature. Selector or page body. |
-| `browser_eval` | `script`, `target_id` | `cdp` feature. The script body is never logged verbatim; only its length and a stable `DefaultHasher` hash. |
+| `browser_navigate` | `url`, `target_id`, `wait`, `timeout_ms`, `new_tab` | `cdp` feature. URL is checked against `[browser].blocked_urls`. |
+| `browser_back` / `browser_forward` | `target_id` | `cdp` feature. |
+| `browser_reload` | `target_id`, `wait`, `timeout_ms` | `cdp` feature. |
+| `browser_wait` | `target_id`, `wait`, `timeout_ms` | `cdp` feature. |
+| `browser_snapshot` | `target_id`, `diff`, `interactive_only`, `max_nodes` | `cdp` feature. Compact accessibility tree with `ref=eN` handles. |
+| `browser_click` | `selector`/`ref_id`, `target_id`, `button`, `count`, `wait`, `timeout_ms`, `force` | `cdp` feature. Actionability checks by default. |
+| `browser_text` | `selector`/`ref_id`, `target_id` | `cdp` feature. |
+| `browser_type` | `text`, `selector`/`ref_id`, `target_id`, `clear`, `submit`, `wait`, `timeout_ms` | `cdp` feature. Secure fields are refused. |
+| `browser_press` | `keys`, `selector`/`ref_id`, `target_id` | `cdp` feature. |
+| `browser_hover` | `selector`/`ref_id`, `target_id` | `cdp` feature. |
+| `browser_scroll` | `selector`/`ref_id`, `target_id`, `dx`, `dy` | `cdp` feature. |
+| `browser_select` | `selector`/`ref_id`, `target_id`, `value`, `label` | `cdp` feature. |
+| `browser_check` | `selector`/`ref_id`, `target_id`, `checked` | `cdp` feature. |
+| `browser_upload` | `selector`/`ref_id`, `target_id`, `files` | `cdp` feature. |
+| `browser_dialog` | `target_id`, `accept`, `prompt_text` | `cdp` feature. |
+| `browser_screenshot` | `target_id`, `output`, `full_page`, `format`, `quality` | `cdp` feature. |
+| `browser_eval` | `script`, `target_id`, `timeout_ms`, `await_promise` | `cdp` feature. The script body is never logged verbatim. |
+| `browser_tab_new` | `url` | `cdp` feature. |
+| `browser_tab_close` | `target_id` | `cdp` feature. |
+| `browser_launch` | `browser`, `headless`, `profile`, `port`, `url` | `cdp` feature. Starts a managed Chromium with an isolated profile. |
+| `browser_quit` | `session`, `purge` | `cdp` feature. |
+| `browser_sessions` | none | `cdp` feature. |
 
 ```json
 {"id":1,"action":"click","x":10,"y":20,"button":"left"}
@@ -312,6 +329,7 @@ The JSON `error.code` is one of the strings below. `ComputerError::code()` is th
 | `blocked_url` | Browser URL matched the block list. |
 | `paused` | Local user input tripped the kill switch. |
 | `cdp_unavailable` | Feature off, or Chrome has no debugging port. |
+| `timeout` | A browser wait, action, or dialog rescue exceeded its timeout. |
 | `display_unavailable` | The screen is locked, the display is asleep, or no display or shareable window is available. Checked before `window_not_found`; no xcap crop fallback. |
 
 ## Library
@@ -338,7 +356,7 @@ Click, move, scroll, and screenshot regions use **logical** points. A display's 
 
 ## Isolation
 
-`isolation` is a pure report: `{platform, display_filter, cdp, virtual_display, set_of_marks}`. macOS reports `virtual_display: "experimental"` only when both `CGVirtualDisplayDescriptorCreate` and `CGVirtualDisplayCreate` resolved; otherwise `unsupported`. The build never creates a virtual display — see `docs/ISOLATION.md` for the reason and the VM proxy design.
+`isolation` is a pure report (`cdp` is not part of the 0.4.0 output). macOS reports `virtual_display: "experimental"` only when both `CGVirtualDisplayDescriptorCreate` and `CGVirtualDisplayCreate` resolved; otherwise `unsupported`. The build never creates a virtual display — see `docs/ISOLATION.md` for the reason and the VM proxy design.
 
 ## Development
 

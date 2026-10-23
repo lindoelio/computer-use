@@ -68,8 +68,9 @@ These flags apply to every subcommand. The JSON equivalents are sibling keys of 
 | `--allow-foreground` | `allow_foreground` | false | Skip `foreground.lock` for tier `activate`. |
 | `--require-background` | `require_background` | false | Do not fall back to `activate`. Cursor motion becomes `execution_failed`. |
 | `--no-overlay` | `no_overlay` | false | Do not send the agent point to the overlay helper. |
-| `--cdp` | `cdp` | off | Route `browser` commands through Chrome DevTools Protocol. Requires `--features cdp`. |
-| `--cdp-url <URL>` | `cdp_url` | argv discovery | Override the discovered CDP websocket URL. |
+| `--cdp` | `cdp` | off | Route `browser` commands through Chrome DevTools Protocol. The release binaries include the feature; a default `cargo install` needs `--features cdp`. |
+| `--cdp-url <URL>` | `cdp_url` | argv discovery / managed session | Override the discovered CDP endpoint. |
+| `--on-dialog <MODE>` | `on_dialog` | dismiss | Browser dialog policy: accept, dismiss, or fail. |
 | `--display <ID\|VIRTUAL>` | `display` | all | Restrict capture and coordinate conversion to one monitor id from `displays`. `--display virtual` is the Linux Xvfb recipe. |
 | `--exec <CMD>...` | n/a | none | With `--display virtual`, replace this process with a command inside the prepared environment (`DISPLAY=:99`). |
 
@@ -140,7 +141,7 @@ exec                Run one JSON action from an argument
 batch               Run a batch of JSON actions from an argument
 cursor-position     Print the pointer position
 overlay             Local agent-cursor helper. This is not a network service
-browser             Chrome DevTools Protocol (CDP) subcommands. Requires `--cdp` and a binary built with `--features cdp`
+browser             Chrome DevTools Protocol (CDP) subcommands. Requires `--cdp`; the release binaries include the feature
 help                Print this message or the help of the given subcommand(s)
 ```
 
@@ -413,7 +414,7 @@ usage: computer-use displays [OPTIONS]
 usage: computer-use isolation [OPTIONS]
 ```
 
-Returns `{platform, display_filter, cdp, virtual_display, set_of_marks, notes}`.
+Returns `{platform, display_filter, virtual_display, set_of_marks, notes}`. In 0.4.0 it does not report `cdp`.
 
 ### `list-apps`
 
@@ -646,27 +647,74 @@ macOS only. The main CLI sends `{x, y, session}` on `<cache>/overlay.sock` after
 usage: computer-use browser [OPTIONS] <COMMAND>
 
 Commands:
-  tabs        List the targets Chrome exposes. Each entry is one CDP `Target`. Tabs are `type == "page"`.
-  activate    Bring a tab to the front. --target is the CDP targetId from `browser tabs`.
-  navigate    Navigate a tab (or the first page) to --url. The URL is blocked by [browser].blocked_urls in the policy before it is sent.
-  click       Click the element matched by CSS --selector.
-  text        Read the innerText of the first element matched by CSS --selector. The current page URL is checked against [browser].blocked_urls first.
-  type        Type --text into the element matched by --selector (or the page body). Classified like `type`.
-  eval        Evaluate JavaScript in the page context. The script body is never logged verbatim.
+  tabs         List the targets the browser exposes. Filter by `kind == "page"`.
+  activate     Bring a tab to the front. `--target` is required.
+  navigate     Navigate a tab to `--url` with an optional wait.
+  back         Go back in the tab history.
+  forward      Go forward in the tab history.
+  reload       Reload the tab.
+  wait         Wait for `load`, `domcontentloaded`, `networkidle`, `selector:<css>`, or `url:<glob>`.
+  snapshot     Capture a compact accessibility snapshot with `ref=eN` handles.
+  click        Click by `--selector` or `--ref`.
+  text         Read innerText by `--selector` or `--ref`.
+  type         Type `--text` into `--selector`/`--ref`; secure fields are refused.
+  press        Press a key combination on the page or an element.
+  hover        Move the mouse over an element.
+  scroll       Scroll the page or an element.
+  select       Select an option by `--value` or `--label`.
+  check        Check or uncheck a checkbox/radio (`--unchecked`).
+  upload       Set files on an `<input type=file>` with `--file`.
+  dialog       Accept or dismiss a JavaScript dialog.
+  screenshot   Capture the page with `Page.captureScreenshot`.
+  eval         Evaluate JavaScript in the page context.
+  tab-new      Open a new tab.
+  tab-close    Close a tab by `--target`.
+  launch       Start a managed Chromium with an isolated profile.
+  quit         Stop a managed Chromium (`--purge` removes the profile).
+  sessions     List managed Chromium sessions.
 ```
+
+Attach mode stays the default. `--cdp-url` wins; otherwise the port is
+discovered from the `--app` pid's argv (macOS/Linux), and with no app the
+newest `browser launch` session is used. `browser launch` is the reliable
+path on Chrome 136+, which ignores `--remote-debugging-port` on the default
+data directory.
 
 Per-subcommand flags:
 
 ```
-browser activate    --target <TARGET>           Restrict to one tab by targetId. Optional.
-browser navigate    --url <URL> --target <TARGET>
-browser click       --selector <SELECTOR> --target <TARGET>
-browser text        --selector <SELECTOR> --target <TARGET>
-browser type        --text <TEXT> --selector <SELECTOR> --target <TARGET>
-browser eval        --eval <SCRIPT> --target <TARGET>
+browser tabs
+browser activate   --target <TARGET>
+browser navigate   --url <URL> [--target <TARGET>] [--wait <WAIT>] [--timeout-ms <MS>] [--new-tab]
+browser back|forward [--target <TARGET>]
+browser reload     [--target <TARGET>] [--wait <WAIT>] [--timeout-ms <MS>]
+browser wait       --wait <WAIT> [--target <TARGET>] [--timeout-ms <MS>]
+browser snapshot   [--target <TARGET>] [--diff] [--interactive-only] [--max-nodes <N>]
+browser click      (--selector <CSS>|--ref <REF>) [--target <TARGET>] [--button left|right|middle|back|forward] [--count N] [--wait <WAIT>] [--timeout-ms <MS>] [--force]
+browser text       (--selector <CSS>|--ref <REF>) [--target <TARGET>]
+browser type       --text <TEXT> (--selector <CSS>|--ref <REF>) [--clear] [--submit] [--wait <WAIT>] [--timeout-ms <MS>]
+browser press      --keys <COMBO> [--selector <CSS>|--ref <REF>] [--target <TARGET>]
+browser hover      (--selector <CSS>|--ref <REF>) [--target <TARGET>]
+browser scroll     [--selector <CSS>|--ref <REF>] [--dx <N>] [--dy <N>]
+browser select     (--selector <CSS>|--ref <REF>) (--value <V>|--label <L>)
+browser check      (--selector <CSS>|--ref <REF>) [--unchecked]
+browser upload     (--selector <CSS>|--ref <REF>) --file <PATH> [--file <PATH>...]
+browser dialog     [--target <TARGET>] [--accept|--dismiss] [--prompt-text <TEXT>]
+browser screenshot [--target <TARGET>] [--output <PATH>] [--full-page] [--format png|jpeg] [--quality <N>]
+browser eval       --eval <SCRIPT> [--target <TARGET>] [--timeout-ms <MS>] [--await-promise]
+browser tab-new    [--url <URL>]
+browser tab-close  --target <TARGET>
+browser launch     [--browser <NAME|PATH>] [--headless] [--profile <DIR>] [--port <PORT>] [--url <URL>]
+browser quit       [--session <ID>] [--purge]
+browser sessions
 ```
 
-The CLI flag is `--cdp` and the JSON field is `cdp: true`. Without `--features cdp`, every browser command returns `cdp_unavailable`.
+`--wait` accepts `none`, `load` (default), `domcontentloaded`, `networkidle`,
+`selector:<css>`, or `url:<glob>`. `--timeout-ms` defaults to 30000.
+
+The CLI flag is `--cdp` and the JSON field is `cdp: true`. A binary built
+without the feature returns `unsupported`; without `--cdp` the CLI returns
+`invalid_arguments`.
 
 ## JSON actions
 
@@ -721,13 +769,31 @@ The protocol is `src/protocol.rs::Action`. The tag is `action`; the rename rule 
 | `dock_click` | `title` | Aliases: `dock-click`, `dock_click`. |
 | `spaces` | none | |
 | `batch` | `actions` (array of native actions), `stop_on_error` | Nested batch is `invalid_arguments`. Also reachable as the CLI command `batch`. |
-| `browser_tabs` | none | `cdp` feature. |
+| `browser_tabs` | none | `cdp` feature. Returns `{tabs, count}`. |
 | `browser_activate` | `target_id` | `cdp` feature. |
-| `browser_navigate` | `url`, `target_id` | `cdp` feature. |
-| `browser_click` | `selector`, `target_id` | `cdp` feature. |
-| `browser_text` | `selector`, `target_id` | `cdp` feature. |
-| `browser_type` | `text`, `selector` (optional), `target_id` | `cdp` feature. |
-| `browser_eval` | `script`, `target_id` | `cdp` feature. |
+| `browser_navigate` | `url`, `target_id`, `wait`, `timeout_ms`, `new_tab` | `cdp` feature. |
+| `browser_back` | `target_id` | `cdp` feature. |
+| `browser_forward` | `target_id` | `cdp` feature. |
+| `browser_reload` | `target_id`, `wait`, `timeout_ms` | `cdp` feature. |
+| `browser_wait` | `target_id`, `wait`, `timeout_ms` | `cdp` feature. |
+| `browser_snapshot` | `target_id`, `diff`, `interactive_only`, `max_nodes` | `cdp` feature. |
+| `browser_click` | `selector`/`ref_id`, `target_id`, `button`, `count`, `wait`, `timeout_ms`, `force` | `cdp` feature. |
+| `browser_text` | `selector`/`ref_id`, `target_id` | `cdp` feature. |
+| `browser_type` | `text`, `selector`/`ref_id`, `target_id`, `clear`, `submit`, `wait`, `timeout_ms` | `cdp` feature. |
+| `browser_press` | `keys`, `selector`/`ref_id`, `target_id` | `cdp` feature. |
+| `browser_hover` | `selector`/`ref_id`, `target_id` | `cdp` feature. |
+| `browser_scroll` | `selector`/`ref_id`, `target_id`, `dx`, `dy` | `cdp` feature. |
+| `browser_select` | `selector`/`ref_id`, `target_id`, `value`, `label` | `cdp` feature. |
+| `browser_check` | `selector`/`ref_id`, `target_id`, `checked` | `cdp` feature. |
+| `browser_upload` | `selector`/`ref_id`, `target_id`, `files` | `cdp` feature. |
+| `browser_dialog` | `target_id`, `accept`, `prompt_text` | `cdp` feature. |
+| `browser_screenshot` | `target_id`, `output`, `full_page`, `format`, `quality`, `base64` | `cdp` feature. |
+| `browser_eval` | `script`, `target_id`, `timeout_ms`, `await_promise` | `cdp` feature. |
+| `browser_tab_new` | `url` | `cdp` feature. |
+| `browser_tab_close` | `target_id` | `cdp` feature. |
+| `browser_launch` | `browser`, `headless`, `profile`, `port`, `url` | `cdp` feature. |
+| `browser_quit` | `session`, `purge` | `cdp` feature. |
+| `browser_sessions` | none | `cdp` feature. |
 
 `adapter` values:
 
@@ -757,6 +823,7 @@ The protocol is `src/protocol.rs::Action`. The tag is `action`; the rename rule 
 | `paused` | Local user input tripped the kill switch. |
 | `cdp_unavailable` | Feature off, or Chrome has no debugging port. |
 | `display_unavailable` | The screen is locked, the display is asleep, or no display or shareable window is available. Checked before `window_not_found`; no xcap crop fallback. |
+| `timeout` | A browser wait, action, or dialog rescue exceeded its timeout. |
 
 ## File locations
 

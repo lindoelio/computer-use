@@ -120,18 +120,24 @@ struct Cli {
     no_overlay: bool,
 
     /// Route `browser` commands to Chrome DevTools Protocol. Requires a
-    /// binary built with `--features cdp`. The CDP client attaches to a
-    /// Chrome that the user already started with `--remote-debugging-port=N`
-    /// — `computer-use` does not spawn a browser.
+    /// binary built with `--features cdp` (the release binaries include it).
+    /// Attach mode connects to a Chrome the user already started with
+    /// `--remote-debugging-port=N`; `browser launch` starts a managed
+    /// Chromium with an isolated profile and `browser quit` stops it.
     #[arg(long, global = true)]
     cdp: bool,
 
     /// Override the discovered CDP websocket URL. Default: scan the `--app`
     /// pid's argv on macOS/Linux and connect to `ws://127.0.0.1:<port>`, or
-    /// `ws://127.0.0.1:9222` when no app is given. `http(s)://...` is also
+    /// use the newest `browser launch` session. `http(s)://...` is also
     /// accepted and resolved via `/json/version`.
     #[arg(long, global = true, value_name = "URL")]
     cdp_url: Option<String>,
+
+    /// What to do when a browser JavaScript dialog opens: accept, dismiss,
+    /// or fail. Default: dismiss.
+    #[arg(long, global = true, value_name = "accept|dismiss|fail")]
+    on_dialog: Option<String>,
 
     /// Restrict capture and coordinate conversion to one monitor id from
     /// `displays`. Points stay virtual-desktop points, and a point outside the
@@ -797,82 +803,360 @@ enum CliCommand {
 
 #[derive(Debug, Subcommand)]
 enum CliBrowserCommand {
-    /// List the targets Chrome exposes. Each entry is one CDP `Target`.
-    /// Tabs are `type == "page"`.
-    ///
-    /// Example: computer-use --cdp browser tabs
+    /// List the targets the browser exposes. Filter by `kind == "page"`.
     Tabs,
 
-    /// Bring a tab to the front. `--target` is the CDP `targetId` from
-    /// `browser tabs`.
+    /// Bring a tab to the front.
     Activate {
+        /// CDP `targetId` from `browser tabs`.
+        #[arg(long, value_name = "TARGET")]
+        target: String,
+    },
+
+    /// Navigate a tab to `--url`.
+    Navigate {
+        /// Destination URL.
+        #[arg(long, value_name = "URL")]
+        url: String,
+        /// Restrict to one tab.
+        #[arg(long, value_name = "TARGET")]
+        target: Option<String>,
+        /// `none`, `load`, `domcontentloaded`, `networkidle`,
+        /// `selector:<css>`, or `url:<glob>`. Default: load.
+        #[arg(long, value_name = "WAIT")]
+        wait: Option<String>,
+        /// Timeout in milliseconds. Default: 30000.
+        #[arg(long, value_name = "MS")]
+        timeout_ms: Option<u64>,
+        /// Open the URL in a new tab.
+        #[arg(long)]
+        new_tab: bool,
+    },
+
+    /// Go back in the tab's history.
+    Back {
+        /// Restrict to one tab.
+        #[arg(long, value_name = "TARGET")]
+        target: Option<String>,
+    },
+
+    /// Go forward in the tab's history.
+    Forward {
+        /// Restrict to one tab.
+        #[arg(long, value_name = "TARGET")]
+        target: Option<String>,
+    },
+
+    /// Reload the tab.
+    Reload {
+        /// Restrict to one tab.
+        #[arg(long, value_name = "TARGET")]
+        target: Option<String>,
+        /// Wait condition after the reload. Default: load.
+        #[arg(long, value_name = "WAIT")]
+        wait: Option<String>,
+        /// Timeout in milliseconds.
+        #[arg(long, value_name = "MS")]
+        timeout_ms: Option<u64>,
+    },
+
+    /// Wait for a page condition without navigating.
+    Wait {
+        /// Restrict to one tab.
+        #[arg(long, value_name = "TARGET")]
+        target: Option<String>,
+        /// `none`, `load`, `domcontentloaded`, `networkidle`,
+        /// `selector:<css>`, or `url:<glob>`.
+        #[arg(long, value_name = "WAIT")]
+        wait: String,
+        /// Timeout in milliseconds. Default: 30000.
+        #[arg(long, value_name = "MS")]
+        timeout_ms: Option<u64>,
+    },
+
+    /// Capture a compact accessibility snapshot with `ref=eN` handles.
+    Snapshot {
+        /// Restrict to one tab.
+        #[arg(long, value_name = "TARGET")]
+        target: Option<String>,
+        /// Return only the delta against the cached snapshot.
+        #[arg(long)]
+        diff: bool,
+        /// Only actionable controls.
+        #[arg(long)]
+        interactive_only: bool,
+        /// Maximum rendered nodes. Default: 400.
+        #[arg(long, value_name = "N")]
+        max_nodes: Option<usize>,
+    },
+
+    /// Click an element by CSS selector or snapshot ref.
+    Click {
+        /// CSS selector.
+        #[arg(long, value_name = "SELECTOR", conflicts_with = "ref_id")]
+        selector: Option<String>,
+        /// Snapshot ref such as `e12`.
+        #[arg(long = "ref", value_name = "REF", conflicts_with = "selector")]
+        ref_id: Option<String>,
+        /// Restrict to one tab.
+        #[arg(long, value_name = "TARGET")]
+        target: Option<String>,
+        /// Mouse button. Default: left.
+        #[arg(long, value_enum, default_value_t = CliButton::Left)]
+        button: CliButton,
+        /// Click count: 1, 2, or 3. Default: 1.
+        #[arg(long, value_name = "N", default_value_t = 1)]
+        count: u8,
+        /// Wait condition after the click. Default: load.
+        #[arg(long, value_name = "WAIT")]
+        wait: Option<String>,
+        /// Timeout in milliseconds.
+        #[arg(long, value_name = "MS")]
+        timeout_ms: Option<u64>,
+        /// Skip visibility and enabled checks.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Read the `innerText` of an element.
+    Text {
+        /// CSS selector.
+        #[arg(long, value_name = "SELECTOR", conflicts_with = "ref_id")]
+        selector: Option<String>,
+        /// Snapshot ref such as `e12`.
+        #[arg(long = "ref", value_name = "REF", conflicts_with = "selector")]
+        ref_id: Option<String>,
+        /// Restrict to one tab.
+        #[arg(long, value_name = "TARGET")]
+        target: Option<String>,
+    },
+
+    /// Type `text` into an element. Secure fields are refused.
+    Type {
+        /// Text to type.
+        #[arg(long, value_name = "TEXT")]
+        text: String,
+        /// CSS selector.
+        #[arg(long, value_name = "SELECTOR", conflicts_with = "ref_id")]
+        selector: Option<String>,
+        /// Snapshot ref such as `e12`.
+        #[arg(long = "ref", value_name = "REF", conflicts_with = "selector")]
+        ref_id: Option<String>,
+        /// Restrict to one tab.
+        #[arg(long, value_name = "TARGET")]
+        target: Option<String>,
+        /// Clear the field before typing.
+        #[arg(long)]
+        clear: bool,
+        /// Press Enter after typing.
+        #[arg(long)]
+        submit: bool,
+        /// Wait condition after typing. Default: load.
+        #[arg(long, value_name = "WAIT")]
+        wait: Option<String>,
+        /// Timeout in milliseconds.
+        #[arg(long, value_name = "MS")]
+        timeout_ms: Option<u64>,
+    },
+
+    /// Press a key combination such as `Enter`, `cmd+a`, or `ctrl+shift+Tab`.
+    Press {
+        /// Combination to press.
+        #[arg(long, value_name = "KEYS")]
+        keys: String,
+        /// Optional element to focus first.
+        #[arg(long, value_name = "SELECTOR", conflicts_with = "ref_id")]
+        selector: Option<String>,
+        /// Optional snapshot ref to focus first.
+        #[arg(long = "ref", value_name = "REF", conflicts_with = "selector")]
+        ref_id: Option<String>,
+        /// Restrict to one tab.
+        #[arg(long, value_name = "TARGET")]
+        target: Option<String>,
+    },
+
+    /// Move the mouse over an element.
+    Hover {
+        /// CSS selector.
+        #[arg(long, value_name = "SELECTOR", conflicts_with = "ref_id")]
+        selector: Option<String>,
+        /// Snapshot ref.
+        #[arg(long = "ref", value_name = "REF", conflicts_with = "selector")]
+        ref_id: Option<String>,
+        /// Restrict to one tab.
+        #[arg(long, value_name = "TARGET")]
+        target: Option<String>,
+    },
+
+    /// Scroll the page or an element.
+    Scroll {
+        /// CSS selector.
+        #[arg(long, value_name = "SELECTOR", conflicts_with = "ref_id")]
+        selector: Option<String>,
+        /// Snapshot ref.
+        #[arg(long = "ref", value_name = "REF", conflicts_with = "selector")]
+        ref_id: Option<String>,
+        /// Restrict to one tab.
+        #[arg(long, value_name = "TARGET")]
+        target: Option<String>,
+        /// Horizontal wheel delta.
+        #[arg(long, default_value_t = 0.0)]
+        dx: f64,
+        /// Vertical wheel delta. Positive is down.
+        #[arg(long, default_value_t = 0.0)]
+        dy: f64,
+    },
+
+    /// Select an option in a `<select>`.
+    Select {
+        /// CSS selector.
+        #[arg(long, value_name = "SELECTOR", conflicts_with = "ref_id")]
+        selector: Option<String>,
+        /// Snapshot ref.
+        #[arg(long = "ref", value_name = "REF", conflicts_with = "selector")]
+        ref_id: Option<String>,
+        /// Restrict to one tab.
+        #[arg(long, value_name = "TARGET")]
+        target: Option<String>,
+        /// Option value.
+        #[arg(long, value_name = "VALUE")]
+        value: Option<String>,
+        /// Option label.
+        #[arg(long, value_name = "LABEL")]
+        label: Option<String>,
+    },
+
+    /// Check a checkbox or radio. Pass `--unchecked` to clear it.
+    Check {
+        /// CSS selector.
+        #[arg(long, value_name = "SELECTOR", conflicts_with = "ref_id")]
+        selector: Option<String>,
+        /// Snapshot ref.
+        #[arg(long = "ref", value_name = "REF", conflicts_with = "selector")]
+        ref_id: Option<String>,
+        /// Restrict to one tab.
+        #[arg(long, value_name = "TARGET")]
+        target: Option<String>,
+        /// Uncheck instead of check.
+        #[arg(long)]
+        unchecked: bool,
+    },
+
+    /// Set files on an `<input type=file>`.
+    Upload {
+        /// CSS selector.
+        #[arg(long, value_name = "SELECTOR", conflicts_with = "ref_id")]
+        selector: Option<String>,
+        /// Snapshot ref.
+        #[arg(long = "ref", value_name = "REF", conflicts_with = "selector")]
+        ref_id: Option<String>,
+        /// Restrict to one tab.
+        #[arg(long, value_name = "TARGET")]
+        target: Option<String>,
+        /// File path. Repeat for several files.
+        #[arg(long = "file", value_name = "PATH", action = clap::ArgAction::Append)]
+        files: Vec<String>,
+    },
+
+    /// Accept or dismiss a JavaScript dialog.
+    Dialog {
+        /// Restrict to one tab.
+        #[arg(long, value_name = "TARGET")]
+        target: Option<String>,
+        /// Accept the dialog. Default when neither flag is given.
+        #[arg(long, conflicts_with = "dismiss")]
+        accept: bool,
+        /// Dismiss the dialog.
+        #[arg(long)]
+        dismiss: bool,
+        /// Text for a prompt dialog.
+        #[arg(long, value_name = "TEXT")]
+        prompt_text: Option<String>,
+    },
+
+    /// Capture a page screenshot.
+    Screenshot {
+        /// Restrict to one tab.
+        #[arg(long, value_name = "TARGET")]
+        target: Option<String>,
+        /// Output path. Defaults to a temp file.
+        #[arg(long, value_name = "PATH")]
+        output: Option<String>,
+        /// Capture beyond the viewport.
+        #[arg(long)]
+        full_page: bool,
+        /// `png` (default) or `jpeg`.
+        #[arg(long, value_name = "FORMAT")]
+        format: Option<String>,
+        /// JPEG quality 0-100.
+        #[arg(long, value_name = "N")]
+        quality: Option<i64>,
+        /// Include the image as base64 in the response. Off by default.
+        #[arg(long)]
+        base64: bool,
+    },
+
+    /// Evaluate JavaScript in the page context.
+    Eval {
+        /// JavaScript source.
+        #[arg(long, value_name = "SCRIPT")]
+        eval: String,
+        /// Restrict to one tab.
+        #[arg(long, value_name = "TARGET")]
+        target: Option<String>,
+        /// Timeout in milliseconds.
+        #[arg(long, value_name = "MS")]
+        timeout_ms: Option<u64>,
+        /// Await a returned promise.
+        #[arg(long)]
+        await_promise: bool,
+    },
+
+    /// Open a new tab.
+    TabNew {
+        /// URL to open. Defaults to `about:blank`.
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+    },
+
+    /// Close a tab.
+    TabClose {
         /// CDP `targetId`.
         #[arg(long, value_name = "TARGET")]
         target: String,
     },
 
-    /// Navigate a tab (or the first page) to `--url`. The URL is blocked by
-    /// `[browser].blocked_urls` in the policy before it is sent.
-    Navigate {
-        /// Destination URL.
+    /// Start a managed Chromium with an isolated profile.
+    Launch {
+        /// Browser executable name or path.
+        #[arg(long, value_name = "NAME|PATH")]
+        browser: Option<String>,
+        /// Run headless.
+        #[arg(long)]
+        headless: bool,
+        /// Profile directory. Defaults to a cache directory.
+        #[arg(long, value_name = "DIR")]
+        profile: Option<String>,
+        /// Debug port. Default: an ephemeral port.
+        #[arg(long, value_name = "PORT")]
+        port: Option<u16>,
+        /// URL to open. Defaults to `about:blank`.
         #[arg(long, value_name = "URL")]
-        url: String,
-        /// Restrict to one tab by `targetId`. Optional.
-        #[arg(long, value_name = "TARGET")]
-        target: Option<String>,
+        url: Option<String>,
     },
 
-    /// Click the element matched by CSS `--selector`.
-    Click {
-        /// CSS selector.
-        #[arg(long, value_name = "SELECTOR")]
-        selector: String,
-        /// Restrict to one tab by `targetId`. Optional.
-        #[arg(long, value_name = "TARGET")]
-        target: Option<String>,
+    /// Stop a managed Chromium.
+    Quit {
+        /// Managed session id. Defaults to the newest one.
+        #[arg(long, value_name = "ID")]
+        session: Option<String>,
+        /// Remove the profile directory too.
+        #[arg(long)]
+        purge: bool,
     },
 
-    /// Read the `innerText` of the first element matched by CSS `--selector`.
-    /// The current page URL is checked against `[browser].blocked_urls` first.
-    /// A selector that matches nothing returns `element_not_found`.
-    Text {
-        /// CSS selector whose `innerText` should be returned.
-        #[arg(long, value_name = "SELECTOR")]
-        selector: String,
-        /// Restrict to one tab by `targetId`. Optional.
-        #[arg(long, value_name = "TARGET")]
-        target: Option<String>,
-    },
-
-    /// Type `text` into the element matched by `--selector` (or the page body
-    /// when no selector is given). Classified like `type`: the body is never
-    /// stored, only its character count. The current page URL is checked
-    /// against `[browser].blocked_urls` first.
-    Type {
-        /// Text to type.
-        #[arg(long, value_name = "TEXT")]
-        text: String,
-        /// Optional CSS selector. When omitted the page body receives input.
-        #[arg(long, value_name = "SELECTOR")]
-        selector: Option<String>,
-        /// Restrict to one tab by `targetId`. Optional.
-        #[arg(long, value_name = "TARGET")]
-        target: Option<String>,
-    },
-
-    /// Evaluate JavaScript in the page context. The script body is never
-    /// logged verbatim — only its length and a small hash appear in the
-    /// audit row.
-    Eval {
-        /// JavaScript source. The whole next argument is the script body.
-        /// Pass an empty `--eval ""` to evaluate an empty expression (which
-        /// resolves to `undefined`).
-        #[arg(long, value_name = "SCRIPT")]
-        eval: String,
-        /// Restrict to one tab by `targetId`. Optional.
-        #[arg(long, value_name = "TARGET")]
-        target: Option<String>,
-    },
+    /// List managed Chromium sessions.
+    Sessions,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1152,6 +1436,7 @@ fn run() -> u8 {
                 no_overlay: cli.no_overlay,
                 cdp: cli.cdp,
                 cdp_url: cli.cdp_url.clone(),
+                on_dialog: cli.on_dialog.clone(),
                 display: cli.display.clone(),
                 ..CallContext::default()
             };
@@ -1510,31 +1795,227 @@ fn browser_action(
         CliBrowserCommand::Activate { target } => Action::BrowserActivate {
             target_id: Some(target.clone()),
         },
-        CliBrowserCommand::Navigate { url, target } => Action::BrowserNavigate {
+        CliBrowserCommand::Navigate {
+            url,
+            target,
+            wait,
+            timeout_ms,
+            new_tab,
+        } => Action::BrowserNavigate {
             url: url.clone(),
             target_id: target.clone(),
+            wait: wait.clone(),
+            timeout_ms: *timeout_ms,
+            new_tab: *new_tab,
         },
-        CliBrowserCommand::Click { selector, target } => Action::BrowserClick {
-            selector: selector.clone(),
+        CliBrowserCommand::Back { target } => Action::BrowserBack {
             target_id: target.clone(),
         },
-        CliBrowserCommand::Text { selector, target } => Action::BrowserText {
+        CliBrowserCommand::Forward { target } => Action::BrowserForward {
+            target_id: target.clone(),
+        },
+        CliBrowserCommand::Reload {
+            target,
+            wait,
+            timeout_ms,
+        } => Action::BrowserReload {
+            target_id: target.clone(),
+            wait: wait.clone(),
+            timeout_ms: *timeout_ms,
+        },
+        CliBrowserCommand::Wait {
+            target,
+            wait,
+            timeout_ms,
+        } => Action::BrowserWait {
+            target_id: target.clone(),
+            wait: wait.clone(),
+            timeout_ms: *timeout_ms,
+        },
+        CliBrowserCommand::Snapshot {
+            target,
+            diff,
+            interactive_only,
+            max_nodes,
+        } => Action::BrowserSnapshot {
+            target_id: target.clone(),
+            diff: *diff,
+            interactive_only: *interactive_only,
+            max_nodes: *max_nodes,
+        },
+        CliBrowserCommand::Click {
+            selector,
+            ref_id,
+            target,
+            button,
+            count,
+            wait,
+            timeout_ms,
+            force,
+        } => Action::BrowserClick {
             selector: selector.clone(),
+            ref_id: ref_id.clone(),
+            target_id: target.clone(),
+            button: MouseButton::from(*button),
+            count: *count,
+            wait: wait.clone(),
+            timeout_ms: *timeout_ms,
+            force: *force,
+        },
+        CliBrowserCommand::Text {
+            selector,
+            ref_id,
+            target,
+        } => Action::BrowserText {
+            selector: selector.clone(),
+            ref_id: ref_id.clone(),
             target_id: target.clone(),
         },
         CliBrowserCommand::Type {
             text,
             selector,
+            ref_id,
             target,
+            clear,
+            submit,
+            wait,
+            timeout_ms,
         } => Action::BrowserType {
             text: text.clone(),
             selector: selector.clone(),
+            ref_id: ref_id.clone(),
+            target_id: target.clone(),
+            clear: *clear,
+            submit: *submit,
+            wait: wait.clone(),
+            timeout_ms: *timeout_ms,
+        },
+        CliBrowserCommand::Press {
+            keys,
+            selector,
+            ref_id,
+            target,
+        } => Action::BrowserPress {
+            keys: keys.clone(),
+            selector: selector.clone(),
+            ref_id: ref_id.clone(),
             target_id: target.clone(),
         },
-        CliBrowserCommand::Eval { eval, target } => Action::BrowserEval {
+        CliBrowserCommand::Hover {
+            selector,
+            ref_id,
+            target,
+        } => Action::BrowserHover {
+            selector: selector.clone(),
+            ref_id: ref_id.clone(),
+            target_id: target.clone(),
+        },
+        CliBrowserCommand::Scroll {
+            selector,
+            ref_id,
+            target,
+            dx,
+            dy,
+        } => Action::BrowserScroll {
+            selector: selector.clone(),
+            ref_id: ref_id.clone(),
+            target_id: target.clone(),
+            dx: *dx,
+            dy: *dy,
+        },
+        CliBrowserCommand::Select {
+            selector,
+            ref_id,
+            target,
+            value,
+            label,
+        } => Action::BrowserSelect {
+            selector: selector.clone(),
+            ref_id: ref_id.clone(),
+            target_id: target.clone(),
+            value: value.clone(),
+            label: label.clone(),
+        },
+        CliBrowserCommand::Check {
+            selector,
+            ref_id,
+            target,
+            unchecked,
+        } => Action::BrowserCheck {
+            selector: selector.clone(),
+            ref_id: ref_id.clone(),
+            target_id: target.clone(),
+            checked: !*unchecked,
+        },
+        CliBrowserCommand::Upload {
+            selector,
+            ref_id,
+            target,
+            files,
+        } => Action::BrowserUpload {
+            selector: selector.clone(),
+            ref_id: ref_id.clone(),
+            target_id: target.clone(),
+            files: files.clone(),
+        },
+        CliBrowserCommand::Dialog {
+            target,
+            accept,
+            dismiss,
+            prompt_text,
+        } => Action::BrowserDialog {
+            target_id: target.clone(),
+            accept: *accept || !*dismiss,
+            prompt_text: prompt_text.clone(),
+        },
+        CliBrowserCommand::Screenshot {
+            target,
+            output,
+            full_page,
+            format,
+            quality,
+            base64,
+        } => Action::BrowserScreenshot {
+            target_id: target.clone(),
+            output: output.clone(),
+            full_page: *full_page,
+            format: format.clone(),
+            quality: *quality,
+            base64: *base64,
+        },
+        CliBrowserCommand::Eval {
+            eval,
+            target,
+            timeout_ms,
+            await_promise,
+        } => Action::BrowserEval {
             script: eval.clone(),
             target_id: target.clone(),
+            timeout_ms: *timeout_ms,
+            await_promise: *await_promise,
         },
+        CliBrowserCommand::TabNew { url } => Action::BrowserTabNew { url: url.clone() },
+        CliBrowserCommand::TabClose { target } => Action::BrowserTabClose {
+            target_id: target.clone(),
+        },
+        CliBrowserCommand::Launch {
+            browser,
+            headless,
+            profile,
+            port,
+            url,
+        } => Action::BrowserLaunch {
+            browser: browser.clone(),
+            headless: *headless,
+            profile: profile.clone(),
+            port: *port,
+            url: url.clone(),
+        },
+        CliBrowserCommand::Quit { session, purge } => Action::BrowserQuit {
+            session: session.clone(),
+            purge: *purge,
+        },
+        CliBrowserCommand::Sessions => Action::BrowserSessions {},
     };
     Ok(action)
 }
@@ -1590,6 +2071,7 @@ fn line_options(cli: &Cli) -> LineOptions<'_> {
         no_overlay: cli.no_overlay,
         cdp: cli.cdp,
         cdp_url: cli.cdp_url.as_deref(),
+        on_dialog: cli.on_dialog.as_deref(),
     }
 }
 

@@ -45,9 +45,9 @@ jobs:
         shell: bash
         run: |
           if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
-            cargo build --release --target ${{ matrix.target }} --features portal
+            cargo build --release --target ${{ matrix.target }} --features portal,cdp
           else
-            cargo build --release --target ${{ matrix.target }}
+            cargo build --release --target ${{ matrix.target }} --features cdp
           fi
       - name: Package Unix
         if: matrix.os != 'windows-latest'

@@ -69,6 +69,10 @@ pub enum ComputerError {
     /// The screen is locked, asleep, or no display is attached.
     #[error("display unavailable: {0}")]
     DisplayUnavailable(String),
+
+    /// A browser wait or action exceeded its timeout.
+    #[error("timeout: {0}")]
+    Timeout(String),
 }
 
 impl ComputerError {
@@ -91,6 +95,7 @@ impl ComputerError {
             Self::Paused(_) => "paused",
             Self::CdpUnavailable(_) => "cdp_unavailable",
             Self::DisplayUnavailable(_) => "display_unavailable",
+            Self::Timeout(_) => "timeout",
         }
     }
 }

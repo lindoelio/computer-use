@@ -4,6 +4,39 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - 2026-10-23
+
+### Added
+
+#### Browser (CDP v2)
+
+- `browser snapshot` captures a compact accessibility tree with stable `ref=eN` handles and a `--diff` delta against the `--session` baseline. `browser click`, `text`, and `type` accept `--ref` in addition to `--selector`. A ref from a different document returns `stale_element` instead of acting on the wrong page.
+- `browser navigate` now waits by default: `--wait none|load|domcontentloaded|networkidle|selector:<css>|url:<glob>` with `--timeout-ms`. Navigation goes through `location.assign` plus polling so it does not depend on the chromiumoxide frame-manager load path.
+- New commands: `browser back`, `forward`, `reload`, `wait`, `press`, `hover`, `scroll`, `select`, `check`, `upload`, `dialog`, `screenshot`, `tab-new`, `tab-close`, `launch`, `quit`, `sessions`.
+- `browser launch` starts a managed Chromium with an isolated profile and `--remote-debugging-port=0`; `browser quit --purge` stops it and removes the profile. This is the reliable path on Chrome 136+, which ignores the debug port on the default data directory.
+- `browser tabs` returns `{tabs, count}` with `kind` (not `type`), `target_id`, `handle`, `title`, `url`, `opener_id`, and `blocked`; blocked tabs are redacted.
+- With no `--target`, a single page is used. Multiple pages are `invalid_arguments` with the list, instead of silently picking the first one.
+- `browser type` refuses `input[type=password]` and `autocomplete` current-password/new-password/one-time-code fields with `policy_denied`.
+- Actionability: `browser click` checks visibility and disabled state, scrolls into view, and `--force` bypasses the checks.
+- `--on-dialog accept|dismiss|fail` handles JavaScript dialogs opened by an action; `browser dialog` handles one explicitly over a raw CDP connection.
+- New error code `timeout`.
+- The release binaries are built with `--features cdp`; `cargo install` keeps the optional `cdp` feature.
+
+### Changed
+
+- The CDP driver keeps one runtime alive for the whole command. The previous code created the runtime inside `connect`, spawned the chromiumoxide handler, and dropped the runtime before the command ran.
+- `browser navigate` requires `--target` when more than one page target exists.
+- The `browser` CLI help and `docs/CLI.md` document the new surface; `browser activate --target` is required.
+
+### Fixed
+
+- `browser text` on `<input>`, `<textarea>`, and `<select>` reads `value` instead of an empty `innerText`.
+- Browser commands report `unsupported` when the feature is off and `invalid_arguments` when `--cdp` is missing, matching the CLI gate.
+
+### Tests
+
+- New `tests/cdp_live.rs` starts a real headless Chromium with an isolated profile and an in-process HTTP fixture server. It covers `tabs` (`kind`), navigate, snapshot, click by ref, type, secure-field refusal, and blocked URLs. The new `cdp-live` CI job runs it on macOS, Linux, and Windows.
+
 ## [0.3.2] - 2026-10-21
 
 ### Fixed
