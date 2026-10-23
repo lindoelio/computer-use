@@ -1117,10 +1117,18 @@ pub fn parse_request(mut value: Value) -> Result<Request, ComputerError> {
 
 fn take_context(object: &mut Map<String, Value>) -> Result<CallContext, ComputerError> {
     let state_diff = take_bool(object, "state_diff")?;
+    // `wait` and `verify` use `element` as the condition target, not as the
+    // shared context element. Leaving the key in the object lets the action
+    // deserialize it; the context element stays unset.
+    let element = if element_is_a_condition(object) {
+        None
+    } else {
+        take_optional_u32(object, "element")?
+    };
     Ok(CallContext {
         app: take_stringish(object, "app")?,
         window: take_stringish(object, "window")?,
-        element: take_optional_u32(object, "element")?,
+        element,
         diff: take_bool(object, "diff")?,
         full: take_bool(object, "full")?,
         return_state: take_bool(object, "return_state")? || state_diff,
@@ -1143,6 +1151,15 @@ fn take_context(object: &mut Map<String, Value>) -> Result<CallContext, Computer
         on_dialog: take_stringish(object, "on_dialog")?,
         agent_overlay: take_stringish(object, "agent_overlay")?,
     })
+}
+
+/// True when `element` on this request is a `wait`/`verify` condition rather
+/// than the shared context element.
+fn element_is_a_condition(object: &Map<String, Value>) -> bool {
+    matches!(
+        object.get("action").and_then(Value::as_str),
+        Some("wait") | Some("verify")
+    )
 }
 
 fn take_stringish(
@@ -2211,28 +2228,23 @@ fn prepare_action(
     }
     if context.element.is_none() && action_inserts_text(action) {
         match backend.peek_focused(context.app.as_deref(), context.window.as_deref()) {
-            Ok(Some(peek)) if peek.secure => {
-                let decision = match loaded.secure_focus() {
-                    policy::FocusDecision::Deny => {
-                        return Prepared {
-                            stop: Some(Response::from_error(ComputerError::PolicyDenied(
-                                "the focused element is a secure field; ask the user to type it"
-                                    .into(),
-                            ))),
-                            warning,
-                            subject,
-                            decision: "deny",
-                            source: "builtin",
-                        };
-                    }
-                    policy::FocusDecision::Warn => {
-                        let note = "focused element is a secure field; proceeding because [security] secure_focus = warn";
-                        warning = Some(append_warning(warning, note));
-                        "allow"
-                    }
-                };
-                let _ = decision;
-            }
+            Ok(Some(peek)) if peek.secure => match loaded.secure_focus() {
+                policy::FocusDecision::Deny => {
+                    return Prepared {
+                        stop: Some(Response::from_error(ComputerError::PolicyDenied(
+                            "the focused element is a secure field; ask the user to type it".into(),
+                        ))),
+                        warning,
+                        subject,
+                        decision: "deny",
+                        source: "builtin",
+                    };
+                }
+                policy::FocusDecision::Warn => {
+                    let note = "focused element is a secure field; proceeding because [security] secure_focus = warn";
+                    warning = Some(append_warning(warning, note));
+                }
+            },
             Ok(_) => {}
             Err(error) => {
                 let note = format!("secure-field check unavailable: {error}");
@@ -3081,7 +3093,7 @@ fn overlay_context(
     if object.contains_key("window") {
         context.window = take_stringish(object, "window")?;
     }
-    if object.contains_key("element") {
+    if object.contains_key("element") && !element_is_a_condition(object) {
         context.element = take_optional_u32(object, "element")?;
     }
     if object.contains_key("diff") {
@@ -4501,10 +4513,14 @@ fn wait_spec(
         });
     }
     match conditions.len() {
+        0 if args.ms.is_some() || args.seconds.is_some() => Ok(None),
         0 if matches!(action, Action::Verify { .. }) => Err(ComputerError::InvalidArguments(
             "verify needs a condition".into(),
         )),
         0 => Ok(None),
+        1 if args.ms.is_some() || args.seconds.is_some() => Err(ComputerError::InvalidArguments(
+            "wait takes a duration or a condition, not both".into(),
+        )),
         1 => Ok(Some(wait::WaitSpec::new(
             conditions.pop().expect("one condition"),
             args.timeout_ms.unwrap_or(default_timeout_ms),
@@ -4516,7 +4532,6 @@ fn wait_spec(
     }
 }
 
-#[allow(unused_assignments)]
 fn wait_action(
     backend: &dyn DesktopBackend,
     context: &CallContext,
@@ -4530,22 +4545,20 @@ fn wait_action(
     };
     let started = Instant::now();
     let deadline = started + Duration::from_millis(spec.timeout_ms);
-    let mut last = Value::Null;
-    loop {
+    let last = loop {
         let (matched, observed) = evaluate_condition(backend, context, &spec.condition)?;
-        last = observed;
         if matched {
             return Ok(json!({
                 "waited_ms": started.elapsed().as_millis() as u64,
                 "condition": spec.condition.as_str(),
-                "observed": last,
+                "observed": observed,
             }));
         }
         if Instant::now() >= deadline {
-            break;
+            break observed;
         }
         thread::sleep(Duration::from_millis(spec.poll_ms));
-    }
+    };
     Err(ComputerError::Timeout(format!(
         "{} was not observed after {} ms; last observation: {last}",
         spec.condition.describe(),
@@ -4553,7 +4566,6 @@ fn wait_action(
     )))
 }
 
-#[allow(unused_assignments)]
 fn verify_response(
     backend: &dyn DesktopBackend,
     context: &CallContext,
@@ -4570,8 +4582,7 @@ fn verify_response(
     };
     let started = Instant::now();
     let deadline = started + Duration::from_millis(spec.timeout_ms);
-    let mut last = Value::Null;
-    loop {
+    let last = loop {
         match evaluate_condition(backend, context, &spec.condition) {
             Ok((true, observed)) => {
                 return Response::success(json!({
@@ -4580,22 +4591,20 @@ fn verify_response(
                     "observed": observed,
                 }))
             }
-            Ok((false, observed)) => last = observed,
+            Ok((false, observed)) => {
+                if Instant::now() >= deadline {
+                    break observed;
+                }
+            }
             Err(error) => return Response::from_error(error),
         }
-        if Instant::now() >= deadline {
-            break;
-        }
         thread::sleep(Duration::from_millis(spec.poll_ms));
-    }
-    Response::failure(
-        "verification_failed",
-        format!(
-            "{} was not true after {} ms",
-            spec.condition.describe(),
-            spec.timeout_ms
-        ),
-    )
+    };
+    Response::from_error(ComputerError::VerificationFailed(format!(
+        "{} was not true after {} ms",
+        spec.condition.describe(),
+        spec.timeout_ms
+    )))
     .with_field("condition", json!(spec.condition.as_str()))
     .with_field("observed", last)
 }
@@ -6251,6 +6260,131 @@ mod tests {
         );
         assert!(response.ok, "{:?}", response.to_value());
         assert_eq!(response.to_value()["condition"], "value");
+    }
+
+    #[test]
+    fn wait_takes_a_duration_or_a_condition_not_both() {
+        let backend = StubBackend::default();
+        let mixed = dispatch_with_context(
+            &backend,
+            Action::Wait {
+                ms: Some(5),
+                seconds: Some(0.0),
+                element: None,
+                element_state: None,
+                text: Some("x".into()),
+                value: None,
+                within_element: None,
+                window_state: None,
+                tree_change: false,
+                app_running: None,
+                title: None,
+                ignore_case: false,
+                timeout_ms: Some(150),
+                poll_ms: Some(25),
+            },
+            &ctx("Notes"),
+        );
+        let value = mixed.to_value();
+        assert_eq!(value["error"]["code"], "invalid_arguments");
+        assert!(value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("duration or a condition"));
+    }
+
+    #[test]
+    fn json_wait_and_verify_keep_element_as_a_condition() {
+        let wait = parse_request(json!({
+            "action": "wait",
+            "element": 12,
+            "element_state": "visible"
+        }))
+        .unwrap();
+        assert!(
+            matches!(
+                wait.action,
+                Action::Wait {
+                    element: Some(12),
+                    ..
+                }
+            ),
+            "{:?}",
+            wait.action
+        );
+        assert_eq!(wait.context.element, None);
+
+        let verify = parse_request(json!({"action": "verify", "element": 3})).unwrap();
+        assert!(
+            matches!(
+                verify.action,
+                Action::Verify {
+                    element: Some(3),
+                    ..
+                }
+            ),
+            "{:?}",
+            verify.action
+        );
+        assert_eq!(verify.context.element, None);
+
+        // Every other action still routes `element` into the shared context.
+        let press = parse_request(json!({"action": "press", "element": 7})).unwrap();
+        assert!(matches!(press.action, Action::Press { .. }));
+        assert_eq!(press.context.element, Some(7));
+    }
+
+    #[test]
+    fn batch_step_keeps_the_wait_element_condition() {
+        let backend = StubBackend::default();
+        let response = dispatch_with_context(
+            &backend,
+            Action::Batch {
+                actions: vec![json!({
+                    "action": "wait",
+                    "element": 1,
+                    "element_state": "bogus"
+                })],
+                stop_on_error: true,
+            },
+            &ctx("Notes"),
+        );
+        let value = response.to_value();
+        // The nested action saw the element; the state is what failed.
+        assert!(
+            value["results"][0]["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("element state"),
+            "{value:?}"
+        );
+    }
+
+    #[test]
+    fn wait_text_with_multibyte_prefix_does_not_panic() {
+        let backend = StubBackend::default();
+        // Curly quotes and an ellipsis are 3-byte characters; the snippet
+        // window starts inside them before the match.
+        *backend.stub_value.lock().unwrap() = "Saved “Draft”… now".into();
+        let response = dispatch_with_context(
+            &backend,
+            wait_action_with(None, None, Some("Saved"), None, None),
+            &ctx("Notes"),
+        );
+        assert!(response.ok, "{:?}", response.to_value());
+        let snippet = response.to_value()["observed"]["snippet"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(snippet.contains("Saved"), "{snippet:?}");
+    }
+
+    #[test]
+    fn verification_failed_is_a_computer_error_code() {
+        assert_eq!(
+            ComputerError::VerificationFailed("nope".into()).code(),
+            "verification_failed"
+        );
     }
 
     #[test]

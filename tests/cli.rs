@@ -616,6 +616,54 @@ fn exec_wait_roundtrip() {
 }
 
 #[test]
+fn exec_wait_element_condition_reaches_the_action() {
+    // An invalid element state proves the field was handed to the wait
+    // action rather than swallowed by the shared request context.
+    let output = run(&[
+        "exec",
+        r#"{"action":"wait","element":12,"element_state":"bogus"}"#,
+    ]);
+    let value: Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["code"], "invalid_arguments");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("element state"),
+        "{value:?}"
+    );
+
+    let verify = run(&[
+        "exec",
+        r#"{"action":"verify","element":3,"element_state":"bogus"}"#,
+    ]);
+    let value: Value = serde_json::from_str(&String::from_utf8_lossy(&verify.stdout)).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_arguments");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("element state"),
+        "{value:?}"
+    );
+}
+
+#[test]
+fn exec_wait_rejects_a_duration_with_a_condition() {
+    let output = run(&["exec", r#"{"action":"wait","ms":5,"text":"x"}"#]);
+    let value: Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_arguments");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("duration or a condition"),
+        "{value:?}"
+    );
+}
+
+#[test]
 fn help_lists_browser_command() {
     let output = run(&["--help"]);
     assert!(output.status.success());

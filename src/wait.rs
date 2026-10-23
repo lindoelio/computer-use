@@ -227,7 +227,16 @@ pub fn contains(haystack: &str, needle: &str, ignore_case: bool) -> bool {
 }
 
 /// A short window around the match, for the response observation.
+///
+/// `to_ascii_lowercase` rewrites only ASCII bytes, so a match offset found in
+/// the folded copy is a valid byte offset in `text`. The bounds are snapped to
+/// character boundaries before slicing: tree text routinely carries 3- and
+/// 4-byte characters (curly quotes, ellipses, arrows, emoji, CJK), and a raw
+/// `position - 40` would land inside one and panic.
 pub fn snippet(text: &str, needle: &str, ignore_case: bool) -> String {
+    if needle.is_empty() {
+        return String::new();
+    }
     let (haystack, wanted) = if ignore_case {
         (text.to_ascii_lowercase(), needle.to_ascii_lowercase())
     } else {
@@ -236,8 +245,8 @@ pub fn snippet(text: &str, needle: &str, ignore_case: bool) -> String {
     let Some(position) = haystack.find(&wanted) else {
         return String::new();
     };
-    let start = position.saturating_sub(40);
-    let end = (position + wanted.len() + 40).min(text.len());
+    let start = floor_char_boundary(text, position.saturating_sub(40));
+    let end = ceil_char_boundary(text, (position + wanted.len() + 40).min(text.len()));
     let mut slice = text[start..end].to_string();
     slice = slice.replace('\n', " ");
     if start > 0 {
@@ -247,6 +256,30 @@ pub fn snippet(text: &str, needle: &str, ignore_case: bool) -> String {
         slice.push('…');
     }
     slice
+}
+
+/// Largest character boundary at or before `index`.
+fn floor_char_boundary(text: &str, index: usize) -> usize {
+    if index >= text.len() {
+        return text.len();
+    }
+    let mut index = index;
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+/// Smallest character boundary at or after `index`.
+fn ceil_char_boundary(text: &str, index: usize) -> usize {
+    if index >= text.len() {
+        return text.len();
+    }
+    let mut index = index;
+    while index < text.len() && !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index
 }
 
 #[cfg(test)]
@@ -273,5 +306,36 @@ mod tests {
         assert!(window.contains("brown"));
         let long = "x".repeat(120) + "needle";
         assert!(snippet(&long, "needle", false).starts_with('…'));
+    }
+
+    #[test]
+    fn snippet_keeps_the_original_case_when_folding() {
+        // The needle match is found in the folded copy, but the window is
+        // sliced from the original text.
+        let text = "Save “Draft” Before You Leave";
+        let window = snippet(text, "before", true);
+        assert!(window.contains("Before"), "{window:?}");
+        assert!(window.contains('“'), "{window:?}");
+    }
+
+    #[test]
+    fn snippet_never_slices_inside_a_multibyte_character() {
+        for fill in ["é", "€", "😀"] {
+            let text = format!("{}Saved", fill.repeat(30));
+            let window = snippet(&text, "Saved", false);
+            assert!(window.contains("Saved"), "{window:?}");
+            // No leading filler is needed for the 2-byte case; the 3- and
+            // 4-byte cases must still produce a slice, not a panic.
+            assert!(window.chars().count() <= 41, "{window:?}");
+        }
+        let mixed = "a€é😀bneedle".to_string();
+        assert!(snippet(&mixed, "needle", false).contains("needle"));
+    }
+
+    #[test]
+    fn snippet_handles_empty_and_missing_needles() {
+        assert_eq!(snippet("anything", "", false), "");
+        assert_eq!(snippet("anything", "absent", false), "");
+        assert_eq!(snippet("", "x", false), "");
     }
 }

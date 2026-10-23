@@ -73,6 +73,10 @@ pub enum ComputerError {
     /// A browser wait or action exceeded its timeout.
     #[error("timeout: {0}")]
     Timeout(String),
+
+    /// `verify` did not observe its condition before the timeout.
+    #[error("verification failed: {0}")]
+    VerificationFailed(String),
 }
 
 impl ComputerError {
@@ -96,6 +100,7 @@ impl ComputerError {
             Self::CdpUnavailable(_) => "cdp_unavailable",
             Self::DisplayUnavailable(_) => "display_unavailable",
             Self::Timeout(_) => "timeout",
+            Self::VerificationFailed(_) => "verification_failed",
         }
     }
 }
