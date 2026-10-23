@@ -74,9 +74,44 @@ jobs:
         run: |
           set -euo pipefail
           bash -n scripts/package-macos-app.sh
+          bash -n scripts/check-macos-app-status.sh
           if command -v shellcheck >/dev/null 2>&1; then
             shellcheck scripts/package-macos-app.sh
+            shellcheck scripts/check-macos-app-status.sh
           fi
+      - name: Check the release guard script
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp=$(mktemp -d)
+          guard=scripts/check-macos-app-status.sh
+          # Ad-hoc only: refused unless the pre-release override is set.
+          touch "${tmp}/computer-use-macos-arm64-app-unsigned.zip"
+          printf 'signed=adhoc\nnotarized=no\n' > "${tmp}/computer-use-macos-app-status.txt"
+          if "${guard}" "${tmp}"; then
+            echo "an ad-hoc bundle must fail the tag guard" >&2
+            exit 1
+          fi
+          ALLOW_UNSIGNED_RELEASE=1 "${guard}" "${tmp}"
+          # Developer ID signed but not notarized: still refused.
+          rm "${tmp}/computer-use-macos-arm64-app-unsigned.zip"
+          touch "${tmp}/computer-use-macos-arm64-app.zip"
+          printf 'signed=developer-id\nnotarized=no\n' > "${tmp}/computer-use-macos-app-status.txt"
+          if "${guard}" "${tmp}"; then
+            echo "a signed but un-notarized bundle must fail the tag guard" >&2
+            exit 1
+          fi
+          # Signed and notarized: accepted.
+          printf 'signed=developer-id\nnotarized=yes\n' > "${tmp}/computer-use-macos-app-status.txt"
+          "${guard}" "${tmp}"
+          # No macOS app at all: refused.
+          rm "${tmp}/computer-use-macos-arm64-app.zip"
+          if "${guard}" "${tmp}"; then
+            echo "a tag without a macOS app must fail the guard" >&2
+            exit 1
+          fi
+          echo "release guard script ok"
+          rm -rf "${tmp}"
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Check the portal feature builds

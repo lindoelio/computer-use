@@ -76,7 +76,15 @@ The script does this when `MACOS_SIGN_IDENTITY`, `APPLE_ID`, `APPLE_APP_SPECIFIC
 
 The release workflow signs only when the first three secrets exist. It notarizes only when the Apple ID secrets exist too. With none of them, it uploads `computer-use-macos-arm64-app-unsigned.zip` and adds a line to the release notes saying the zip is ad-hoc signed and not notarized.
 
-Tag releases **require** the signed and notarized bundle. If a tag builds only the ad-hoc zip, the release job fails with an error unless the repository variable `ALLOW_UNSIGNED_RELEASE=1` is set. That variable exists for pre-releases only: when the unsigned asset is attached, the GitHub release is marked pre-release. The skill's `scripts/setup.sh` prefers `computer-use-macos-arm64-app.zip` and falls back to the unsigned asset so local installs keep working without secrets.
+Tag releases **require** the signed and notarized bundle, enforced by `scripts/check-macos-app-status.sh` in the release job. The script reads `computer-use-macos-app-status.txt` and fails the tag when:
+
+- only `computer-use-macos-arm64-app-unsigned.zip` was built,
+- no macOS app bundle was built at all,
+- the status file is missing,
+- `signed` is not `developer-id`, or
+- `notarized` is not `yes`.
+
+The repository variable `ALLOW_UNSIGNED_RELEASE=1` skips the check for a pre-release; that release is then marked pre-release. The skill's `scripts/setup.sh` prefers `computer-use-macos-arm64-app.zip` and falls back to the unsigned asset so local installs keep working without secrets. `.github/workflows/ci.yml` exercises the guard against fixture status files on every push.
 
 | Secret | Required for | Value |
 | --- | --- | --- |

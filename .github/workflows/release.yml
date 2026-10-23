@@ -161,15 +161,9 @@ jobs:
           path: dist
           merge-multiple: true
       - name: Require a signed and notarized macOS helper for tags
-        if: hashFiles('dist/computer-use-macos-arm64-app-unsigned.zip') != ''
         env:
           ALLOW_UNSIGNED_RELEASE: ${{ vars.ALLOW_UNSIGNED_RELEASE }}
-        run: |
-          set -euo pipefail
-          if [ "${ALLOW_UNSIGNED_RELEASE:-0}" != "1" ]; then
-            echo "::error::This tag built only an ad-hoc signed macOS app. Tag releases require Developer ID signing and notarization. Set the repository variable ALLOW_UNSIGNED_RELEASE=1 only for a pre-release."
-            exit 1
-          fi
+        run: bash scripts/check-macos-app-status.sh dist
       - name: Write SHA256SUMS
         shell: bash
         working-directory: dist
