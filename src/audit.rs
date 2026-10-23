@@ -7,7 +7,7 @@
 //! returned to the caller and does not by itself fail the desktop action.
 
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -78,14 +78,27 @@ fn config() -> AuditConfig {
     #[allow(unused_mut)]
     let mut config = AUDIT_CONFIG.with(|slot| *slot.borrow()).unwrap_or_default();
     #[cfg(not(test))]
-    if let Ok(value) = std::env::var("COMPUTER_USE_AUDIT_MAX_BYTES") {
-        if let Ok(bytes) = value.trim().parse::<u64>() {
-            if bytes >= 1024 {
-                config.max_bytes = bytes;
-            }
-        }
-    }
+    apply_env_override(
+        &mut config,
+        std::env::var("COMPUTER_USE_AUDIT_MAX_BYTES")
+            .ok()
+            .as_deref(),
+    );
     config
+}
+
+/// `COMPUTER_USE_AUDIT_MAX_BYTES` can only raise the rotation threshold, and
+/// never below the 1 KiB floor the policy enforces.
+fn apply_env_override(config: &mut AuditConfig, raw: Option<&str>) {
+    let Some(raw) = raw else {
+        return;
+    };
+    let Ok(bytes) = raw.trim().parse::<u64>() else {
+        return;
+    };
+    if bytes >= 1024 && bytes > config.max_bytes {
+        config.max_bytes = bytes;
+    }
 }
 
 std::thread_local! {
@@ -275,26 +288,69 @@ pub fn tail(lines: usize) -> Result<Vec<String>, ComputerError> {
         return Ok(Vec::new());
     };
     let want = lines.clamp(1, 500);
-    let mut out: Vec<String> = Vec::new();
     let base = dir.join("audit.jsonl");
-    for index in (1..=5).rev() {
-        let path = rotated_path(&base, index);
-        let Ok(text) = fs::read_to_string(&path) else {
+    // Read newest first and prepend, so the budget always lands on the most
+    // recent lines instead of letting an older backup consume it.
+    let mut paths = vec![base.clone()];
+    for index in 1..=5 {
+        paths.push(rotated_path(&base, index));
+    }
+    let mut out: Vec<String> = Vec::new();
+    for path in paths {
+        if out.len() >= want {
+            break;
+        }
+        let Ok(mut older) = tail_lines(&path, want - out.len()) else {
             continue;
         };
-        for line in text.lines().filter(|line| !line.trim().is_empty()) {
-            out.push(line.to_string());
-        }
-    }
-    if let Ok(text) = fs::read_to_string(&base) {
-        for line in text.lines().filter(|line| !line.trim().is_empty()) {
-            out.push(line.to_string());
-        }
+        older.append(&mut out);
+        out = older;
     }
     if out.len() > want {
         out.drain(0..out.len() - want);
     }
     Ok(out)
+}
+
+/// The last `want` non-empty lines of `path`, read backwards in 64 KiB chunks.
+///
+/// The whole file is never loaded: only as many chunks as the requested lines
+/// need, capped by the file size.
+fn tail_lines(path: &Path, want: usize) -> std::io::Result<Vec<String>> {
+    const CHUNK: u64 = 64 * 1024;
+    let mut file = fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let mut chunks: Vec<Vec<u8>> = Vec::new();
+    let mut end = len;
+    let mut newlines = 0usize;
+    // One extra newline so the line before the last `want` is complete.
+    while end > 0 && newlines <= want {
+        let start = end.saturating_sub(CHUNK);
+        let mut buffer = vec![0u8; (end - start) as usize];
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut buffer)?;
+        newlines += buffer.iter().filter(|byte| **byte == b'\n').count();
+        chunks.push(buffer);
+        end = start;
+    }
+    let mut data = Vec::new();
+    for chunk in chunks.into_iter().rev() {
+        data.extend_from_slice(&chunk);
+    }
+    let text = String::from_utf8_lossy(&data);
+    let mut lines: Vec<String> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    // The first read started at a chunk boundary that may be mid-line.
+    if end > 0 && lines.len() > 1 {
+        lines.remove(0);
+    }
+    if lines.len() > want {
+        lines.drain(0..lines.len() - want);
+    }
+    Ok(lines)
 }
 
 fn append_line(path: &Path, line: &str) -> Result<(), ComputerError> {
@@ -448,6 +504,66 @@ mod tests {
         })
         .unwrap();
         assert!(!dir.join("audit.jsonl").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn audit_limit_can_only_be_raised() {
+        let mut config = AuditConfig {
+            enabled: true,
+            max_bytes: 1024 * 1024,
+            keep: 1,
+        };
+        apply_env_override(&mut config, None);
+        assert_eq!(config.max_bytes, 1024 * 1024);
+        apply_env_override(&mut config, Some("512"));
+        assert_eq!(
+            config.max_bytes,
+            1024 * 1024,
+            "below the 1 KiB floor changes nothing"
+        );
+        apply_env_override(&mut config, Some("2048"));
+        assert_eq!(config.max_bytes, 1024 * 1024, "a lower value is ignored");
+        apply_env_override(&mut config, Some("20971520"));
+        assert_eq!(config.max_bytes, 20 * 1024 * 1024);
+        apply_env_override(&mut config, Some("  nope "));
+        assert_eq!(config.max_bytes, 20 * 1024 * 1024);
+    }
+
+    #[test]
+    fn tail_reads_across_a_chunk_boundary() {
+        let dir = std::env::temp_dir().join(format!(
+            "computer-use-audit-tail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.jsonl");
+        let mut text = String::new();
+        for index in 0..5_000 {
+            text.push_str(&format!(
+                "{{\"n\":{index},\"pad\":\"{}\"}}\n",
+                "x".repeat(40)
+            ));
+        }
+        fs::write(&path, &text).unwrap();
+        assert!(
+            fs::metadata(&path).unwrap().len() > 64 * 1024,
+            "the fixture must span more than one read chunk"
+        );
+
+        let lines = tail_lines(&path, 50).unwrap();
+        assert_eq!(lines.len(), 50, "exactly the requested lines");
+        // The head of the first chunk is a partial line and must be dropped.
+        for line in &lines {
+            serde_json::from_str::<serde_json::Value>(line).expect("a complete JSON line");
+        }
+        assert!(lines.last().unwrap().contains("\"n\":4999"));
+        assert!(lines[0].contains("\"n\":4950"), "{}", lines[0]);
         let _ = fs::remove_dir_all(&dir);
     }
 
