@@ -101,6 +101,7 @@ pub(crate) fn build_tree(query: &TreeQuery) -> Result<TreeReport, ComputerError>
             app: app.clone(),
             window: window.clone(),
             full,
+            diff: false,
             session: None,
         };
         tokio::time::timeout(ATSPI_CALL_BUDGET, walk_live(&inner, false, false)).await
@@ -145,6 +146,7 @@ pub(crate) fn element_action(request: &ElementRequest) -> Result<ElementOutcome,
         app: request.app.clone(),
         window: request.window.clone(),
         full: false,
+        diff: false,
         session: request.session.clone(),
     };
     let request = request.clone();
@@ -741,6 +743,7 @@ fn render_node<'a>(
                 },
                 identifier: None,
                 value,
+                enabled: true,
                 secure,
                 actions: Vec::new(),
                 frame: None,
@@ -837,6 +840,7 @@ mod tests {
             description: None,
             identifier: None,
             value: value.map(str::to_owned),
+            enabled: true,
             secure,
             actions: Vec::new(),
             frame: None,
@@ -887,6 +891,7 @@ mod tests {
             description: None,
             identifier: None,
             value: None,
+            enabled: true,
             secure: false,
             actions: Vec::new(),
             frame: None,

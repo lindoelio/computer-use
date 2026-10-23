@@ -117,11 +117,12 @@ clipboard           Read or write the clipboard
 zoom                Screenshot one region. With `--app` or `--window`, the region is window-local and its far edge may equal the window size
 scroll              Scroll the mouse wheel
 get-state           Report displays, cursor, frontmost window, and a best-effort accessibility tree [alias: get_state]
-wait                Sleep, then return `waited_ms`
+wait                Sleep, or wait for one condition (element, text, value, window, tree change, app, title)
+verify              Assert one condition with a short timeout. Failure is `verification_failed`
 displays            List connected displays without capturing pixels
 isolation           Report what this build can isolate and what it cannot
 list-apps           List running applications [alias: list_apps]
-list-windows        List on-screen windows in z-order. Index 0 is front [alias: list_windows]
+list-windows        List on-screen windows in z-order. Index 0 is front; system windows are hidden unless --all [alias: list_windows]
 launch              Launch an application by name, bundle id, path, or pid
 activate            Bring an application forward
 quit                Ask an application to quit
@@ -130,12 +131,14 @@ pause               Pause mutating actions until `resume`
 resume              Clear the pause flag
 doctor              Report permissions, the TCC identity, and how to fix what is missing
 tree                Print the key window's accessibility tree
-ocr                 Run OCR on the most recent capture for `--app` or `--window`
+ocr                 Run OCR on the most recent capture for `--app` or `--window`, or on an image file
+window              Move, resize, and inspect the front (or `--window`-selected) window
 menu                Walk a running app's menu bar. macOS only
 apple-event         Send an Apple event script via `osascript`. macOS only
 shortcuts           Run a Shortcuts workflow by name. macOS only
 dock                List or click Dock items. macOS only
 spaces              Group on-screen windows by the screen that contains each window's center
+audit               Audit log path and tail. Read-only
 session             Session cache and accessibility teardown
 serve               Read newline-delimited JSON actions from stdin and write one JSON response per line
 exec                Run one JSON action from an argument
@@ -397,13 +400,31 @@ When `get-state` has no explicit `--app` and the frontmost app is on the deny li
 
 ```
 usage: computer-use wait [OPTIONS]
-
-Options:
-      --ms <N>             Milliseconds to sleep.
-      --seconds <N>        Seconds to sleep. Fractions are allowed.
 ```
 
-`--ms` and `--seconds` are added when both are set. At least one is required.
+Without a condition, `--ms` and `--seconds` are added when both are set and at least one is required. With a condition, `wait` polls until the condition holds or `--timeout-ms` expires (default 10000, maximum 300000); `--poll-ms` defaults to 100 (minimum 25).
+
+Exactly one condition is accepted:
+
+| Condition | Flags |
+| --- | --- |
+| Element state | `--element N` with `--element-state exists` (default), `gone`, `visible`, `enabled` |
+| Text | `--text TEXT`, optionally `--within-element N` |
+| Element value | `--value TEXT --element N` |
+| Window | `--window-state exists\|gone` |
+| Tree change | `--tree-change` (against the session baseline) |
+| App running | `--app-running NAME` |
+| Window title | `--title TEXT` |
+
+`--ignore-case` relaxes text, value, title, and app comparisons. Timeout is `timeout`.
+
+### `verify`
+
+```
+usage: computer-use verify [OPTIONS]
+```
+
+`verify` takes the same condition flags as `wait` with a 2000 ms default timeout, and is meant as an assertion, not a sleep. Failure is the dedicated `verification_failed` code; the body carries `condition` and the last `observed` value. Example: `computer-use verify --app Notes --element 12 --element-state enabled`.
 
 ### `displays`
 
@@ -481,6 +502,24 @@ exempt = ["app.crynta.terax"]
 
 An exemption matches a bundle id, an executable name, or a `.app` bundle name, and covers the whole app.
 
+Three optional sections tune the security and audit behavior:
+
+```toml
+[security]
+secure_focus = "deny"        # or "warn": proceed when the focused element is a secure field
+unreadable_focus = "warn"    # or "deny": refuse when the focused element cannot be read
+
+[audit]
+enabled = true
+max_bytes = 10485760         # rotate at 10 MiB (minimum 1024); COMPUTER_USE_AUDIT_MAX_BYTES can raise it
+keep = 1                     # rotated backups kept, clamped to 1..=5
+
+[window]
+clamp = true                 # keep window moves and resizes inside a display (default true)
+```
+
+`secure_focus` decides text-inserting actions without `--element`: the CLI reads the focused element first and refuses a secure field (`deny`, the default) or proceeds with a warning (`warn`). `unreadable_focus` covers platforms or apps that cannot report focus.
+
 ### `pause`
 
 ```
@@ -525,10 +564,42 @@ A diff line starts with `+` for an added node, `-` for a removed one, and `~` fo
 usage: computer-use ocr [OPTIONS]
 
 Options:
-      --force    Re-run OCR even when the latest screenshot map is recent.
+      --force          Re-run OCR even when the latest screenshot map is recent.
+      --image <PATH>   Run OCR on this image file instead of a live capture.
 ```
 
 Source: `vision` on macOS (`VNRecognizeTextRequest`), `media_ocr` on Windows (`Windows.Media.Ocr.OcrEngine`). Linux returns `unsupported`.
+
+`ocr --image` reads the file, reports `source: "image"`, `width`, and `height`, and sets `screen` to the block center in image pixels (a 1:1 map). Secure-field redaction does not apply to an arbitrary file, because there is no accessibility tree to redact against.
+
+### `window`
+
+```
+usage: computer-use window [OPTIONS] <COMMAND>
+
+Commands:
+  move     Move the window to --x/--y, or center it on --to-display.
+  resize   Resize the window.
+  set      Set any combination of position and size.
+  state    Read or set minimized/full-screen state.
+  info     Report bounds, display, and status.
+```
+
+macOS reads and writes `AXPosition`/`AXSize` on the app's `AXWindows`, matched by title and frame. Windows and Linux return `unsupported` until their native layers land. The target comes from `--app` and `--window` like every other action.
+
+```bash
+computer-use window info --app Finder
+computer-use window move --app Finder --x 100 --y 100
+computer-use window move --app Finder --to-display 1
+computer-use window resize --app Finder --width 900 --height 600
+computer-use window set --app Finder --width 900          # position unchanged
+computer-use window state --app Finder --minimized
+computer-use window state --app Finder --restore
+computer-use window state --app Finder --fullscreen
+computer-use window state --app Finder                    # report only
+```
+
+Unless `[window] clamp = false`, a move or resize is clamped to the display that contains the requested center, so a window cannot be parked off-screen. `window move --to-display ID` centers the window on that display (ids come from `displays`).
 
 ### `menu`
 
@@ -586,6 +657,20 @@ usage: computer-use spaces [OPTIONS]
 ```
 
 Groups on-screen windows by the screen that contains each window's center. Mission Control moves are not attempted.
+
+`spaces move --to-space N` always returns `unsupported`: moving a window between managed spaces needs the private SkyLight window-to-space API, which this build does not call. `window move --to-display` is the supported alternative.
+
+### `audit`
+
+```
+usage: computer-use audit [OPTIONS] <COMMAND>
+
+Commands:
+  path   Print the audit log path.
+  tail   Print the newest audit entries, including the rotated backup.
+```
+
+`audit path` returns `{path}` (null when no state directory is available). `audit tail --lines N` (default 50, maximum 500) returns `{lines, count}`, reading `audit.jsonl.1` before `audit.jsonl` so a rotation does not hide the newest entries. Both are read-only and never logged.
 
 ### `session`
 
@@ -757,22 +842,30 @@ The protocol is `src/protocol.rs::Action`. The tag is `action`; the rename rule 
 | `scroll_to` | none | Aliases: `scroll-to`, `scroll_to_visible`, `scroll-to-visible`. |
 | `get_state` | none | Alias: `get-state`. |
 | `cursor_position` | none | Also reachable as the CLI command `cursor-position`. |
-| `wait` | `ms`, `seconds` | |
+| `wait` | `ms`, `seconds`, or one condition: `element`, `element_state`, `text`, `value`, `within_element`, `window_state`, `tree_change`, `app_running`, `title`; plus `ignore_case`, `timeout_ms`, `poll_ms` | Without a condition it is the sleep wait. `timeout_ms` default 10000 (max 300000), `poll_ms` default 100 (min 25). |
+| `verify` | same condition fields as `wait`; `timeout_ms` default 2000 | Failure is `verification_failed` and the body carries `condition` and the last `observed`. |
 | `displays` | none | |
 | `isolation` | none | |
-| `list_apps` | `all` | Alias: `list-apps`. |
-| `list_windows` | none | Alias: `list-windows`. |
+| `list_apps` | `all`, `match` | Alias: `list-apps`. `match` accepts a substring or a `*` glob over name, bundle id, and path; rows carry `kind` and `system`. |
+| `list_windows` | `all` | Alias: `list-windows`. System windows are hidden by default; the response adds `system_hidden` and a `note`, and rows carry `kind` and `system`. Index `0` and `--window N` always resolve app windows; use `id:` for a system row. |
 | `launch` | none (uses `--app`) | |
 | `activate` | none (uses `--app`/`--window`) | |
 | `quit` | `force` | |
 | `policy_check` | none (uses `--app`) | |
 | `pause` | none | |
 | `resume` | none | |
-| `doctor` | `prompt` (alias `request`), `open_settings`, `x11` | |
+| `doctor` | `prompt` (alias `request`), `open_settings`, `x11`, `full` | `full` validates notarization with `xcrun stapler validate` and reports `notarized`. |
 | `tree` | none | |
-| `ocr` | `force` | |
+| `ocr` | `force`, `image` | `image` reads a file; `screen` equals the image pixel and `source` is `"image"`. |
 | `session_end` | none | |
 | `session_prune` | `dry_run`, `ttl_secs` | |
+| `audit_path` | none | Alias: `audit-path`. `{path}` or null. |
+| `audit_tail` | `lines` | Alias: `audit-tail`. Default 50, maximum 500. Reads the rotated backup first. |
+| `window_move` | `x`, `y`, `to_display` | Alias: `window-move`. macOS only. `to_display` centers on that display. |
+| `window_resize` | `width`, `height` | Alias: `window-resize`. macOS only. |
+| `window_set` | `x`, `y`, `width`, `height` | Alias: `window-set`. At least one field. macOS only. |
+| `window_state` | `minimized`, `fullscreen` | Alias: `window-state`. No fields reports. macOS only. |
+| `window_info` | none | Alias: `window-info`. Bounds, display, and status. macOS only. |
 | `menu_list` | `app` (override), `depth` | Aliases: `menu-list`, `menu_list`. |
 | `menu_click` | `app` (override), `path` | Aliases: `menu-click`, `menu_click`. |
 | `apple_event` | `app` (override), `script`, `language` | Aliases: `apple_event`, `apple-event`. |
@@ -780,6 +873,7 @@ The protocol is `src/protocol.rs::Action`. The tag is `action`; the rename rule 
 | `dock_list` | none | Aliases: `dock-list`, `dock_list`. |
 | `dock_click` | `title` | Aliases: `dock-click`, `dock_click`. |
 | `spaces` | none | |
+| `spaces_move` | `to_space` | Alias: `spaces-move`. Always `unsupported`; the private SkyLight window-to-space API is not implemented. Use `window move --to-display`. |
 | `batch` | `actions` (array of native actions), `stop_on_error` | Nested batch is `invalid_arguments`. Also reachable as the CLI command `batch`. |
 | `browser_tabs` | none | `cdp` feature. Returns `{tabs, count}`. |
 | `browser_activate` | `target_id` | `cdp` feature. |
@@ -836,7 +930,8 @@ The protocol is `src/protocol.rs::Action`. The tag is `action`; the rename rule 
 | `paused` | Local user input tripped the kill switch. |
 | `cdp_unavailable` | Feature off, or Chrome has no debugging port. |
 | `display_unavailable` | The screen is locked, the display is asleep, or no display or shareable window is available. Checked before `window_not_found`; no xcap crop fallback. |
-| `timeout` | A browser wait, action, or dialog rescue exceeded its timeout. |
+| `timeout` | A `wait`, browser wait, action, or dialog rescue exceeded its timeout. |
+| `verification_failed` | `verify` did not observe its condition before its timeout. The body carries `condition` and the last `observed`. |
 
 ## File locations
 
@@ -845,7 +940,7 @@ The protocol is `src/protocol.rs::Action`. The tag is `action`; the rename rule 
 | Session cache | `${XDG_CACHE_HOME:-~/.cache}/computer-use/sessions/<session>/` | `%LOCALAPPDATA%\computer-use\cache\sessions\<session>\` |
 | User policy | `~/.config/computer-use/policy.toml` | `~/.config/computer-use/policy.toml` |
 | Admin policy | `/etc/computer-use/policy.toml` | `%ProgramData%\computer-use\policy.toml` |
-| Audit log | `${XDG_STATE_HOME:-~/.local/state}/computer-use/audit.jsonl` | `%LOCALAPPDATA%\computer-use\audit.jsonl` |
+| Audit log | `${XDG_STATE_HOME:-~/.local/state}/computer-use/audit.jsonl` (rotated backups `.1`..`.5`) | `%LOCALAPPDATA%\computer-use\audit.jsonl` |
 | Foreground lock | `<cache>/foreground.lock` | `<cache>\foreground.lock` |
 | Overlay socket | `<cache>/overlay.sock` | `<cache>\overlay.sock` |
 

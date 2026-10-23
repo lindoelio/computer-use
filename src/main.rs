@@ -166,6 +166,86 @@ struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
+enum AuditCommand {
+    /// Print the audit log path.
+    Path,
+    /// Print the newest audit entries, including the rotated backup.
+    Tail {
+        /// How many lines to return. Default 50, capped at 500.
+        #[arg(long, value_name = "N", default_value_t = 50)]
+        lines: usize,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SpacesCommand {
+    /// Move the selected window to another space. Always `unsupported` in
+    /// this build; the private SkyLight API is not called.
+    Move {
+        /// Managed space index, 1-based, as reported by `spaces`.
+        #[arg(long, value_name = "N")]
+        to_space: u32,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum WindowCommand {
+    /// Move the window to `--x`/`--y`, or center it on `--to-display`.
+    Move {
+        /// Left edge in screen points.
+        #[arg(long, value_name = "X")]
+        x: Option<i32>,
+        /// Top edge in screen points.
+        #[arg(long, value_name = "Y")]
+        y: Option<i32>,
+        /// Center the window on this display id.
+        #[arg(long, value_name = "ID", conflicts_with_all = ["x", "y"])]
+        to_display: Option<u32>,
+    },
+    /// Resize the window.
+    Resize {
+        /// New width in screen points.
+        #[arg(long, value_name = "W")]
+        width: u32,
+        /// New height in screen points.
+        #[arg(long, value_name = "H")]
+        height: u32,
+    },
+    /// Set any combination of position and size.
+    Set {
+        /// Left edge in screen points.
+        #[arg(long, value_name = "X")]
+        x: Option<i32>,
+        /// Top edge in screen points.
+        #[arg(long, value_name = "Y")]
+        y: Option<i32>,
+        /// New width in screen points.
+        #[arg(long, value_name = "W")]
+        width: Option<u32>,
+        /// New height in screen points.
+        #[arg(long, value_name = "H")]
+        height: Option<u32>,
+    },
+    /// Read or set minimized/full-screen state.
+    State {
+        /// Set `AXMinimized` true.
+        #[arg(long, conflicts_with = "restore")]
+        minimized: bool,
+        /// Set `AXMinimized` false.
+        #[arg(long)]
+        restore: bool,
+        /// Set `AXFullScreen` true.
+        #[arg(long, conflicts_with = "windowed")]
+        fullscreen: bool,
+        /// Set `AXFullScreen` false.
+        #[arg(long)]
+        windowed: bool,
+    },
+    /// Report bounds, display, and status. Read-only.
+    Info,
+}
+
+#[derive(Debug, Subcommand)]
 enum SessionCommand {
     /// Restore Electron accessibility flags this process changed and stop observers.
     End,
@@ -532,18 +612,100 @@ enum CliCommand {
     #[command(name = "get-state", visible_alias = "get_state")]
     GetState,
 
-    /// Sleep, then return `waited_ms`.
+    /// Sleep, or wait for one condition (element, text, value, window, tree
+    /// change, app, title).
     ///
-    /// Pass `--ms`, `--seconds`, or both. The durations are added.
+    /// Without a condition, pass `--ms`, `--seconds`, or both; the durations
+    /// are added. With a condition, `--timeout-ms` defaults to 10000 and
+    /// `--poll-ms` to 100.
     ///
     /// Example: computer-use wait --ms 250
+    /// Example: computer-use wait --app Notes --text "Saved" --timeout-ms 5000
     Wait {
-        /// Milliseconds to sleep.
+        /// Milliseconds to sleep. Without a condition this is the old wait.
         #[arg(long, value_name = "N")]
         ms: Option<u64>,
         /// Seconds to sleep. Fractions are allowed.
         #[arg(long, value_name = "N")]
         seconds: Option<f64>,
+        /// Wait until this element index is in `--state`.
+        #[arg(long, value_name = "N")]
+        element: Option<u32>,
+        /// Element state: exists (default), gone, visible, enabled.
+        #[arg(long = "element-state", value_name = "STATE")]
+        element_state: Option<String>,
+        /// Wait until the window tree contains this text.
+        #[arg(long, value_name = "TEXT")]
+        text: Option<String>,
+        /// Wait until the element value contains this text. Requires --element.
+        #[arg(long, value_name = "TEXT")]
+        value: Option<String>,
+        /// Restrict --text to this element's subtree.
+        #[arg(long, value_name = "N")]
+        within_element: Option<u32>,
+        /// Wait until the window selector is exists or gone.
+        #[arg(long, value_name = "STATE")]
+        window_state: Option<String>,
+        /// Wait until the tree differs from the session baseline.
+        #[arg(long)]
+        tree_change: bool,
+        /// Wait until an app is running.
+        #[arg(long, value_name = "NAME")]
+        app_running: Option<String>,
+        /// Wait until the window title contains this text.
+        #[arg(long, value_name = "TEXT")]
+        title: Option<String>,
+        /// Case-insensitive text, value, and title comparison.
+        #[arg(long)]
+        ignore_case: bool,
+        /// Total time budget in milliseconds. Default 10000.
+        #[arg(long, value_name = "MS")]
+        timeout_ms: Option<u64>,
+        /// Poll interval in milliseconds. Default 100, minimum 25.
+        #[arg(long, value_name = "MS")]
+        poll_ms: Option<u64>,
+    },
+
+    /// Assert one condition with a short timeout. Failure is `verification_failed`.
+    ///
+    /// Example: computer-use verify --app Notes --element 12 --element-state enabled
+    Verify {
+        /// Assert this element index is in `--state`.
+        #[arg(long, value_name = "N")]
+        element: Option<u32>,
+        /// Element state: exists (default), gone, visible, enabled.
+        #[arg(long = "element-state", value_name = "STATE")]
+        element_state: Option<String>,
+        /// Assert the window tree contains this text.
+        #[arg(long, value_name = "TEXT")]
+        text: Option<String>,
+        /// Assert the element value contains this text. Requires --element.
+        #[arg(long, value_name = "TEXT")]
+        value: Option<String>,
+        /// Restrict --text to this element's subtree.
+        #[arg(long, value_name = "N")]
+        within_element: Option<u32>,
+        /// Assert the window selector is exists or gone.
+        #[arg(long, value_name = "STATE")]
+        window_state: Option<String>,
+        /// Assert the tree differs from the session baseline.
+        #[arg(long)]
+        tree_change: bool,
+        /// Assert an app is running.
+        #[arg(long, value_name = "NAME")]
+        app_running: Option<String>,
+        /// Assert the window title contains this text.
+        #[arg(long, value_name = "TEXT")]
+        title: Option<String>,
+        /// Case-insensitive comparison.
+        #[arg(long)]
+        ignore_case: bool,
+        /// Timeout in milliseconds. Default 2000.
+        #[arg(long, value_name = "MS")]
+        timeout_ms: Option<u64>,
+        /// Poll interval in milliseconds. Default 100.
+        #[arg(long, value_name = "MS")]
+        poll_ms: Option<u64>,
     },
 
     /// List connected displays without capturing pixels.
@@ -568,6 +730,9 @@ enum CliCommand {
         /// Include accessory and prohibited apps.
         #[arg(long)]
         all: bool,
+        /// Filter by name, bundle id, or path. `*` globs are accepted.
+        #[arg(long = "match", value_name = "PATTERN")]
+        r#match: Option<String>,
     },
 
     /// List on-screen windows in z-order. Index 0 is front.
@@ -577,7 +742,11 @@ enum CliCommand {
     ///
     /// Example: computer-use list-windows --app Finder
     #[command(name = "list-windows", visible_alias = "list_windows")]
-    ListWindows,
+    ListWindows {
+        /// Include system windows (menubar, Dock, notifications).
+        #[arg(long)]
+        all: bool,
+    },
 
     /// Launch an application by name, bundle id, path, or pid.
     ///
@@ -652,6 +821,9 @@ enum CliCommand {
         #[cfg_attr(not(target_os = "linux"), arg(long, hide = true))]
         #[arg(long)]
         x11: bool,
+        /// Also validate notarization of the containing app bundle (macOS).
+        #[arg(long)]
+        full: bool,
     },
 
     /// Print the key window's accessibility tree.
@@ -674,6 +846,21 @@ enum CliCommand {
         /// Re-run OCR even when the latest screenshot map is recent.
         #[arg(long)]
         force: bool,
+        /// Run OCR on this image file instead of a live capture. `screen`
+        /// equals the image pixel. No secure-field redaction applies.
+        #[arg(long, value_name = "PATH")]
+        image: Option<String>,
+    },
+
+    /// Move, resize, and inspect the front (or `--window`-selected) window.
+    ///
+    /// macOS reads and writes `AXPosition`/`AXSize`. Windows and Linux return
+    /// `unsupported` until their native layers land.
+    ///
+    /// Example: computer-use window info --app Finder
+    Window {
+        #[command(subcommand)]
+        command: WindowCommand,
     },
 
     /// Walk a running app's menu bar. macOS only.
@@ -741,7 +928,16 @@ enum CliCommand {
     /// best-effort space moves; otherwise the report is read-only.
     ///
     /// Example: computer-use spaces
-    Spaces,
+    Spaces {
+        #[command(subcommand)]
+        command: Option<SpacesCommand>,
+    },
+
+    /// Audit log path and tail. Read-only.
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommand,
+    },
 
     /// Session cache and accessibility teardown.
     Session {
@@ -1650,14 +1846,71 @@ fn command_action(
             amount: *amount,
         },
         CliCommand::GetState => Action::GetState,
-        CliCommand::Wait { ms, seconds } => Action::Wait {
+        CliCommand::Wait {
+            ms,
+            seconds,
+            element,
+            element_state,
+            text,
+            value,
+            within_element,
+            window_state,
+            tree_change,
+            app_running,
+            title,
+            ignore_case,
+            timeout_ms,
+            poll_ms,
+        } => Action::Wait {
             ms: *ms,
             seconds: *seconds,
+            element: *element,
+            element_state: element_state.clone(),
+            text: text.clone(),
+            value: value.clone(),
+            within_element: *within_element,
+            window_state: window_state.clone(),
+            tree_change: *tree_change,
+            app_running: app_running.clone(),
+            title: title.clone(),
+            ignore_case: *ignore_case,
+            timeout_ms: *timeout_ms,
+            poll_ms: *poll_ms,
+        },
+        CliCommand::Verify {
+            element,
+            element_state,
+            text,
+            value,
+            within_element,
+            window_state,
+            tree_change,
+            app_running,
+            title,
+            ignore_case,
+            timeout_ms,
+            poll_ms,
+        } => Action::Verify {
+            element: *element,
+            element_state: element_state.clone(),
+            text: text.clone(),
+            value: value.clone(),
+            within_element: *within_element,
+            window_state: window_state.clone(),
+            tree_change: *tree_change,
+            app_running: app_running.clone(),
+            title: title.clone(),
+            ignore_case: *ignore_case,
+            timeout_ms: *timeout_ms,
+            poll_ms: *poll_ms,
         },
         CliCommand::Displays => Action::Displays,
         CliCommand::Isolation => Action::Isolation,
-        CliCommand::ListApps { all } => Action::ListApps { all: *all },
-        CliCommand::ListWindows => Action::ListWindows,
+        CliCommand::ListApps { all, r#match } => Action::ListApps {
+            all: *all,
+            r#match: r#match.clone(),
+        },
+        CliCommand::ListWindows { all } => Action::ListWindows { all: *all },
         CliCommand::Launch { app } => {
             match (app, context.app.as_deref()) {
                 (Some(positional), Some(flag)) if positional != flag => {
@@ -1724,14 +1977,63 @@ fn command_action(
             prompt,
             open_settings,
             x11,
+            full,
         } => Action::Doctor {
             prompt: *prompt,
             open_settings: *open_settings,
             x11: *x11,
+            full: *full,
         },
         CliCommand::Tree => Action::Tree,
         CliCommand::CursorPosition => Action::CursorPosition,
-        CliCommand::Ocr { force } => Action::Ocr { force: *force },
+        CliCommand::Ocr { force, image } => Action::Ocr {
+            force: *force,
+            image: image.clone(),
+        },
+        CliCommand::Window { command } => match command {
+            WindowCommand::Move { x, y, to_display } => Action::WindowMove {
+                x: *x,
+                y: *y,
+                to_display: *to_display,
+            },
+            WindowCommand::Resize { width, height } => Action::WindowResize {
+                width: *width,
+                height: *height,
+            },
+            WindowCommand::Set {
+                x,
+                y,
+                width,
+                height,
+            } => Action::WindowSet {
+                x: *x,
+                y: *y,
+                width: *width,
+                height: *height,
+            },
+            WindowCommand::State {
+                minimized,
+                restore,
+                fullscreen,
+                windowed,
+            } => Action::WindowState {
+                minimized: if *minimized {
+                    Some(true)
+                } else if *restore {
+                    Some(false)
+                } else {
+                    None
+                },
+                fullscreen: if *fullscreen {
+                    Some(true)
+                } else if *windowed {
+                    Some(false)
+                } else {
+                    None
+                },
+            },
+            WindowCommand::Info => Action::WindowInfo,
+        },
         CliCommand::Menu { command } => match command {
             MenuCommand::List { app, depth } => {
                 if let Some(positional) = app {
@@ -1777,8 +2079,19 @@ fn command_action(
                 title: title.to_string(),
             },
         },
-        CliCommand::Spaces => Action::Spaces {},
+        CliCommand::Spaces { command } => match command {
+            None => Action::Spaces {},
+            Some(SpacesCommand::Move { to_space }) => Action::SpacesMove {
+                to_space: *to_space,
+            },
+        },
         CliCommand::Browser(command) => browser_action(command, &mut context)?,
+        CliCommand::Audit { command } => match command {
+            AuditCommand::Path => Action::AuditPath {},
+            AuditCommand::Tail { lines } => Action::AuditTail {
+                lines: Some(*lines),
+            },
+        },
         CliCommand::Session { command } => match command {
             SessionCommand::End => Action::SessionEnd,
             SessionCommand::Prune { dry_run, ttl } => Action::SessionPrune {

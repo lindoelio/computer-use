@@ -393,6 +393,7 @@ pub(crate) fn element_action(
         app: request.app.clone(),
         window: request.window.clone(),
         full: false,
+        diff: false,
         session: request.session.clone(),
     };
     let live = build_tree(&query).map_err(ElementError::new)?;
@@ -749,6 +750,65 @@ pub(crate) fn pid_only_query(pid: i32) -> TreeQuery {
     }
 }
 
+/// Focused UIA element for the secure-field guard.
+pub(crate) fn focused_peek() -> Result<Option<crate::element::ElementPeek>, ComputerError> {
+    let automation = match UIAutomation::new() {
+        Ok(automation) => automation,
+        Err(_) => return Ok(None),
+    };
+    let element = match automation.get_focused_element() {
+        Ok(element) => element,
+        Err(_) => return Ok(None),
+    };
+    let secure = element.is_password().unwrap_or(false);
+    let title = element.get_name().ok().filter(|text| !text.is_empty());
+    Ok(Some(crate::element::ElementPeek { title, secure }))
+}
+
+/// Live view of one element, for `wait` and `verify`.
+pub(crate) fn view_element(
+    query: &TreeQuery,
+    index: u32,
+) -> Result<Option<crate::element::ElementView>, ComputerError> {
+    let tree = build_tree(query)?;
+    let Some(node) = tree::find_ui(&tree.root, index) else {
+        return Ok(None);
+    };
+    let secure = tree::node_is_secure(node);
+    let mut parts: Vec<String> = Vec::new();
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        for text in [
+            current.value.as_deref(),
+            current.title.as_deref(),
+            current.description.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !text.is_empty() {
+                parts.push(text.to_string());
+            }
+        }
+        for child in &current.children {
+            stack.push(child);
+        }
+    }
+    Ok(Some(crate::element::ElementView {
+        role: node.role.clone(),
+        title: node
+            .title
+            .clone()
+            .or_else(|| node.description.clone())
+            .or_else(|| node.identifier.clone()),
+        value: if secure { None } else { node.value.clone() },
+        secure,
+        enabled: node.enabled,
+        frame: node.frame.map(crate::tree::SavedFrame::from),
+        subtree_text: parts.join(" "),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -969,6 +1029,7 @@ mod tests {
             app: req.app.clone(),
             window: req.window.clone(),
             full: false,
+            diff: false,
             session: req.session.clone(),
         };
         assert_eq!(q.app.as_deref(), Some("pid:42"));

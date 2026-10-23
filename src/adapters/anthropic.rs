@@ -48,10 +48,7 @@ pub fn translate(value: &Value) -> Result<Action, ComputerError> {
                     ))
                 }
             };
-            Ok(Action::Wait {
-                ms: None,
-                seconds: Some(seconds),
-            })
+            Ok(Action::wait_sleep(None, Some(seconds)))
         }
         "zoom" => zoom(object),
         "cursor_position" => Ok(Action::CursorPosition),

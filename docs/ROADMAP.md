@@ -1396,3 +1396,28 @@ Update this table at the end of a phase. `commit` is the full hash on `main` of 
 Each phase is one commit unless the note below says otherwise. Do not start P3 before P2 is on `main`. P4 can follow P2 in parallel with P3 only if the screenshot command does not need element indices. P5 depends on P2 and P4. P6 should land before P7 so the event marker and the tap share one constant. P12 and P13 depend on P2's `tree.rs` and P6's policy, and they can proceed in parallel with each other. P10 and P11 depend on P4's map. P14 and P15 are last.
 
 P2 is the largest phase. Split it only if review requires it: first the pure `tree.rs` and cache, then `ax.rs`. Both halves stay inside P2 in this table. The second half's commit message still says `P2`.
+
+## P16 — Hardening pass (P1/P2 items, 0.4.0)
+
+A focused reliability pass after the CDP work. It did not add a new phase number upstream; the items keep their original P1/P2 labels.
+
+| Item | Status | Notes |
+| --- | --- | --- |
+| P1.1 Signing, notarization, release guard | DONE | The packaging script already Developer-ID signs and notarizes when the secrets exist. The release workflow now refuses a tag that built only the ad-hoc bundle unless the repository variable `ALLOW_UNSIGNED_RELEASE=1` is set, and such a release is marked pre-release. The skill's `setup.sh` prefers the signed `computer-use-macos-arm64-app.zip` and falls back to the unsigned one. `doctor --full` runs `xcrun stapler validate` and reports `notarized`. |
+| P1.2 Conditional `wait` | DONE | `wait` polls element state, text, value, window state, tree change, app running, and title, with timeout/poll bounds. The sleep form is unchanged. |
+| P1.3 Secure focused-field guard | DONE (macOS, Windows) | Text-inserting actions without `--element` read the focused element; a secure field is `policy_denied` (`[security] secure_focus = "deny"`, default) or a warning (`warn`). `unreadable_focus` covers platforms that cannot report focus; Linux warns and proceeds. |
+| P1.4 Sensitive menu-item confirm | DONE | Menu paths containing delete, erase, trash, discard, uninstall, send, submit, pay, or purchase are confirm-gated; the confirm document carries `extra.path`. |
+| P1.5 Audit rotation and reader | DONE | `[audit] max_bytes` (default 10 MiB, env can raise), `[audit] keep` (1..=5, default 1), `audit path`, and `audit tail`. Rotation is best-effort and never fails the action. |
+| P1.6 ScreenCaptureKit full-screen capture | DONE | Display capture through `SCScreenshotManager`/`SCStream` with the desktop image as a non-terminal fallback. Not live-verified on this Mac: the bare binary has no Screen Recording TCC, so the path falls back with a warning; the same code shape is proven by window capture. |
+| P1.7 `ocr --image` | DONE | Reads a file, reports `source: "image"`, `width`, `height`, and `screen` as the block center in image pixels. `tests/ocr_live.rs` runs it against a committed PNG. Secure redaction correctly does not apply. |
+| P2.1 Sensitive key combinations | DONE | `cmd+q`, `cmd+shift+q`, `ctrl+cmd+q`, `cmd+alt+esc`, `cmd+shift+delete` on macOS; `alt+F4` and the lock key on Windows/X11. The confirm document carries `extra.combo`. |
+| P2.2 `list-windows` system filtering | DONE | System rows (layer >= 20 or known system apps) are hidden by default; `--all` includes them, rows carry `kind`/`system`, and the response reports `system_hidden`. Index `0` and `--window N` always resolve app windows. |
+| P2.3 `list-apps --match`, kinds | DONE | Substring or `*` glob over name, bundle id, and path; rows carry `kind`/`system`; `hidden_count` explains the default filter. |
+| P2.4 `doctor` launcher/effective, `--full` | DONE | `identity.responsible` and `fix.target` already name the launcher that owns the grant; `--full` adds the notarization check. |
+| P2.5 `tree` diff mode | DONE | Responses carry `mode` (`full` or `diff`) and `diff_requested`. |
+| P2.6 `verify` | DONE | Shared engine with `wait`; own `verification_failed` code carrying the last `observed` value. |
+| P2.7 Window control | DONE (macOS) | `window move` / `resize` / `set` / `state` / `info` over `AXPosition`/`AXSize`, with `[window] clamp`. Windows and Linux return `unsupported`. |
+| P2.8 `window move --to-display`, `spaces move` | PARTIAL | `window move --to-display` centers on a display. `spaces move --to-space` always returns `unsupported`: the private SkyLight window-to-space API is deliberately not called, because it could destabilize the session and cannot be verified without moving real windows. |
+| P2.9 Overlay parity (Windows/X11) | TODO | The macOS click-through overlay exists. Windows and X11 need native transparent windows; shipping unverified native UI was judged worse than an explicit gap. `overlay serve` remains `unsupported` there. |
+
+Verification for this pass: `cargo test --all-targets` (default and `--features cdp`), `cargo clippy --all-targets --all-features -D warnings`, new live `tests/ocr_live.rs`, unit tests for wait/verify, audit rotation, secure focus, sensitive menus, list-windows/apps, window control, and doctor `--full`, plus the skill lint and setup tests in `smart-computer-use`.

@@ -48,6 +48,8 @@ pub struct DoctorOptions {
     /// unconditionally.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub x11: bool,
+    /// Also validate notarization of the containing app bundle. macOS only.
+    pub full: bool,
 }
 
 /// Values the platform measured. Assembly does not measure them again.
@@ -85,6 +87,10 @@ pub struct DoctorInput {
     pub uiaccess: Option<bool>,
     /// Windows integrity label.
     pub integrity: Option<String>,
+    /// `--full` notarization result. `None` when not checked or not applicable.
+    pub notarized: Option<bool>,
+    /// Bundle that was validated, when `--full` checked one.
+    pub notarized_bundle: Option<String>,
     /// Notes already collected by the platform.
     pub notes: Vec<String>,
     /// Permission ids that must be `Some(true)`.
@@ -191,6 +197,8 @@ pub fn assemble(input: DoctorInput) -> DoctorReport {
         bundle_id: input.bundle_id.clone(),
         identity,
         responsible_app: input.responsible.clone(),
+        notarized: input.notarized,
+        notarized_bundle: input.notarized_bundle.clone(),
         fix,
         fixes,
         session: input.session.clone(),
@@ -558,6 +566,12 @@ fn render_text(report: &DoctorReport) -> String {
     ));
     if let Some(team) = &report.identity.team_id {
         lines.push(format!("team_id: {team}"));
+    }
+    if let Some(notarized) = report.notarized {
+        lines.push(format!(
+            "notarized: {}",
+            if notarized { "yes" } else { "no" }
+        ));
     }
     if let Some(app) = &report.identity.responsible {
         let bundle = app.bundle_id.as_deref().unwrap_or("null");

@@ -35,3 +35,7 @@ Checked with a read-only `dlsym` on macOS 27.0.1 (build 26A434). The symbols wer
 | `SLSMainConnectionID` | present (`0x18d61fca0`) |
 
 The first symbol that resolves is `SLPSSetFrontProcessWithOptions`.
+
+## `spaces move`
+
+`spaces move --to-space N` always returns `unsupported`. Moving a window between managed spaces needs the private SkyLight window-to-space API, which this build deliberately does not call: an unverified private call can destabilize the session, and it cannot be exercised without moving real windows. `window move --to-display` is the supported alternative for positioning a window on another display.

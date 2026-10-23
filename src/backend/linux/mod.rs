@@ -106,6 +106,7 @@ pub(crate) fn inspect_accessibility(app_name: Option<&str>) -> Result<String, Co
         app: app_name.map(str::to_owned),
         window: None,
         full: true,
+        diff: false,
         session: None,
     };
     let report = atspi::build_tree(&query)?;
@@ -546,6 +547,15 @@ fn keycode_for_canonical(name: &str) -> Result<u8, ComputerError> {
         }
     };
     Ok(code)
+}
+
+/// AT-SPI focus detection is not wired yet; the secure-field guard warns and
+/// proceeds with a note.
+pub(crate) fn focused_peek(
+    _app: Option<&str>,
+    _window: Option<&str>,
+) -> Result<Option<crate::element::ElementPeek>, ComputerError> {
+    Ok(None)
 }
 
 #[cfg(test)]

@@ -25,3 +25,23 @@ version = 1
 
 # [browser]
 # blocked_urls = ["https://accounts.example.com/*", "file://*"]
+
+# Focused-element guard for text-inserting actions without --element.
+# secure_focus: "deny" refuses a secure focused field, "warn" proceeds with a warning.
+# unreadable_focus: "warn" proceeds with a warning when focus cannot be read, "deny" refuses.
+# [security]
+# secure_focus = "deny"
+# unreadable_focus = "warn"
+
+# Audit rotation. max_bytes rotates audit.jsonl into numbered backups at that
+# size (minimum 1024; COMPUTER_USE_AUDIT_MAX_BYTES can raise it). keep is the
+# number of backups, clamped to 1..=5.
+# [audit]
+# enabled = true
+# max_bytes = 10485760
+# keep = 1
+
+# Window moves and resizes are clamped to the display that contains the
+# requested center unless clamp is false.
+# [window]
+# clamp = true

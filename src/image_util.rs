@@ -352,6 +352,29 @@ pub fn prepare_shot(image: &RgbaImage, fit: ShotFit) -> Result<PreparedShot, Com
     })
 }
 
+impl ScreenshotMap {
+    /// A 1:1 map for an image whose own pixels are the coordinate space, such
+    /// as `ocr --image`. `screen` in the response equals the image pixel.
+    pub fn identity(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            scale: 1.0,
+            logical_width: width,
+            logical_height: height,
+            origin: MapPoint { x: 0, y: 0 },
+            fit: "none".into(),
+            pad: MapPoint { x: 0, y: 0 },
+            content_width: width,
+            content_height: height,
+            map: MapFormulas {
+                image_to_screen: IMAGE_TO_SCREEN.to_string(),
+                screen_to_image: SCREEN_TO_IMAGE.to_string(),
+            },
+        }
+    }
+}
+
 /// Image pixel to screen point.
 pub fn image_to_screen(map: &ScreenshotMap, image_x: f64, image_y: f64) -> (f64, f64) {
     let content_w = f64::from(map.content_width.max(1));

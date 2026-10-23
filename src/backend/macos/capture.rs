@@ -32,10 +32,10 @@ use objc2_core_graphics::{
     CGSessionCopyCurrentDictionary,
 };
 use objc2_core_media::CMSampleBuffer;
-use objc2_foundation::{NSError, NSObject, NSObjectProtocol, NSProcessInfo};
+use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol, NSProcessInfo};
 use objc2_screen_capture_kit::{
-    SCContentFilter, SCScreenshotManager, SCShareableContent, SCStream, SCStreamConfiguration,
-    SCStreamOutput, SCStreamOutputType, SCWindow,
+    SCContentFilter, SCDisplay, SCScreenshotManager, SCShareableContent, SCStream,
+    SCStreamConfiguration, SCStreamOutput, SCStreamOutputType, SCWindow,
 };
 
 use super::ax;
@@ -45,12 +45,209 @@ use crate::image_util::{
     self, classify_sck_error, error_for_missing_window, CaptureFault, DisplayFacts, Layer,
 };
 use crate::tree::NodeFrame;
-use crate::types::{Frame, RawCapture};
+use crate::types::{Frame, RawCapture, Region};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 const SCREEN_RECORDING: &str = "Screen Recording is off. System Settings → Privacy & Security → Screen Recording → enable the app named by computer-use doctor";
 /// `kCVPixelFormatType_32BGRA`.
 const PIXEL_BGRA: u32 = 0x4247_5241;
+
+/// Full-screen or region capture through ScreenCaptureKit, with the xcap
+/// desktop image as a non-terminal fallback.
+pub(crate) fn capture_screen(region: Option<Region>) -> Result<RawCapture, ComputerError> {
+    if let Some(error) = session_display_block() {
+        return Err(error);
+    }
+    match capture_screen_sck(region) {
+        Ok(raw) => Ok(raw),
+        // Permission and missing-display errors fall back to the desktop
+        // image: TCC may attribute the grant to a launcher (the terminal),
+        // where ScreenCaptureKit in this process still refuses.
+        Err(error)
+            if is_terminal(&error) && !matches!(error, ComputerError::PermissionRequired(_)) =>
+        {
+            Err(error)
+        }
+        Err(error) => {
+            let mut raw = crate::backend::capture::capture_screen(region)?;
+            raw.warnings.push(format!(
+                "ScreenCaptureKit display capture fell back to the desktop image: {error}"
+            ));
+            Ok(raw)
+        }
+    }
+}
+
+fn capture_screen_sck(region: Option<Region>) -> Result<RawCapture, ComputerError> {
+    let content = shareable(false)?;
+    // SAFETY: content is a live SCShareableContent. displays() returns +1.
+    let displays = unsafe { content.displays() };
+    if displays.count() == 0 {
+        return Err(ComputerError::ExecutionFailed(
+            "ScreenCaptureKit reported no displays".into(),
+        ));
+    }
+    let mut entries: Vec<(Retained<SCDisplay>, CGRect)> = Vec::new();
+    for index in 0..displays.count() {
+        let display = displays.objectAtIndex(index);
+        // SAFETY: display is a live SCDisplay for this call.
+        let frame = unsafe { display.frame() };
+        entries.push((display, frame));
+    }
+
+    if let Some(region) = region {
+        let center_x = f64::from(region.x) + f64::from(region.width) / 2.0;
+        let center_y = f64::from(region.y) + f64::from(region.height) / 2.0;
+        let (display, frame) = entries
+            .iter()
+            .find(|(_, frame)| {
+                center_x >= frame.origin.x
+                    && center_x < frame.origin.x + frame.size.width
+                    && center_y >= frame.origin.y
+                    && center_y < frame.origin.y + frame.size.height
+            })
+            .unwrap_or(&entries[0]);
+        let scale = positive_scale(backing_scale(
+            round_i32(frame.origin.x),
+            round_i32(frame.origin.y),
+        ));
+        let image = capture_display_layer(display, frame, scale)?;
+        let cropped = crop_display_to_region(&image, frame, region, scale)?;
+        return Ok(RawCapture {
+            frame: Frame::from_image(cropped, scale),
+            origin_x: region.x,
+            origin_y: region.y,
+            logical_width: region.width,
+            logical_height: region.height,
+            capture_source: "sck".into(),
+            occluded: false,
+            warnings: Vec::new(),
+        });
+    }
+
+    let scales: Vec<f64> = entries
+        .iter()
+        .map(|(_, frame)| {
+            positive_scale(backing_scale(
+                round_i32(frame.origin.x),
+                round_i32(frame.origin.y),
+            ))
+        })
+        .collect();
+    if scales
+        .windows(2)
+        .any(|pair| (pair[0] - pair[1]).abs() > 0.001)
+    {
+        return Err(ComputerError::ExecutionFailed(
+            "displays use different backing scales; the desktop image handles this".into(),
+        ));
+    }
+    let scale = scales[0];
+    let mut layers = Vec::new();
+    let mut warnings = Vec::new();
+    for (display, frame) in &entries {
+        match capture_display_layer(display, frame, scale) {
+            Ok(image) => layers.push(Layer {
+                image,
+                origin_x: round_i32(frame.origin.x),
+                origin_y: round_i32(frame.origin.y),
+                logical_width: positive_points(frame.size.width),
+                logical_height: positive_points(frame.size.height),
+            }),
+            Err(error) if is_terminal(&error) => return Err(error),
+            Err(error) => warnings.push(format!("display capture failed: {error}")),
+        }
+    }
+    if layers.is_empty() {
+        return Err(ComputerError::ExecutionFailed(
+            "ScreenCaptureKit captured no displays".into(),
+        ));
+    }
+    let (image, origin_x, origin_y, logical_width, logical_height) = if layers.len() == 1 {
+        let layer = layers.pop().expect("single display layer");
+        (
+            layer.image,
+            layer.origin_x,
+            layer.origin_y,
+            layer.logical_width,
+            layer.logical_height,
+        )
+    } else {
+        let composite = image_util::composite_layers(&layers, scale)?;
+        (
+            composite.image,
+            composite.origin_x,
+            composite.origin_y,
+            composite.logical_width,
+            composite.logical_height,
+        )
+    };
+    Ok(RawCapture {
+        frame: Frame::from_image(image, scale),
+        origin_x,
+        origin_y,
+        logical_width,
+        logical_height,
+        capture_source: "sck".into(),
+        occluded: false,
+        warnings,
+    })
+}
+
+fn capture_display_layer(
+    display: &SCDisplay,
+    frame: &CGRect,
+    scale: f64,
+) -> Result<image::RgbaImage, ComputerError> {
+    let width = positive_points(frame.size.width);
+    let height = positive_points(frame.size.height);
+    let config = stream_config(px_len(width, scale), px_len(height, scale));
+    let empty = NSArray::<SCWindow>::from_slice(&[]);
+    // SAFETY: alloc/init returns +1. display and empty are live for this call.
+    let filter = unsafe {
+        SCContentFilter::initWithDisplay_excludingWindows(SCContentFilter::alloc(), display, &empty)
+    };
+    if macos_14_or_newer() {
+        match capture_manager_filter(&filter, &config) {
+            Ok(image) => Ok(image),
+            Err(error) if is_terminal(&error) => Err(error),
+            Err(manager_error) => match capture_stream_filter(&filter, &config) {
+                Ok(image) => Ok(image),
+                Err(error) if is_terminal(&error) => Err(error),
+                Err(stream_error) => Err(ComputerError::ExecutionFailed(format!(
+                    "screenshot manager: {manager_error}; stream: {stream_error}"
+                ))),
+            },
+        }
+    } else {
+        capture_stream_filter(&filter, &config)
+    }
+}
+
+fn crop_display_to_region(
+    image: &image::RgbaImage,
+    frame: &CGRect,
+    region: Region,
+    scale: f64,
+) -> Result<image::RgbaImage, ComputerError> {
+    let offset_x = (f64::from(region.x) - frame.origin.x) * scale;
+    let offset_y = (f64::from(region.y) - frame.origin.y) * scale;
+    let width = (f64::from(region.width) * scale).round().max(1.0);
+    let height = (f64::from(region.height) * scale).round().max(1.0);
+    let x = offset_x.round().max(0.0).min(f64::from(image.width()));
+    let y = offset_y.round().max(0.0).min(f64::from(image.height()));
+    let width = width.min(f64::from(image.width()) - x).max(1.0);
+    let height = height.min(f64::from(image.height()) - y).max(1.0);
+    if width < 1.0 || height < 1.0 {
+        return Err(ComputerError::InvalidArguments(
+            "the region falls outside every display".into(),
+        ));
+    }
+    Ok(
+        image::imageops::crop_imm(image, x as u32, y as u32, width as u32, height as u32)
+            .to_image(),
+    )
+}
 
 /// Capture `target` without activating it.
 pub(crate) fn capture_window(target: &WindowTarget) -> Result<RawCapture, ComputerError> {
@@ -335,6 +532,13 @@ fn capture_manager(
     let filter = unsafe {
         SCContentFilter::initWithDesktopIndependentWindow(SCContentFilter::alloc(), window)
     };
+    capture_manager_filter(&filter, config)
+}
+
+fn capture_manager_filter(
+    filter: &SCContentFilter,
+    config: &SCStreamConfiguration,
+) -> Result<image::RgbaImage, ComputerError> {
     let (sender, receiver) = mpsc::channel();
     let block = RcBlock::new(move |image: *mut CGImage, error: *mut NSError| {
         let result = if !error.is_null() {
@@ -348,7 +552,7 @@ fn capture_manager(
     // SAFETY: `block` stays alive until the handler runs. A timeout forgets it.
     unsafe {
         SCScreenshotManager::captureImageWithFilter_configuration_completionHandler(
-            &filter,
+            filter,
             config,
             Some(&block),
         );
@@ -470,11 +674,18 @@ fn capture_stream(
     let filter = unsafe {
         SCContentFilter::initWithDesktopIndependentWindow(SCContentFilter::alloc(), window)
     };
+    capture_stream_filter(&filter, config)
+}
+
+fn capture_stream_filter(
+    filter: &SCContentFilter,
+    config: &SCStreamConfiguration,
+) -> Result<image::RgbaImage, ComputerError> {
     let (sender, receiver) = mpsc::channel();
     let sink = FrameSink::new(sender);
     // SAFETY: filter, config, and a nil delegate are valid for init. Returns +1.
     let stream = unsafe {
-        SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, config, None)
+        SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), filter, config, None)
     };
     let output = ProtocolObject::from_ref(&*sink);
     let queue = DispatchQueue::new("computer-use.sck", DispatchQueueAttr::SERIAL);

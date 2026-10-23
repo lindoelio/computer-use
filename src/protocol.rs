@@ -5,7 +5,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::de::{self, Deserializer};
 use serde::ser::{Serialize, Serializer};
@@ -35,6 +35,7 @@ use crate::types::{
     ScrollDirection,
 };
 use crate::vision::{OcrBlock, OcrResult};
+use crate::wait;
 
 const MAX_WAIT_MS: u128 = 24 * 60 * 60 * 1000;
 
@@ -291,6 +292,82 @@ pub enum Action {
         /// Seconds, including fractions. Added to `ms`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         seconds: Option<f64>,
+        /// Wait until the element index is in the given state.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        element: Option<u32>,
+        /// Element state: exists, gone, visible, enabled. Default exists.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        element_state: Option<String>,
+        /// Wait until the window tree contains this text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        /// Wait until the element value contains this text. Requires `element`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<String>,
+        /// Restrict `text` to this element's subtree.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        within_element: Option<u32>,
+        /// Wait until the window selector is exists or gone.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window_state: Option<String>,
+        /// Wait until the tree differs from the session baseline.
+        #[serde(default, skip_serializing_if = "is_false")]
+        tree_change: bool,
+        /// Wait until an app is running.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        app_running: Option<String>,
+        /// Wait until the window title contains this text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        /// Case-insensitive text/value/title comparison.
+        #[serde(default, skip_serializing_if = "is_false")]
+        ignore_case: bool,
+        /// Total time budget. Default 10000.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+        /// Poll interval. Default 100, minimum 25.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        poll_ms: Option<u64>,
+    },
+    /// Assert one condition with a short timeout. Failure is `verification_failed`.
+    #[serde(rename = "verify")]
+    Verify {
+        /// Element index to assert.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        element: Option<u32>,
+        /// Element state: exists, gone, visible, enabled. Default exists.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        element_state: Option<String>,
+        /// Assert the window tree contains this text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        /// Assert the element value contains this text. Requires `element`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<String>,
+        /// Restrict `text` to this element's subtree.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        within_element: Option<u32>,
+        /// Assert the window selector is exists or gone.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window_state: Option<String>,
+        /// Assert the tree changed against the session baseline.
+        #[serde(default, skip_serializing_if = "is_false")]
+        tree_change: bool,
+        /// Assert an app is running.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        app_running: Option<String>,
+        /// Assert the window title contains this text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        /// Case-insensitive comparison.
+        #[serde(default, skip_serializing_if = "is_false")]
+        ignore_case: bool,
+        /// Timeout. Default 2000.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+        /// Poll interval. Default 100.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        poll_ms: Option<u64>,
     },
     /// List displays without capturing pixels.
     Displays,
@@ -301,9 +378,16 @@ pub enum Action {
         /// Include accessory and prohibited activation policies.
         #[serde(default, rename = "all")]
         all: bool,
+        /// Filter by name, bundle id, or path. `*` globs are accepted.
+        #[serde(default, rename = "match", skip_serializing_if = "Option::is_none")]
+        r#match: Option<String>,
     },
     /// List on-screen windows. `app` comes from the shared request context.
-    ListWindows,
+    ListWindows {
+        /// Include system windows (menubar, Dock, notifications). Default false.
+        #[serde(default, rename = "all", skip_serializing_if = "is_false")]
+        all: bool,
+    },
     /// Launch an application named by the shared `app` field.
     Launch,
     /// Activate an application named by the shared `app` field.
@@ -338,6 +422,9 @@ pub enum Action {
         /// unconditionally.
         #[serde(default)]
         x11: bool,
+        /// Also validate notarization of the containing app bundle. macOS only.
+        #[serde(default)]
+        full: bool,
     },
     /// Numbered accessibility tree for the key window.
     Tree,
@@ -352,6 +439,16 @@ pub enum Action {
         stop_on_error: bool,
         /// Native action objects. A nested `batch` is rejected at dispatch.
         actions: Vec<Value>,
+    },
+    /// Absolute path of the current audit log, when one is configured.
+    #[serde(rename = "audit_path", alias = "audit-path")]
+    AuditPath {},
+    /// Newest audit entries, reading the rotated backup first.
+    #[serde(rename = "audit_tail", alias = "audit-tail")]
+    AuditTail {
+        /// How many lines to return. Default 50, capped at 500.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lines: Option<usize>,
     },
     /// Remove empty session directories and stale ones.
     #[serde(alias = "session-prune")]
@@ -430,6 +527,16 @@ pub enum Action {
     /// between spaces; otherwise the action reports the visible state only.
     #[serde(alias = "spaces")]
     Spaces {},
+    /// Move the front (or `--window`-selected) window to another space.
+    ///
+    /// Requires the private SkyLight window-to-space API, which this build
+    /// does not implement; the action always returns `unsupported` with the
+    /// reason. `window move --to-display` is the supported alternative.
+    #[serde(rename = "spaces_move", alias = "spaces-move")]
+    SpacesMove {
+        /// Managed space index, 1-based, as reported by `spaces`.
+        to_space: u32,
+    },
     /// List the tabs the running Chromium exposes. Requires `--features cdp`.
     /// Without the feature this returns `unsupported`.
     #[serde(rename = "browser_tabs", alias = "browser-tabs")]
@@ -793,7 +900,61 @@ pub enum Action {
         /// Re-run OCR even when `--app` already produced it. Defaults to false.
         #[serde(default, skip_serializing_if = "is_false")]
         force: bool,
+        /// Run OCR on a file instead of a live capture. `screen` then equals
+        /// the image pixel. No secure-field redaction applies.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image: Option<String>,
     },
+    /// Move one window. Requires `x` and `y`, or `to_display`.
+    #[serde(rename = "window_move", alias = "window-move")]
+    WindowMove {
+        /// Left edge in screen points.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        x: Option<i32>,
+        /// Top edge in screen points.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        y: Option<i32>,
+        /// Center the window on this display instead of `x`/`y`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_display: Option<u32>,
+    },
+    /// Resize one window.
+    #[serde(rename = "window_resize", alias = "window-resize")]
+    WindowResize {
+        /// New width in screen points.
+        width: u32,
+        /// New height in screen points.
+        height: u32,
+    },
+    /// Set any combination of position and size on one window.
+    #[serde(rename = "window_set", alias = "window-set")]
+    WindowSet {
+        /// Left edge in screen points.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        x: Option<i32>,
+        /// Top edge in screen points.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        y: Option<i32>,
+        /// New width in screen points.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        width: Option<u32>,
+        /// New height in screen points.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        height: Option<u32>,
+    },
+    /// Read or set `AXMinimized`/`AXFullScreen` on one window.
+    #[serde(rename = "window_state", alias = "window-state")]
+    WindowState {
+        /// Set the minimized flag.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        minimized: Option<bool>,
+        /// Set the full-screen flag.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fullscreen: Option<bool>,
+    },
+    /// Report one window's bounds, display, and status.
+    #[serde(rename = "window_info", alias = "window-info")]
+    WindowInfo,
 }
 
 fn default_true() -> bool {
@@ -1458,13 +1619,51 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
         } => scroll(backend, context, (x, y), (dx, dy), direction, amount),
         Action::GetState => result_response(Ok(collect_state_for(backend, &tree_query(context)))),
         Action::Tree => result_response(tree_action(backend, context)),
-        Action::Ocr { force } => result_response(ocr_action(backend, context, force)),
+        Action::Ocr { force, image } => {
+            result_response(ocr_action(backend, context, force, image.as_deref()))
+        }
+        Action::WindowMove { x, y, to_display } => {
+            result_response(window_move_action(backend, context, x, y, to_display))
+        }
+        Action::WindowResize { width, height } => result_response(window_set_action(
+            backend,
+            context,
+            None,
+            None,
+            Some(width),
+            Some(height),
+            "window_resize",
+        )),
+        Action::WindowSet {
+            x,
+            y,
+            width,
+            height,
+        } => result_response(window_set_action(
+            backend,
+            context,
+            x,
+            y,
+            width,
+            height,
+            "window_set",
+        )),
+        Action::WindowState {
+            minimized,
+            fullscreen,
+        } => result_response(window_state_action(backend, context, minimized, fullscreen)),
+        Action::WindowInfo => result_response(window_info_action(backend, context)),
         Action::SessionEnd => result_response(session_end(backend, context)),
-        Action::Wait { ms, seconds } => result_response(wait(ms, seconds)),
+        wait @ Action::Wait { .. } => result_response(wait_action(backend, context, &wait)),
+        verify @ Action::Verify { .. } => verify_response(backend, context, &verify),
         Action::Displays => result_response(displays(backend)),
         Action::Isolation => result_response(isolation()),
-        Action::ListApps { all } => result_response(list_apps(backend, all)),
-        Action::ListWindows => result_response(list_windows(backend, context.app.as_deref())),
+        Action::ListApps { all, r#match } => {
+            result_response(list_apps(backend, all, r#match.as_deref()))
+        }
+        Action::ListWindows { all } => {
+            result_response(list_windows(backend, context.app.as_deref(), all))
+        }
         Action::Launch => result_response(launch(backend, context.app.as_deref())),
         Action::Activate => result_response(activate(
             backend,
@@ -1476,15 +1675,24 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
             prompt,
             open_settings,
             x11,
+            full,
         } => result_response(doctor(
             backend,
             crate::doctor::DoctorOptions {
                 prompt,
                 open_settings,
                 x11,
+                full,
             },
         )),
         Action::CursorPosition => result_response(cursor_position(backend)),
+        Action::AuditPath {} => result_response(Ok(json!({
+            "path": crate::audit::audit_path().map(|path| path.display().to_string()),
+        }))),
+        Action::AuditTail { lines } => result_response(
+            crate::audit::tail(lines.unwrap_or(50))
+                .map(|entries| json!({"lines": entries, "count": entries.len()})),
+        ),
         Action::SessionPrune { dry_run, ttl_secs } => {
             result_response(session_prune(dry_run, ttl_secs))
         }
@@ -1544,6 +1752,7 @@ fn dispatch_inner(backend: &dyn DesktopBackend, action: Action, context: &CallCo
             result_response(dock_click_action(backend, &title))
         }
         Action::Spaces {} => result_response(spaces_action(backend)),
+        Action::SpacesMove { to_space } => result_response(spaces_move_action(to_space)),
         other if is_browser_action(&other) => {
             let response = match browser_command(&other, context) {
                 Ok(command) => match browser_options(context, &prepared.subject) {
@@ -1703,16 +1912,19 @@ fn action_label(action: &Action) -> &'static str {
         Action::Scroll { .. } => "scroll",
         Action::GetState => "get_state",
         Action::Wait { .. } => "wait",
+        Action::Verify { .. } => "verify",
         Action::Displays => "displays",
         Action::Isolation => "isolation",
         Action::ListApps { .. } => "list_apps",
-        Action::ListWindows => "list_windows",
+        Action::ListWindows { .. } => "list_windows",
         Action::Launch => "launch",
         Action::Activate => "activate",
         Action::Quit { .. } => "quit",
         Action::Doctor { .. } => "doctor",
         Action::Tree => "tree",
         Action::SessionEnd => "session_end",
+        Action::AuditPath {} => "audit_path",
+        Action::AuditTail { .. } => "audit_tail",
         Action::CursorPosition => "cursor_position",
         Action::Batch { .. } => "batch",
         Action::SessionPrune { .. } => "session_prune",
@@ -1726,6 +1938,7 @@ fn action_label(action: &Action) -> &'static str {
         Action::DockList { .. } => "dock_list",
         Action::DockClick { .. } => "dock_click",
         Action::Spaces { .. } => "spaces",
+        Action::SpacesMove { .. } => "spaces_move",
         Action::BrowserTabs { .. } => "browser_tabs",
         Action::BrowserActivate { .. } => "browser_activate",
         Action::BrowserNavigate { .. } => "browser_navigate",
@@ -1753,6 +1966,11 @@ fn action_label(action: &Action) -> &'static str {
         Action::BrowserSessions {} => "browser_sessions",
         Action::BrowserBatch { .. } => "browser_batch",
         Action::Ocr { .. } => "ocr",
+        Action::WindowMove { .. } => "window_move",
+        Action::WindowResize { .. } => "window_resize",
+        Action::WindowSet { .. } => "window_set",
+        Action::WindowState { .. } => "window_state",
+        Action::WindowInfo => "window_info",
     }
 }
 
@@ -1775,15 +1993,18 @@ fn policy_class(action: &Action) -> PolicyClass {
         | Action::Displays
         | Action::Isolation
         | Action::ListApps { .. }
-        | Action::ListWindows
+        | Action::ListWindows { .. }
         | Action::Pause
         | Action::Resume => PolicyClass::Always,
-        Action::SessionEnd | Action::SessionPrune { .. } | Action::CursorPosition => {
-            PolicyClass::Benign
-        }
+        Action::SessionEnd
+        | Action::SessionPrune { .. }
+        | Action::CursorPosition
+        | Action::AuditPath {}
+        | Action::AuditTail { .. } => PolicyClass::Benign,
         Action::Screenshot { .. }
         | Action::Zoom { .. }
         | Action::Tree
+        | Action::Verify { .. }
         | Action::GetState
         | Action::PolicyCheck
         | Action::MenuList { .. }
@@ -1796,6 +2017,11 @@ fn policy_class(action: &Action) -> PolicyClass {
         | Action::BrowserWait { .. }
         | Action::BrowserSessions {}
         | Action::BrowserActivate { .. }
+        | Action::WindowInfo
+        | Action::WindowState {
+            minimized: None,
+            fullscreen: None,
+        }
         | Action::Ocr { .. } => PolicyClass::Observe,
         Action::Quit { .. } => PolicyClass::Quit,
         Action::Key { .. } | Action::HoldKey { .. } => PolicyClass::Key,
@@ -1847,7 +2073,13 @@ fn prepare_action(
     // The backends consult the built-in deny list without carrying the policy,
     // so the exemptions go into the process-wide registry here.
     policy::set_builtin_exemptions(loaded.builtin_exempt());
-    let warning = if loaded.pause_on_user_input {
+    policy::set_window_clamp(loaded.window_clamp());
+    crate::audit::set_config(crate::audit::AuditConfig {
+        enabled: loaded.audit_enabled(),
+        max_bytes: loaded.audit_max_bytes(),
+        keep: loaded.audit_keep(),
+    });
+    let mut warning = if loaded.pause_on_user_input {
         backend.user_input_pause_warning().map(str::to_string)
     } else {
         None
@@ -1958,6 +2190,71 @@ fn prepare_action(
             }
         }
     }
+    if let Action::MenuClick { path, .. } = action {
+        if menu_needs_confirm(path) {
+            if let Err(error) = confirm_action(
+                context,
+                &loaded,
+                &subject,
+                action,
+                "sensitive menu item; confirm the exact path",
+            ) {
+                return Prepared {
+                    stop: Some(Response::from_error(error)),
+                    warning,
+                    subject,
+                    decision: "confirm",
+                    source: "builtin",
+                };
+            }
+        }
+    }
+    if context.element.is_none() && action_inserts_text(action) {
+        match backend.peek_focused(context.app.as_deref(), context.window.as_deref()) {
+            Ok(Some(peek)) if peek.secure => {
+                let decision = match loaded.secure_focus() {
+                    policy::FocusDecision::Deny => {
+                        return Prepared {
+                            stop: Some(Response::from_error(ComputerError::PolicyDenied(
+                                "the focused element is a secure field; ask the user to type it"
+                                    .into(),
+                            ))),
+                            warning,
+                            subject,
+                            decision: "deny",
+                            source: "builtin",
+                        };
+                    }
+                    policy::FocusDecision::Warn => {
+                        let note = "focused element is a secure field; proceeding because [security] secure_focus = warn";
+                        warning = Some(append_warning(warning, note));
+                        "allow"
+                    }
+                };
+                let _ = decision;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                let note = format!("secure-field check unavailable: {error}");
+                match loaded.unreadable_focus() {
+                    policy::FocusDecision::Deny => {
+                        return Prepared {
+                            stop: Some(Response::from_error(ComputerError::PolicyDenied(format!(
+                                "{note}; set [security] unreadable_focus = warn to proceed"
+                            )))),
+                            warning,
+                            subject,
+                            decision: "deny",
+                            source: "builtin",
+                        };
+                    }
+                    policy::FocusDecision::Warn => {
+                        warning = Some(append_warning(warning, &note));
+                    }
+                }
+            }
+        }
+    }
     if let policy::Decision::Confirm { reason } = &decision {
         if let Err(error) = confirm_action(context, &loaded, &subject, action, reason) {
             return Prepared {
@@ -1985,6 +2282,53 @@ fn decision_record(decision: &policy::Decision) -> (&'static str, &'static str) 
         policy::Decision::Deny { source, .. } => ("deny", *source),
         policy::Decision::Confirm { .. } => ("confirm", "builtin"),
     }
+}
+
+fn append_warning(existing: Option<String>, note: &str) -> String {
+    match existing {
+        Some(text) if !text.is_empty() => format!("{text}; {note}"),
+        _ => note.to_string(),
+    }
+}
+
+fn menu_needs_confirm(path: &str) -> bool {
+    crate::menu_path::parse(path)
+        .map(|parsed| {
+            parsed
+                .as_slice()
+                .iter()
+                .any(|segment| policy::sensitive_title(segment))
+        })
+        .unwrap_or(false)
+}
+
+fn action_inserts_text(action: &Action) -> bool {
+    match action {
+        Action::Type { .. } => true,
+        Action::Key { keys } | Action::HoldKey { keys, .. } => combo_inserts_text(keys),
+        _ => false,
+    }
+}
+
+fn combo_inserts_text(keys: &str) -> bool {
+    let Ok(combos) = crate::keys::parse_key_sequence(keys) else {
+        return false;
+    };
+    combos.iter().any(|combo| {
+        use crate::types::Modifier;
+        let key = combo.key.to_ascii_lowercase();
+        let has = |modifier: Modifier| combo.modifiers.contains(&modifier);
+        let command = has(Modifier::Command) || has(Modifier::Meta);
+        let control = has(Modifier::Control);
+        let shift = has(Modifier::Shift);
+        if key == "v" && command {
+            return true;
+        }
+        if key == "insert" && shift {
+            return true;
+        }
+        key.chars().count() == 1 && !command && !control
+    })
 }
 
 fn confirm_action(
@@ -2022,6 +2366,8 @@ fn confirm_extra(action: &Action) -> Option<Value> {
             "language": language.unwrap_or_default().as_str(),
         })),
         Action::ShortcutsRun { name } => Some(json!({"name": name})),
+        Action::MenuClick { path, .. } => Some(json!({"path": path})),
+        Action::Key { keys } | Action::HoldKey { keys, .. } => Some(json!({"combo": keys})),
         _ => None,
     }
 }
@@ -2321,17 +2667,31 @@ fn post_state_kind(action: &Action) -> PostKind {
         | Action::BrowserLaunch { .. }
         | Action::BrowserQuit { .. }
         | Action::BrowserBatch { .. }
+        | Action::WindowMove { .. }
+        | Action::WindowResize { .. }
+        | Action::WindowSet { .. }
+        | Action::WindowState {
+            minimized: Some(_), ..
+        }
+        | Action::WindowState {
+            fullscreen: Some(_),
+            ..
+        }
+        | Action::SpacesMove { .. }
         | Action::Ocr { .. } => PostKind::Mutating,
         Action::GetState
         | Action::Wait { .. }
+        | Action::Verify { .. }
         | Action::Displays
         | Action::Isolation
         | Action::ListApps { .. }
-        | Action::ListWindows
+        | Action::ListWindows { .. }
         | Action::Doctor { .. }
         | Action::Tree
         | Action::SessionEnd
         | Action::SessionPrune { .. }
+        | Action::AuditPath {}
+        | Action::AuditTail { .. }
         | Action::CursorPosition
         | Action::ClipboardGet
         | Action::PolicyCheck
@@ -2345,6 +2705,11 @@ fn post_state_kind(action: &Action) -> PostKind {
         | Action::BrowserSnapshot { .. }
         | Action::BrowserScreenshot { .. }
         | Action::BrowserWait { .. }
+        | Action::WindowInfo
+        | Action::WindowState {
+            minimized: None,
+            fullscreen: None,
+        }
         | Action::BrowserSessions {} => PostKind::ReadOnly,
     }
 }
@@ -2988,6 +3353,21 @@ fn spaces_action(backend: &dyn DesktopBackend) -> Result<Value, ComputerError> {
         "screens": report.screens,
         "note": report.note,
     }))
+}
+
+/// `spaces move` is deliberately not implemented. Moving a window between
+/// managed spaces needs the private SkyLight window-to-space symbols, which
+/// this build does not call. A built-in `unsupported` is safer than an
+/// unverified private call that could destabilize the session.
+fn spaces_move_action(to_space: u32) -> Result<Value, ComputerError> {
+    let reason = if crate::tier::skylight_compiled() {
+        "the private SkyLight window-to-space API is not implemented"
+    } else {
+        "this build has no skylight feature and the private SkyLight window-to-space API is not implemented"
+    };
+    Err(ComputerError::Unsupported(format!(
+        "spaces move --to-space {to_space}: {reason}; use window move --to-display instead"
+    )))
 }
 
 // `shortcuts` does not need the desktop backend, but the helper signature
@@ -3957,10 +4337,467 @@ pub(crate) fn resolve_scroll(
     Ok((dx.unwrap_or(0), dy.unwrap_or(0)))
 }
 
-fn wait(ms: Option<u64>, seconds: Option<f64>) -> Result<Value, ComputerError> {
-    let waited = resolve_wait(ms, seconds)?;
-    thread::sleep(Duration::from_millis(waited));
-    Ok(json!({"waited_ms": waited}))
+struct WaitArgs<'a> {
+    ms: Option<u64>,
+    seconds: Option<f64>,
+    element: Option<u32>,
+    element_state: Option<&'a str>,
+    text: Option<&'a str>,
+    value: Option<&'a str>,
+    within_element: Option<u32>,
+    window_state: Option<&'a str>,
+    tree_change: bool,
+    app_running: Option<&'a str>,
+    title: Option<&'a str>,
+    ignore_case: bool,
+    timeout_ms: Option<u64>,
+    poll_ms: Option<u64>,
+}
+
+fn wait_args(action: &Action) -> WaitArgs<'_> {
+    match action {
+        Action::Wait {
+            ms,
+            seconds,
+            element,
+            element_state,
+            text,
+            value,
+            within_element,
+            window_state,
+            tree_change,
+            app_running,
+            title,
+            ignore_case,
+            timeout_ms,
+            poll_ms,
+        } => WaitArgs {
+            ms: *ms,
+            seconds: *seconds,
+            element: *element,
+            element_state: element_state.as_deref(),
+            text: text.as_deref(),
+            value: value.as_deref(),
+            within_element: *within_element,
+            window_state: window_state.as_deref(),
+            tree_change: *tree_change,
+            app_running: app_running.as_deref(),
+            title: title.as_deref(),
+            ignore_case: *ignore_case,
+            timeout_ms: *timeout_ms,
+            poll_ms: *poll_ms,
+        },
+        Action::Verify {
+            element,
+            element_state,
+            text,
+            value,
+            within_element,
+            window_state,
+            tree_change,
+            app_running,
+            title,
+            ignore_case,
+            timeout_ms,
+            poll_ms,
+        } => WaitArgs {
+            ms: None,
+            seconds: None,
+            element: *element,
+            element_state: element_state.as_deref(),
+            text: text.as_deref(),
+            value: value.as_deref(),
+            within_element: *within_element,
+            window_state: window_state.as_deref(),
+            tree_change: *tree_change,
+            app_running: app_running.as_deref(),
+            title: title.as_deref(),
+            ignore_case: *ignore_case,
+            timeout_ms: *timeout_ms,
+            poll_ms: *poll_ms,
+        },
+        _ => WaitArgs {
+            ms: None,
+            seconds: None,
+            element: None,
+            element_state: None,
+            text: None,
+            value: None,
+            within_element: None,
+            window_state: None,
+            tree_change: false,
+            app_running: None,
+            title: None,
+            ignore_case: false,
+            timeout_ms: None,
+            poll_ms: None,
+        },
+    }
+}
+
+#[allow(unused_assignments)]
+fn wait_spec(
+    action: &Action,
+    default_timeout_ms: u64,
+) -> Result<Option<wait::WaitSpec>, ComputerError> {
+    let args = wait_args(action);
+    let mut conditions = 0usize;
+    let condition = if let Some(index) = args.element {
+        conditions += 1;
+        let state = match args.element_state {
+            Some(value) => wait::ElementState::parse(value)?,
+            None => wait::ElementState::Exists,
+        };
+        Some(wait::Condition::Element { index, state })
+    } else if args.value.is_some() {
+        return Err(ComputerError::InvalidArguments(
+            "value requires --element".into(),
+        ));
+    } else if let Some(needle) = args.text {
+        conditions += 1;
+        Some(wait::Condition::Text {
+            needle: needle.to_string(),
+            ignore_case: args.ignore_case,
+            within_element: args.within_element,
+        })
+    } else if let Some(value) = args.window_state {
+        conditions += 1;
+        Some(wait::Condition::Window {
+            state: wait::WindowState::parse(value)?,
+            selector: None,
+        })
+    } else if args.tree_change {
+        conditions += 1;
+        Some(wait::Condition::TreeChange)
+    } else if let Some(name) = args.app_running {
+        conditions += 1;
+        Some(wait::Condition::AppRunning {
+            name: name.to_string(),
+            ignore_case: args.ignore_case,
+        })
+    } else if let Some(needle) = args.title {
+        conditions += 1;
+        Some(wait::Condition::Title {
+            needle: needle.to_string(),
+            ignore_case: args.ignore_case,
+        })
+    } else {
+        None
+    };
+    if args.value.is_some() {
+        let index = args
+            .element
+            .ok_or_else(|| ComputerError::InvalidArguments("value requires --element".into()))?;
+        conditions += 1;
+        let condition = wait::Condition::Value {
+            index,
+            needle: args.value.unwrap_or_default().to_string(),
+            ignore_case: args.ignore_case,
+        };
+        return Ok(Some(wait::WaitSpec::new(
+            condition,
+            args.timeout_ms.unwrap_or(default_timeout_ms),
+            args.poll_ms.unwrap_or(wait::DEFAULT_POLL_MS),
+        )?));
+    }
+    let Some(condition) = condition else {
+        if matches!(action, Action::Verify { .. }) {
+            return Err(ComputerError::InvalidArguments(
+                "verify needs a condition".into(),
+            ));
+        }
+        return Ok(None);
+    };
+    if conditions > 1 {
+        return Err(ComputerError::InvalidArguments(
+            "wait and verify accept exactly one condition".into(),
+        ));
+    }
+    Ok(Some(wait::WaitSpec::new(
+        condition,
+        args.timeout_ms.unwrap_or(default_timeout_ms),
+        args.poll_ms.unwrap_or(wait::DEFAULT_POLL_MS),
+    )?))
+}
+
+#[allow(unused_assignments)]
+fn wait_action(
+    backend: &dyn DesktopBackend,
+    context: &CallContext,
+    action: &Action,
+) -> Result<Value, ComputerError> {
+    let Some(spec) = wait_spec(action, wait::DEFAULT_TIMEOUT_MS)? else {
+        let args = wait_args(action);
+        let waited = resolve_wait(args.ms, args.seconds)?;
+        thread::sleep(Duration::from_millis(waited));
+        return Ok(json!({"waited_ms": waited}));
+    };
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(spec.timeout_ms);
+    let mut last = Value::Null;
+    loop {
+        let (matched, observed) = evaluate_condition(backend, context, &spec.condition)?;
+        last = observed;
+        if matched {
+            return Ok(json!({
+                "waited_ms": started.elapsed().as_millis() as u64,
+                "condition": spec.condition.as_str(),
+                "observed": last,
+            }));
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(spec.poll_ms));
+    }
+    Err(ComputerError::Timeout(format!(
+        "{} was not observed after {} ms; last observation: {last}",
+        spec.condition.describe(),
+        spec.timeout_ms
+    )))
+}
+
+#[allow(unused_assignments)]
+fn verify_response(
+    backend: &dyn DesktopBackend,
+    context: &CallContext,
+    action: &Action,
+) -> Response {
+    let spec = match wait_spec(action, wait::VERIFY_TIMEOUT_MS) {
+        Ok(Some(spec)) => spec,
+        Ok(None) => {
+            return Response::from_error(ComputerError::InvalidArguments(
+                "verify needs a condition".into(),
+            ))
+        }
+        Err(error) => return Response::from_error(error),
+    };
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(spec.timeout_ms);
+    let mut last = Value::Null;
+    loop {
+        match evaluate_condition(backend, context, &spec.condition) {
+            Ok((true, observed)) => {
+                return Response::success(json!({
+                    "verified": true,
+                    "condition": spec.condition.as_str(),
+                    "observed": observed,
+                }))
+            }
+            Ok((false, observed)) => last = observed,
+            Err(error) => return Response::from_error(error),
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(spec.poll_ms));
+    }
+    Response::failure(
+        "verification_failed",
+        format!(
+            "{} was not true after {} ms",
+            spec.condition.describe(),
+            spec.timeout_ms
+        ),
+    )
+    .with_field("condition", json!(spec.condition.as_str()))
+    .with_field("observed", last)
+}
+
+fn evaluate_condition(
+    backend: &dyn DesktopBackend,
+    context: &CallContext,
+    condition: &wait::Condition,
+) -> Result<(bool, Value), ComputerError> {
+    match condition {
+        wait::Condition::Element { index, state } => {
+            let view = backend.view_element(&tree_query(context), *index)?;
+            let matched = match state {
+                wait::ElementState::Exists => view.is_some(),
+                wait::ElementState::Gone => view.is_none(),
+                wait::ElementState::Visible => view.as_ref().is_some_and(|view| {
+                    view.frame
+                        .map(|frame| frame.width > 0 && frame.height > 0)
+                        .unwrap_or(false)
+                }),
+                wait::ElementState::Enabled => view.as_ref().is_some_and(|view| view.enabled),
+            };
+            Ok((matched, view_observation(view)))
+        }
+        wait::Condition::Value {
+            index,
+            needle,
+            ignore_case,
+        } => {
+            let view = backend.view_element(&tree_query(context), *index)?;
+            let matched = view
+                .as_ref()
+                .and_then(|view| view.value.as_deref())
+                .is_some_and(|value| wait::contains(value, needle, *ignore_case));
+            Ok((matched, view_observation(view)))
+        }
+        wait::Condition::Text {
+            needle,
+            ignore_case,
+            within_element,
+        } => {
+            let text = match within_element {
+                Some(index) => backend
+                    .view_element(&tree_query(context), *index)?
+                    .map(|view| view.subtree_text)
+                    .unwrap_or_default(),
+                None => backend.tree(&tree_query(context))?.full_text,
+            };
+            let matched = wait::contains(&text, needle, *ignore_case);
+            Ok((
+                matched,
+                json!({"snippet": wait::snippet(&text, needle, *ignore_case)}),
+            ))
+        }
+        wait::Condition::TreeChange => {
+            let report = backend.tree(&tree_query(context))?;
+            let diff = report.diff.clone().unwrap_or_default();
+            let matched = !diff.trim().is_empty();
+            Ok((matched, json!({"diff": diff, "revision": report.revision})))
+        }
+        wait::Condition::Window { state, selector } => {
+            let resolved = window_for_wait(backend, context, selector.as_deref())?;
+            let matched = match state {
+                wait::WindowState::Exists => resolved.is_some(),
+                wait::WindowState::Gone => resolved.is_none(),
+            };
+            Ok((matched, window_observation(resolved)))
+        }
+        wait::Condition::AppRunning { name, ignore_case } => {
+            let apps = backend.list_apps(true)?;
+            let found = apps.into_iter().find(|app| {
+                wait::contains(&app.name, name, *ignore_case)
+                    || app
+                        .bundle_id
+                        .as_deref()
+                        .is_some_and(|bundle| wait::contains(bundle, name, *ignore_case))
+                    || app
+                        .path
+                        .as_deref()
+                        .is_some_and(|path| wait::contains(path, name, *ignore_case))
+            });
+            let observation = found
+                .as_ref()
+                .map(|app| {
+                    json!({
+                        "name": app.name,
+                        "bundle_id": app.bundle_id,
+                        "pid": app.pid,
+                    })
+                })
+                .unwrap_or(Value::Null);
+            Ok((found.is_some(), observation))
+        }
+        wait::Condition::Title {
+            needle,
+            ignore_case,
+        } => {
+            let title = title_for_wait(backend, context)?;
+            let matched = title
+                .as_deref()
+                .is_some_and(|title| wait::contains(title, needle, *ignore_case));
+            Ok((matched, json!({"title": title})))
+        }
+    }
+}
+
+fn view_observation(view: Option<crate::element::ElementView>) -> Value {
+    match view {
+        Some(view) => json!({
+            "role": view.role,
+            "title": view.title,
+            "value": view.value,
+            "secure": view.secure,
+            "enabled": view.enabled,
+            "frame": view.frame.map(|frame| json!({
+                "x": frame.x,
+                "y": frame.y,
+                "width": frame.width,
+                "height": frame.height,
+            })),
+        }),
+        None => Value::Null,
+    }
+}
+
+fn window_observation(window: Option<crate::target::WindowInfo>) -> Value {
+    match window {
+        Some(window) => json!({
+            "id": window.id,
+            "title": window.title,
+            "app": window.app,
+            "pid": window.pid,
+        }),
+        None => Value::Null,
+    }
+}
+
+fn window_for_wait(
+    backend: &dyn DesktopBackend,
+    context: &CallContext,
+    selector: Option<&str>,
+) -> Result<Option<crate::target::WindowInfo>, ComputerError> {
+    let listed = backend.list_windows()?;
+    let windows = match context.app.as_deref() {
+        Some(app) => {
+            let parsed = parse_app_selector(app)?;
+            let apps = backend.list_apps(true)?;
+            let info = resolve_app(&apps, &parsed)?;
+            filter_windows_for_pid(&listed.windows, info.pid)
+        }
+        None => listed.windows,
+    };
+    let Some(selector) = selector else {
+        return Ok(crate::target::hide_system_windows(&windows)
+            .into_iter()
+            .next());
+    };
+    let parsed = parse_window_selector(selector)?;
+    match resolve_window(&windows, &parsed) {
+        Ok(window) => Ok(Some(window.clone())),
+        Err(ComputerError::WindowNotFound(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn title_for_wait(
+    backend: &dyn DesktopBackend,
+    context: &CallContext,
+) -> Result<Option<String>, ComputerError> {
+    if context.window.is_some() || context.app.is_some() {
+        return Ok(
+            window_for_wait(backend, context, context.window.as_deref())?
+                .map(|window| window.title),
+        );
+    }
+    Ok(backend.frontmost().window)
+}
+
+impl Action {
+    /// A sleep-only `Wait` with no condition. Adapters use it.
+    pub fn wait_sleep(ms: Option<u64>, seconds: Option<f64>) -> Self {
+        Action::Wait {
+            ms,
+            seconds,
+            element: None,
+            element_state: None,
+            text: None,
+            value: None,
+            within_element: None,
+            window_state: None,
+            tree_change: false,
+            app_running: None,
+            title: None,
+            ignore_case: false,
+            timeout_ms: None,
+            poll_ms: None,
+        }
+    }
 }
 
 pub(crate) fn resolve_wait(ms: Option<u64>, seconds: Option<f64>) -> Result<u64, ComputerError> {
@@ -4019,6 +4856,7 @@ fn tree_query(context: &CallContext) -> TreeQuery {
         app: context.app.clone(),
         window: context.window.clone(),
         full: context.full,
+        diff: context.diff,
         session: context.session.clone(),
     }
 }
@@ -4030,7 +4868,11 @@ fn ocr_action(
     backend: &dyn DesktopBackend,
     context: &CallContext,
     _force: bool,
+    image_path: Option<&str>,
 ) -> Result<Value, ComputerError> {
+    if let Some(path) = image_path.map(str::trim).filter(|path| !path.is_empty()) {
+        return ocr_image(backend, path);
+    }
     let targeted = context.app.is_some() || context.window.is_some();
     if !targeted {
         return Err(ComputerError::InvalidArguments(
@@ -4094,6 +4936,58 @@ fn redact_secure_ocr_blocks(
     // blocks are image pixels. The default is an empty list.
     let secure_frames = backend.secure_ocr_frames(&tree_query(context), map)?;
     Ok(crate::vision::redact_blocks(blocks, secure_frames))
+}
+
+/// OCR on a file. `screen` equals the image pixel; there is no AX tree to
+/// redact against, so the response says so.
+fn ocr_image(backend: &dyn DesktopBackend, path: &str) -> Result<Value, ComputerError> {
+    let image = image::open(path)
+        .map_err(|error| {
+            ComputerError::InvalidArguments(format!("could not read image {path}: {error}"))
+        })?
+        .to_rgba8();
+    let (width, height) = image.dimensions();
+    let map = crate::image_util::ScreenshotMap::identity(width, height);
+    let OcrResult { blocks, note } = backend.recognize_text(&image, &map)?;
+    let blocks_json: Vec<Value> = blocks
+        .iter()
+        .map(|block| {
+            let image_rect = crate::vision::ocr::ImageRect {
+                x: block.x,
+                y: block.y,
+                width: block.width,
+                height: block.height,
+            };
+            let screen = image_rect.to_screen(&map);
+            json!({
+                "text": block.text,
+                "x": block.x,
+                "y": block.y,
+                "width": block.width,
+                "height": block.height,
+                "confidence": block.confidence,
+                "screen": match screen {
+                    Some((x, y)) => json!({
+                        "x": x.round() as i64,
+                        "y": y.round() as i64,
+                    }),
+                    None => Value::Null,
+                },
+            })
+        })
+        .collect();
+    let mut body = json!({
+        "action": "ocr",
+        "source": "image",
+        "image": path,
+        "width": width,
+        "height": height,
+        "blocks": blocks_json,
+    });
+    if let Some(note) = note {
+        body["note"] = json!(note);
+    }
+    Ok(body)
 }
 
 /// One OCR-ready capture: the prepared shot pixels plus its screenshot map.
@@ -4188,6 +5082,8 @@ fn tree_action(
         "tree": report.tree,
         // `diff` is `None` when this observation created the baseline.
         "baseline": if report.diff.is_some() { "existing" } else { "created" },
+        "mode": if report.diff.is_some() { "diff" } else { "full" },
+        "diff_requested": context.diff,
     });
     if let Some(note) = report.note {
         body["note"] = json!(note);
@@ -4221,12 +5117,288 @@ fn session_end(
     Ok(body)
 }
 
-fn list_apps(backend: &dyn DesktopBackend, all: bool) -> Result<Value, ComputerError> {
-    let apps = backend.list_apps(all)?;
-    Ok(json!({"apps": apps}))
+fn window_json(window: &crate::target::WindowInfo) -> Value {
+    let mut value = serde_json::to_value(window).unwrap_or(Value::Null);
+    value["kind"] = json!(crate::target::window_kind(window));
+    value["system"] = json!(crate::target::is_system_window(window));
+    value
 }
 
-fn list_windows(backend: &dyn DesktopBackend, app: Option<&str>) -> Result<Value, ComputerError> {
+/// The resolved window row for the shared request context, or `window_not_found`.
+fn require_window_row(
+    backend: &dyn DesktopBackend,
+    context: &CallContext,
+) -> Result<crate::target::WindowInfo, ComputerError> {
+    window_for_wait(backend, context, context.window.as_deref())?.ok_or_else(|| {
+        let label = context.window.clone().unwrap_or_else(|| {
+            context
+                .app
+                .clone()
+                .unwrap_or_else(|| "the front window".into())
+        });
+        ComputerError::WindowNotFound(label)
+    })
+}
+
+/// Display id whose frame contains the window's center.
+fn display_for_bounds(
+    backend: &dyn DesktopBackend,
+    bounds: crate::target::WindowBounds,
+) -> Option<u32> {
+    let center_x = f64::from(bounds.x) + f64::from(bounds.width) / 2.0;
+    let center_y = f64::from(bounds.y) + f64::from(bounds.height) / 2.0;
+    backend
+        .list_displays()
+        .ok()?
+        .into_iter()
+        .find(|display| {
+            center_x >= f64::from(display.x)
+                && center_x < f64::from(display.x + display.width as i32)
+                && center_y >= f64::from(display.y)
+                && center_y < f64::from(display.y + display.height as i32)
+        })
+        .map(|display| display.id)
+}
+
+/// The window row after a frame change, plus display and status.
+fn window_frame_response(
+    backend: &dyn DesktopBackend,
+    context: &CallContext,
+    label: &str,
+) -> Result<Value, ComputerError> {
+    let row = require_window_row(backend, context)?;
+    let mut body = json!({
+        "action": label,
+        "window": window_json(&row),
+        "display": display_for_bounds(backend, row.bounds),
+    });
+    if let Ok(status) = backend.window_status(&row.app, context.window.as_deref()) {
+        body["state"] = serde_json::to_value(status).unwrap_or(Value::Null);
+    }
+    Ok(body)
+}
+
+/// Clamp a requested frame to the display that contains its center. Honors
+/// `[window] clamp`; the default is true.
+fn clamp_window_frame(
+    backend: &dyn DesktopBackend,
+    current: &crate::target::WindowInfo,
+    x: Option<f64>,
+    y: Option<f64>,
+    width: Option<f64>,
+    height: Option<f64>,
+) -> (Option<f64>, Option<f64>, Option<f64>, Option<f64>) {
+    if !policy::window_clamp() {
+        return (x, y, width, height);
+    }
+    let Ok(displays) = backend.list_displays() else {
+        return (x, y, width, height);
+    };
+    let Some(first) = displays.first() else {
+        return (x, y, width, height);
+    };
+    let width = width.unwrap_or(f64::from(current.bounds.width)).max(1.0);
+    let height = height.unwrap_or(f64::from(current.bounds.height)).max(1.0);
+    let x = x.unwrap_or(f64::from(current.bounds.x));
+    let y = y.unwrap_or(f64::from(current.bounds.y));
+    let center_x = x + width / 2.0;
+    let center_y = y + height / 2.0;
+    let display = displays
+        .iter()
+        .find(|display| {
+            center_x >= f64::from(display.x)
+                && center_x < f64::from(display.x + display.width as i32)
+                && center_y >= f64::from(display.y)
+                && center_y < f64::from(display.y + display.height as i32)
+        })
+        .unwrap_or(first);
+    let width = width.min(f64::from(display.width));
+    let height = height.min(f64::from(display.height));
+    let max_x = (f64::from(display.x) + f64::from(display.width) - width).max(f64::from(display.x));
+    let max_y =
+        (f64::from(display.y) + f64::from(display.height) - height).max(f64::from(display.y));
+    (
+        Some(x.clamp(f64::from(display.x), max_x)),
+        Some(y.clamp(f64::from(display.y), max_y)),
+        Some(width),
+        Some(height),
+    )
+}
+
+fn window_move_action(
+    backend: &dyn DesktopBackend,
+    context: &CallContext,
+    x: Option<i32>,
+    y: Option<i32>,
+    to_display: Option<u32>,
+) -> Result<Value, ComputerError> {
+    let current = require_window_row(backend, context)?;
+    let (x, y) = match to_display {
+        Some(id) => {
+            let displays = backend.list_displays()?;
+            let display = displays
+                .iter()
+                .find(|display| display.id == id)
+                .ok_or_else(|| {
+                    ComputerError::InvalidArguments(format!("unknown display id {id}"))
+                })?;
+            let x = display.x + ((display.width as i32 - current.bounds.width as i32) / 2).max(0);
+            let y = display.y + ((display.height as i32 - current.bounds.height as i32) / 2).max(0);
+            (Some(x), Some(y))
+        }
+        None => {
+            let Some(x) = x else {
+                return Err(ComputerError::InvalidArguments(
+                    "window move needs --x and --y, or --to-display".into(),
+                ));
+            };
+            let Some(y) = y else {
+                return Err(ComputerError::InvalidArguments(
+                    "window move needs --x and --y, or --to-display".into(),
+                ));
+            };
+            (Some(x), Some(y))
+        }
+    };
+    let (x, y, width, height) = clamp_window_frame(
+        backend,
+        &current,
+        x.map(f64::from),
+        y.map(f64::from),
+        None,
+        None,
+    );
+    backend.set_window_frame(&current.app, context.window.as_deref(), x, y, width, height)?;
+    window_frame_response(backend, context, "window_move")
+}
+
+fn window_set_action(
+    backend: &dyn DesktopBackend,
+    context: &CallContext,
+    x: Option<i32>,
+    y: Option<i32>,
+    width: Option<u32>,
+    height: Option<u32>,
+    label: &str,
+) -> Result<Value, ComputerError> {
+    if x.is_none() && y.is_none() && width.is_none() && height.is_none() {
+        return Err(ComputerError::InvalidArguments(
+            "window set needs at least one of --x, --y, --width, --height".into(),
+        ));
+    }
+    let current = require_window_row(backend, context)?;
+    let (x, y, width, height) = clamp_window_frame(
+        backend,
+        &current,
+        x.map(f64::from),
+        y.map(f64::from),
+        width.map(f64::from),
+        height.map(f64::from),
+    );
+    backend.set_window_frame(&current.app, context.window.as_deref(), x, y, width, height)?;
+    window_frame_response(backend, context, label)
+}
+
+fn window_state_action(
+    backend: &dyn DesktopBackend,
+    context: &CallContext,
+    minimized: Option<bool>,
+    fullscreen: Option<bool>,
+) -> Result<Value, ComputerError> {
+    let row = require_window_row(backend, context)?;
+    if minimized.is_some() || fullscreen.is_some() {
+        backend.set_window_state(&row.app, context.window.as_deref(), minimized, fullscreen)?;
+    }
+    let status = backend.window_status(&row.app, context.window.as_deref())?;
+    Ok(json!({
+        "action": "window_state",
+        "window": window_json(&row),
+        "state": serde_json::to_value(status).unwrap_or(Value::Null),
+    }))
+}
+
+fn window_info_action(
+    backend: &dyn DesktopBackend,
+    context: &CallContext,
+) -> Result<Value, ComputerError> {
+    let row = require_window_row(backend, context)?;
+    let mut body = json!({
+        "action": "window_info",
+        "window": window_json(&row),
+        "display": display_for_bounds(backend, row.bounds),
+    });
+    if let Ok(status) = backend.window_status(&row.app, context.window.as_deref()) {
+        body["state"] = serde_json::to_value(status).unwrap_or(Value::Null);
+    }
+    Ok(body)
+}
+
+fn list_apps(
+    backend: &dyn DesktopBackend,
+    all: bool,
+    pattern: Option<&str>,
+) -> Result<Value, ComputerError> {
+    let apps = backend.list_apps(all)?;
+    let hidden = if all {
+        0
+    } else {
+        backend
+            .list_apps(true)
+            .map(|every| every.len().saturating_sub(apps.len()))
+            .unwrap_or(0)
+    };
+    let mut rows: Vec<Value> = apps
+        .iter()
+        .filter(|app| app_matches(app, pattern))
+        .map(|app| {
+            let mut value = serde_json::to_value(app).unwrap_or(Value::Null);
+            value["kind"] = json!(crate::target::app_kind(app));
+            value["system"] = json!(crate::target::is_system_app(app));
+            value
+        })
+        .collect();
+    rows.sort_by(|left, right| {
+        left["name"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(right["name"].as_str().unwrap_or_default())
+    });
+    let mut body = json!({"apps": rows});
+    if hidden > 0 {
+        body["hidden_count"] = json!(hidden);
+        body["note"] = json!(format!(
+            "{hidden} accessory/system apps hidden; pass --all to include them"
+        ));
+    }
+    Ok(body)
+}
+
+fn app_matches(app: &crate::target::AppInfo, pattern: Option<&str>) -> bool {
+    let Some(pattern) = pattern.map(str::trim).filter(|text| !text.is_empty()) else {
+        return true;
+    };
+    let fields = [
+        app.name.as_str(),
+        app.bundle_id.as_deref().unwrap_or_default(),
+        app.path.as_deref().unwrap_or_default(),
+    ];
+    if pattern.contains('*') {
+        fields
+            .iter()
+            .any(|field| policy::glob_match(pattern, field))
+    } else {
+        let needle = pattern.to_ascii_lowercase();
+        fields
+            .iter()
+            .any(|field| field.to_ascii_lowercase().contains(&needle))
+    }
+}
+
+fn list_windows(
+    backend: &dyn DesktopBackend,
+    app: Option<&str>,
+    all: bool,
+) -> Result<Value, ComputerError> {
     let listed = backend.list_windows()?;
     let windows = match app {
         None => listed.windows,
@@ -4237,7 +5409,23 @@ fn list_windows(backend: &dyn DesktopBackend, app: Option<&str>) -> Result<Value
             filter_windows_for_pid(&listed.windows, info.pid)
         }
     };
-    let mut body = json!({"windows": windows});
+    let system_count = windows
+        .iter()
+        .filter(|window| crate::target::is_system_window(window))
+        .count();
+    let visible = if all {
+        windows
+    } else {
+        crate::target::hide_system_windows(&windows)
+    };
+    let rows: Vec<Value> = visible.iter().map(window_json).collect();
+    let mut body = json!({"windows": rows, "count": rows.len()});
+    if !all && system_count > 0 {
+        body["system_hidden"] = json!(system_count);
+        body["note"] = json!(format!(
+            "{system_count} system windows hidden; pass --all or use id:<n>"
+        ));
+    }
     if let Some(note) = listed.note {
         body["note"] = json!(note);
     }
@@ -4322,6 +5510,12 @@ pub struct Response {
 }
 
 impl Response {
+    /// Attach an extra top-level field to the response body.
+    pub fn with_field(mut self, key: impl Into<String>, value: Value) -> Self {
+        self.fields.insert(key.into(), value);
+        self
+    }
+
     /// Successful response. `data` must be a JSON object; other values are stored as `result`.
     pub fn success(data: Value) -> Self {
         let fields = match data {
@@ -4731,10 +5925,7 @@ mod tests {
 
     #[test]
     fn dispatch_wait_does_not_need_a_display() {
-        let response = dispatch(Action::Wait {
-            ms: Some(0),
-            seconds: None,
-        });
+        let response = dispatch(Action::wait_sleep(Some(0), None));
         assert!(response.ok);
         assert_eq!(response.to_value()["waited_ms"], 0);
     }
@@ -4915,7 +6106,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(request.id, Some(json!(4)));
-        assert!(matches!(request.action, Action::ListWindows));
+        assert!(matches!(request.action, Action::ListWindows { .. }));
         assert_eq!(request.context.app.as_deref(), Some("Foo \"Bar\""));
         assert_eq!(request.context.window.as_deref(), Some("0"));
         assert_eq!(request.context.element, Some(3));
@@ -4959,6 +6150,429 @@ mod tests {
         }
     }
 
+    fn view(role: &str) -> crate::element::ElementView {
+        crate::element::ElementView {
+            role: role.into(),
+            title: Some(role.into()),
+            value: Some("ready".into()),
+            secure: false,
+            enabled: true,
+            frame: Some(crate::tree::SavedFrame {
+                x: 10,
+                y: 10,
+                width: 80,
+                height: 20,
+            }),
+            subtree_text: format!("{role} ready"),
+        }
+    }
+
+    #[test]
+    fn wait_text_returns_when_it_appears() {
+        let backend = StubBackend::default();
+        backend
+            .tree_values
+            .lock()
+            .unwrap()
+            .extend(["idle".to_string(), "Ready".to_string()]);
+        let response = dispatch_with_context(
+            &backend,
+            Action::Wait {
+                ms: None,
+                seconds: None,
+                element: None,
+                element_state: None,
+                text: Some("Ready".into()),
+                value: None,
+                within_element: None,
+                window_state: None,
+                tree_change: false,
+                app_running: None,
+                title: None,
+                ignore_case: false,
+                timeout_ms: Some(1_000),
+                poll_ms: Some(25),
+            },
+            &ctx("Notes"),
+        );
+        assert!(response.ok, "{:?}", response.to_value());
+        let value = response.to_value();
+        assert_eq!(value["condition"], "text");
+        assert!(value["observed"]["snippet"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Ready"));
+    }
+
+    #[test]
+    fn wait_element_appears_and_times_out() {
+        let backend = StubBackend::default();
+        backend
+            .element_views
+            .lock()
+            .unwrap()
+            .extend([None, Some(view("AXButton"))]);
+        let response = dispatch_with_context(
+            &backend,
+            Action::Wait {
+                ms: None,
+                seconds: None,
+                element: Some(2),
+                element_state: None,
+                text: None,
+                value: None,
+                within_element: None,
+                window_state: None,
+                tree_change: false,
+                app_running: None,
+                title: None,
+                ignore_case: false,
+                timeout_ms: Some(1_000),
+                poll_ms: Some(25),
+            },
+            &ctx("Notes"),
+        );
+        assert!(response.ok, "{:?}", response.to_value());
+        assert_eq!(response.to_value()["observed"]["role"], "AXButton");
+
+        let empty = StubBackend::default();
+        let timeout = dispatch_with_context(
+            &empty,
+            Action::Wait {
+                ms: None,
+                seconds: None,
+                element: Some(9),
+                element_state: None,
+                text: None,
+                value: None,
+                within_element: None,
+                window_state: None,
+                tree_change: false,
+                app_running: None,
+                title: None,
+                ignore_case: false,
+                timeout_ms: Some(150),
+                poll_ms: Some(25),
+            },
+            &ctx("Notes"),
+        );
+        assert_eq!(timeout.to_value()["error"]["code"], "timeout");
+    }
+
+    #[test]
+    fn verify_passes_and_fails_with_its_own_code() {
+        let backend = StubBackend::default();
+        backend
+            .tree_values
+            .lock()
+            .unwrap()
+            .extend(["idle".to_string(), "Ready".to_string()]);
+        let pass = dispatch_with_context(
+            &backend,
+            Action::Verify {
+                element: None,
+                element_state: None,
+                text: Some("Ready".into()),
+                value: None,
+                within_element: None,
+                window_state: None,
+                tree_change: false,
+                app_running: None,
+                title: None,
+                ignore_case: false,
+                timeout_ms: Some(1_000),
+                poll_ms: Some(25),
+            },
+            &ctx("Notes"),
+        );
+        assert!(pass.ok, "{:?}", pass.to_value());
+        assert_eq!(pass.to_value()["verified"], true);
+
+        let fail = dispatch_with_context(
+            &backend,
+            Action::Verify {
+                element: None,
+                element_state: None,
+                text: Some("Never".into()),
+                value: None,
+                within_element: None,
+                window_state: None,
+                tree_change: false,
+                app_running: None,
+                title: None,
+                ignore_case: false,
+                timeout_ms: Some(150),
+                poll_ms: Some(25),
+            },
+            &ctx("Notes"),
+        );
+        let value = fail.to_value();
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error"]["code"], "verification_failed");
+        assert!(value.get("observed").is_some(), "{value:?}");
+    }
+
+    #[test]
+    fn window_move_centers_on_a_display() {
+        let backend = StubBackend::default();
+        let response = dispatch_with_context(
+            &backend,
+            Action::WindowMove {
+                x: None,
+                y: None,
+                to_display: Some(1),
+            },
+            &ctx("Notes"),
+        );
+        assert!(response.ok, "{:?}", response.to_value());
+        let value = response.to_value();
+        assert_eq!(value["action"], "window_move");
+        assert_eq!(value["display"], 1);
+        assert_eq!(value["window"]["id"], 100);
+        let calls = backend.window_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert!(calls[0].contains("x=200"), "{}", calls[0]);
+        assert!(calls[0].contains("y=150"), "{}", calls[0]);
+    }
+
+    #[test]
+    fn window_move_requires_coordinates_or_display() {
+        let backend = StubBackend::default();
+        let response = dispatch_with_context(
+            &backend,
+            Action::WindowMove {
+                x: Some(10),
+                y: None,
+                to_display: None,
+            },
+            &ctx("Notes"),
+        );
+        assert_eq!(response.to_value()["error"]["code"], "invalid_arguments");
+        assert!(backend.window_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn window_resize_clamps_to_the_display() {
+        let backend = StubBackend::default();
+        let response = dispatch_with_context(
+            &backend,
+            Action::WindowResize {
+                width: 900,
+                height: 900,
+            },
+            &ctx("Notes"),
+        );
+        assert!(response.ok, "{:?}", response.to_value());
+        let calls = backend.window_calls.lock().unwrap().clone();
+        assert!(calls[0].contains("width=800"), "{}", calls[0]);
+        assert!(calls[0].contains("height=600"), "{}", calls[0]);
+    }
+
+    #[test]
+    fn window_state_sets_and_reports() {
+        let backend = StubBackend::default();
+        *backend.window_status_fixture.lock().unwrap() = crate::target::WindowStatus {
+            minimized: Some(true),
+            fullscreen: Some(false),
+            main: Some(true),
+            focused: Some(false),
+        };
+        let response = dispatch_with_context(
+            &backend,
+            Action::WindowState {
+                minimized: Some(true),
+                fullscreen: None,
+            },
+            &ctx("Notes"),
+        );
+        assert!(response.ok, "{:?}", response.to_value());
+        assert_eq!(response.to_value()["state"]["minimized"], true);
+        let calls = backend.window_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].contains("minimized=Some(true)"), "{}", calls[0]);
+
+        // A report-only call touches nothing.
+        let backend = StubBackend::default();
+        *backend.window_status_fixture.lock().unwrap() = crate::target::WindowStatus {
+            minimized: Some(false),
+            ..Default::default()
+        };
+        let response = dispatch_with_context(
+            &backend,
+            Action::WindowState {
+                minimized: None,
+                fullscreen: None,
+            },
+            &ctx("Notes"),
+        );
+        assert!(response.ok, "{:?}", response.to_value());
+        assert_eq!(response.to_value()["state"]["minimized"], false);
+        assert!(backend.window_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn window_info_reports_bounds_and_status() {
+        let backend = StubBackend::default();
+        *backend.window_status_fixture.lock().unwrap() = crate::target::WindowStatus {
+            fullscreen: Some(false),
+            ..Default::default()
+        };
+        let response = dispatch_with_context(&backend, Action::WindowInfo, &ctx("Notes"));
+        assert!(response.ok, "{:?}", response.to_value());
+        let value = response.to_value();
+        assert_eq!(value["action"], "window_info");
+        assert_eq!(value["window"]["id"], 100);
+        assert_eq!(value["window"]["bounds"]["width"], 400);
+        assert_eq!(value["display"], 1);
+        assert_eq!(value["state"]["fullscreen"], false);
+    }
+
+    #[test]
+    fn ocr_image_reports_image_pixels_as_screen() {
+        let dir =
+            std::env::temp_dir().join(format!("computer-use-ocr-image-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shot.png");
+        let image = image::RgbaImage::from_pixel(40, 20, image::Rgba([255, 255, 255, 255]));
+        image.save(&path).unwrap();
+
+        let backend = StubBackend::default();
+        *backend.ocr_blocks.lock().unwrap() = Some(vec![crate::vision::OcrBlock {
+            text: "Hello".into(),
+            x: 5,
+            y: 6,
+            width: 10,
+            height: 8,
+            confidence: 0.9,
+        }]);
+        let response = dispatch_with(
+            &backend,
+            Action::Ocr {
+                force: false,
+                image: Some(path.display().to_string()),
+            },
+        );
+        assert!(response.ok, "{:?}", response.to_value());
+        let value = response.to_value();
+        assert_eq!(value["source"], "image");
+        assert_eq!(value["width"], 40);
+        assert_eq!(value["height"], 20);
+        assert_eq!(value["blocks"][0]["text"], "Hello");
+        // `screen` is the block center, matching every other OCR path.
+        assert_eq!(value["blocks"][0]["screen"]["x"], 10);
+        assert_eq!(value["blocks"][0]["screen"]["y"], 10);
+        assert_eq!(value["note"], "stub");
+
+        let missing = dispatch_with(
+            &backend,
+            Action::Ocr {
+                force: false,
+                image: Some("/nonexistent/shot.png".into()),
+            },
+        );
+        assert_eq!(missing.to_value()["error"]["code"], "invalid_arguments");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn type_refuses_a_secure_focused_field() {
+        let backend = StubBackend::default();
+        *backend.focused.lock().unwrap() = Some(crate::element::ElementPeek {
+            title: Some("Password".into()),
+            secure: true,
+        });
+        let response = dispatch_with(
+            &backend,
+            Action::Type {
+                text: "secret".into(),
+            },
+        );
+        assert!(!response.ok, "{:?}", response.to_value());
+        assert_eq!(response.to_value()["error"]["code"], "policy_denied");
+        assert!(backend.typed.lock().unwrap().is_empty());
+        // Enter is allowed: it submits, it does not insert text.
+        let enter = dispatch_with(
+            &backend,
+            Action::Key {
+                keys: "enter".into(),
+            },
+        );
+        assert!(enter.ok, "{:?}", enter.to_value());
+        // Paste is refused.
+        let paste = dispatch_with(
+            &backend,
+            Action::Key {
+                keys: "cmd+v".into(),
+            },
+        );
+        assert_eq!(paste.to_value()["error"]["code"], "policy_denied");
+    }
+
+    #[test]
+    fn unreadable_focus_warns_and_proceeds() {
+        let backend = StubBackend {
+            fail_focused: true,
+            ..StubBackend::default()
+        };
+        let response = dispatch_with(
+            &backend,
+            Action::Type {
+                text: "hello".into(),
+            },
+        );
+        assert!(response.ok, "{:?}", response.to_value());
+        let warnings = response
+            .to_value()
+            .get("warnings")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let joined = match warnings {
+            serde_json::Value::Array(items) => items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .collect::<Vec<_>>()
+                .join("; "),
+            serde_json::Value::String(text) => text,
+            _ => String::new(),
+        };
+        assert!(
+            joined.contains("secure-field check unavailable"),
+            "{:?}",
+            response.to_value()
+        );
+    }
+
+    #[test]
+    fn sensitive_menu_item_requires_confirmation() {
+        let backend = StubBackend::default();
+        let response = dispatch_with_context(
+            &backend,
+            Action::MenuClick {
+                app: Some("Notes".into()),
+                path: "File > Empty Trash".into(),
+            },
+            &ctx("Notes"),
+        );
+        assert_eq!(response.to_value()["error"]["code"], "confirm_required");
+        assert!(backend.menu_clicks.lock().unwrap().is_empty());
+
+        let (allow, dir) = allow_confirm_hook();
+        let mut context = ctx("Notes");
+        context.confirm_cmd = Some(allow);
+        let allowed = dispatch_with_context(
+            &backend,
+            Action::MenuClick {
+                app: Some("Notes".into()),
+                path: "File > Empty Trash".into(),
+            },
+            &context,
+        );
+        assert!(allowed.ok, "{:?}", allowed.to_value());
+        assert_eq!(backend.menu_clicks.lock().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn get_state_degrades_when_frontmost_is_denied() {
         let backend = StubBackend {
@@ -4997,17 +6611,137 @@ mod tests {
     }
 
     #[test]
+    fn list_windows_hides_system_rows_by_default() {
+        let mut backend = StubBackend::default();
+        backend.windows.insert(
+            0,
+            crate::target::WindowInfo {
+                id: 900,
+                pid: 99,
+                app: "Window Server".into(),
+                title: "Menubar".into(),
+                z: 0,
+                bounds: crate::target::WindowBounds {
+                    x: 0,
+                    y: 0,
+                    width: 1440,
+                    height: 24,
+                },
+                layer: 25,
+                on_screen: true,
+                ax_matched: false,
+            },
+        );
+
+        let response = dispatch_with(&backend, Action::ListWindows { all: false });
+        let value = response.to_value();
+        let windows = value["windows"].as_array().unwrap();
+        assert_eq!(windows.len(), 3, "{value:?}");
+        assert!(windows.iter().all(|window| window["system"] == false));
+        assert!(windows.iter().all(|window| window["kind"] == "app"));
+        assert_eq!(value["system_hidden"], 1);
+        assert!(value["note"].as_str().unwrap().contains("--all"));
+
+        let response = dispatch_with(&backend, Action::ListWindows { all: true });
+        let value = response.to_value();
+        let windows = value["windows"].as_array().unwrap();
+        assert_eq!(windows.len(), 4, "{value:?}");
+        assert!(windows.iter().any(|window| window["system"] == true));
+        assert!(windows.iter().any(|window| window["kind"] == "panel"));
+        assert!(value.get("system_hidden").is_none());
+
+        // Index resolution skips the system row: window 0 is the Notes window.
+        let listed = backend.list_windows().unwrap();
+        let selector = crate::target::WindowSelector::Index(0);
+        let resolved = crate::target::resolve_window(&listed.windows, &selector).unwrap();
+        assert_eq!(resolved.id, 100);
+        // `id:` still reaches the system row.
+        let system = crate::target::WindowSelector::Id(900);
+        let resolved = crate::target::resolve_window(&listed.windows, &system).unwrap();
+        assert_eq!(resolved.id, 900);
+    }
+
+    #[test]
+    fn list_apps_reports_kind_and_supports_match() {
+        let backend = StubBackend::default();
+
+        let response = dispatch_with(
+            &backend,
+            Action::ListApps {
+                all: false,
+                r#match: None,
+            },
+        );
+        let value = response.to_value();
+        assert_eq!(value["hidden_count"], 1, "{value:?}");
+        assert!(value["note"].as_str().unwrap().contains("--all"));
+
+        let response = dispatch_with(
+            &backend,
+            Action::ListApps {
+                all: false,
+                r#match: Some("term".into()),
+            },
+        );
+        let value = response.to_value();
+        let apps = value["apps"].as_array().unwrap();
+        assert_eq!(apps.len(), 1, "{value:?}");
+        assert_eq!(apps[0]["name"], "Terminal");
+        assert_eq!(apps[0]["kind"], "regular");
+        assert_eq!(apps[0]["system"], false);
+
+        let response = dispatch_with(
+            &backend,
+            Action::ListApps {
+                all: true,
+                r#match: Some("*otes*".into()),
+            },
+        );
+        let apps = response.to_value()["apps"].clone();
+        let apps = apps.as_array().unwrap();
+        assert!(!apps.is_empty());
+        assert!(apps.iter().all(|app| app["name"] == "Notes"));
+
+        let response = dispatch_with(
+            &backend,
+            Action::ListApps {
+                all: true,
+                r#match: None,
+            },
+        );
+        let value = response.to_value();
+        assert!(value["apps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|app| app["kind"] == "accessory"));
+        assert!(value.get("hidden_count").is_none());
+    }
+
+    #[test]
     fn stub_inventory_launch_and_doctor() {
         let backend = StubBackend::default();
 
-        let response = dispatch_with(&backend, Action::ListApps { all: false });
+        let response = dispatch_with(
+            &backend,
+            Action::ListApps {
+                all: false,
+                r#match: None,
+            },
+        );
         assert!(response.ok);
         let value = response.to_value();
         let apps = value["apps"].as_array().unwrap();
         assert!(apps.iter().any(|app| app["name"] == "Notes"));
         assert!(apps.iter().all(|app| app["name"] != "Widget"));
 
-        let response = dispatch_with(&backend, Action::ListApps { all: true });
+        let response = dispatch_with(
+            &backend,
+            Action::ListApps {
+                all: true,
+                r#match: None,
+            },
+        );
         let value = response.to_value();
         assert!(value["apps"]
             .as_array()
@@ -5015,7 +6749,8 @@ mod tests {
             .iter()
             .any(|app| app["pid"] == 77));
 
-        let response = dispatch_with_context(&backend, Action::ListWindows, &ctx("Notes"));
+        let response =
+            dispatch_with_context(&backend, Action::ListWindows { all: false }, &ctx("Notes"));
         assert!(response.ok, "{response:?}");
         let value = response.to_value();
         let windows = &value["windows"];
@@ -5067,6 +6802,7 @@ mod tests {
                 prompt: false,
                 open_settings: false,
                 x11: false,
+                full: false,
             },
         );
         let value = response.to_value();
@@ -5094,6 +6830,8 @@ mod tests {
                 ..
             }
         ));
+        let full: Action = serde_json::from_str(r#"{"action":"doctor","full":true}"#).unwrap();
+        assert!(matches!(full, Action::Doctor { full: true, .. }));
         let plain: Action = serde_json::from_str(r#"{"action":"doctor"}"#).unwrap();
         assert!(matches!(
             plain,
@@ -6303,13 +8041,7 @@ mod tests {
         assert_eq!(response.to_value()["error"]["code"], "paused");
         assert_eq!(backend.clicks.load(Ordering::SeqCst), 0);
         assert_eq!(backend.click_attempts.load(Ordering::SeqCst), 0);
-        let waited = dispatch_with(
-            &backend,
-            Action::Wait {
-                ms: Some(0),
-                seconds: None,
-            },
-        );
+        let waited = dispatch_with(&backend, Action::wait_sleep(Some(0), None));
         assert!(waited.ok, "{waited:?}");
     }
 

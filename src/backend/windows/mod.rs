@@ -71,6 +71,7 @@ pub(crate) fn inspect_accessibility(_app_name: Option<&str>) -> Result<String, C
         app: _app_name.map(str::to_owned),
         window: None,
         full: true,
+        diff: false,
         session: None,
     };
     let tree = uia::build_tree(&query)?;
@@ -383,6 +384,17 @@ fn map_integrity_rid(rid: u32) -> &'static str {
         _ => "untrusted",
     }
 }
+
+/// Focused UIA element for the secure-field guard. `Ok(None)` when UIA
+/// cannot read focus; the caller warns and proceeds.
+pub(crate) fn focused_peek(
+    _app: Option<&str>,
+    _window: Option<&str>,
+) -> Result<Option<crate::element::ElementPeek>, ComputerError> {
+    uia::focused_peek()
+}
+
+pub(crate) use uia::view_element;
 
 #[cfg(test)]
 mod tests {

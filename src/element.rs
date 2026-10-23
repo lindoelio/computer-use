@@ -324,6 +324,25 @@ pub struct ElementPeek {
     pub secure: bool,
 }
 
+/// Live view of one element, used by `wait` and `verify`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ElementView {
+    /// Accessibility role.
+    pub role: String,
+    /// Title, description, or identifier.
+    pub title: Option<String>,
+    /// Value. `None` for secure fields.
+    pub value: Option<String>,
+    /// Secure field bit.
+    pub secure: bool,
+    /// Whether the platform reports the element as enabled.
+    pub enabled: bool,
+    /// Screen frame in points.
+    pub frame: Option<crate::tree::SavedFrame>,
+    /// Text of this node and its descendants, for scoped waits.
+    pub subtree_text: String,
+}
+
 /// Role and title of the element under a coordinate, when hit-testing finds one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HitInfo {

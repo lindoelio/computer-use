@@ -30,6 +30,7 @@ use crate::target::DoctorReport;
 use super::apps;
 
 const CODESIGN_TIMEOUT: Duration = Duration::from_secs(4);
+const NOTARIZATION_TIMEOUT: Duration = Duration::from_secs(10);
 const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct LiveProbe;
@@ -77,7 +78,28 @@ pub(crate) fn doctor(options: DoctorOptions) -> Result<DoctorReport, ComputerErr
     );
     let (signature, team_id, sign_note) = signature_of(path.as_deref());
     let responsible = apps::responsible_app();
+    let (notarized, notarized_bundle, notarization_note) = if options.full {
+        match bundle_for_path(path.as_deref(), bundle_path.as_deref()) {
+            Some(bundle) => {
+                let (ok, note) = notarization(&bundle);
+                (Some(ok), Some(bundle), note)
+            }
+            None => (
+                None,
+                None,
+                Some(
+                    "--full: the executable is not inside an app bundle; notarization applies to bundles"
+                        .to_string(),
+                ),
+            ),
+        }
+    } else {
+        (None, None, None)
+    };
     let mut notes = Vec::new();
+    if let Some(note) = notarization_note {
+        notes.push(note);
+    }
     if options.prompt {
         notes.push(
             "prompts are asynchronous and do not change this result until the user decides"
@@ -99,6 +121,8 @@ pub(crate) fn doctor(options: DoctorOptions) -> Result<DoctorReport, ComputerErr
         signature,
         team_id,
         responsible,
+        notarized,
+        notarized_bundle,
         notes,
         required: doctor::MACOS_REQUIRED,
         recommend_bundle: !bundled,
@@ -164,6 +188,39 @@ fn signature_of(path: Option<&str>) -> (Option<String>, Option<String>, Option<S
     }
 }
 
+fn bundle_for_path(path: Option<&str>, bundle_path: Option<&str>) -> Option<String> {
+    if let Some(bundle) = bundle_path.map(str::trim).filter(|text| !text.is_empty()) {
+        return Some(bundle.to_string());
+    }
+    let path = path?;
+    let mut found: Option<String> = None;
+    for ancestor in std::path::Path::new(path).ancestors() {
+        if ancestor
+            .extension()
+            .map(|extension| extension.eq_ignore_ascii_case("app"))
+            .unwrap_or(false)
+        {
+            found = Some(ancestor.display().to_string());
+        }
+    }
+    found
+}
+
+fn notarization(bundle: &str) -> (bool, Option<String>) {
+    match run_timeout(
+        "xcrun",
+        &["stapler", "validate", bundle],
+        NOTARIZATION_TIMEOUT,
+    ) {
+        Ok(output) if output.status.success() => (true, None),
+        Ok(output) => (
+            false,
+            Some(format!("notarization: {}", stderr_snippet(&output.stderr))),
+        ),
+        Err(error) => (false, Some(format!("notarization: {error}"))),
+    }
+}
+
 fn ax_trusted_with_prompt() -> bool {
     // SAFETY: kAXTrustedCheckOptionPrompt is a process-lifetime CFString.
     let key = std::ptr::from_ref(unsafe { kAXTrustedCheckOptionPrompt }).cast::<c_void>();
@@ -186,4 +243,24 @@ fn ax_trusted_with_prompt() -> bool {
     };
     // SAFETY: the dictionary is CFString → CFBoolean, which is the documented options type.
     unsafe { AXIsProcessTrustedWithOptions(dict.as_deref()) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundle_for_path_finds_the_outermost_app_bundle() {
+        let path = Some("/Applications/Computer Use.app/Contents/MacOS/computer-use");
+        assert_eq!(
+            bundle_for_path(path, None).as_deref(),
+            Some("/Applications/Computer Use.app")
+        );
+        assert_eq!(
+            bundle_for_path(path, Some("/Applications/Computer Use.app")).as_deref(),
+            Some("/Applications/Computer Use.app")
+        );
+        assert_eq!(bundle_for_path(Some("/usr/local/bin/tool"), None), None);
+        assert_eq!(bundle_for_path(None, None), None);
+    }
 }

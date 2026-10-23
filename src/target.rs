@@ -53,6 +53,23 @@ pub enum ActivationPolicy {
     Unknown,
 }
 
+/// Window status flags, read from the platform window element.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct WindowStatus {
+    /// `AXMinimized`. Null when the platform does not expose it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub minimized: Option<bool>,
+    /// `AXFullScreen`. Null when the platform does not expose it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fullscreen: Option<bool>,
+    /// `AXMain`. Null when the platform does not expose it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub main: Option<bool>,
+    /// `AXFocused`. Null when the platform does not expose it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focused: Option<bool>,
+}
+
 /// One running application, as returned by `list_apps`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppInfo {
@@ -261,6 +278,12 @@ pub struct DoctorReport {
     /// Parent GUI app that must be toggled in Settings, when it could be found.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub responsible_app: Option<ResponsibleApp>,
+    /// `--full`: the app bundle passed `stapler validate`. Null when not checked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notarized: Option<bool>,
+    /// `--full`: bundle path that was validated. Null when not checked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notarized_bundle: Option<String>,
     /// Structured fix for each entry in `missing`, in the same order.
     pub fix: Vec<PermissionFix>,
     /// One-line instructions. Same order and text as `fix[].instruction`.
@@ -310,6 +333,8 @@ impl DoctorReport {
             bundle_id: None,
             identity: DoctorIdentity::blank(),
             responsible_app: None,
+            notarized: None,
+            notarized_bundle: None,
             fix: Vec::new(),
             fixes: Vec::new(),
             session: None,
@@ -452,7 +477,13 @@ pub fn resolve_window<'a>(
     selector: &WindowSelector,
 ) -> Result<&'a WindowInfo, ComputerError> {
     let found = match selector {
-        WindowSelector::Index(index) => windows.iter().find(|window| window.z == *index),
+        // Index 0 is the front app window. System rows (menubar, Dock,
+        // notifications) are skipped so `--window 0` cannot land on the
+        // menubar by accident. `id:` and titles still reach them.
+        WindowSelector::Index(index) => windows
+            .iter()
+            .filter(|window| !is_system_window(window))
+            .nth(*index as usize),
         WindowSelector::Id(id) => windows.iter().find(|window| window.id == *id),
         WindowSelector::Title(title) => {
             let exact = windows
@@ -469,6 +500,88 @@ pub fn resolve_window<'a>(
         }
     };
     found.ok_or_else(|| ComputerError::WindowNotFound(window_label(selector)))
+}
+
+/// True for menubar, Dock, notification-center, and other system-UI windows.
+///
+/// App windows may use small non-zero layers (floating panels, popovers), so
+/// only the system-UI layer range counts. `dock` sits at layer 20 and the
+/// menubar at 24-25; app panels stay below that.
+pub fn is_system_window(window: &WindowInfo) -> bool {
+    const SYSTEM_LAYER: i32 = 20;
+    if window.layer >= SYSTEM_LAYER {
+        return true;
+    }
+    matches!(
+        window.app.to_ascii_lowercase().as_str(),
+        "window server"
+            | "dock"
+            | "notification center"
+            | "control center"
+            | "spotlight"
+            | "loginwindow"
+            | "systemuiserver"
+            | "windowmanager"
+    )
+}
+
+/// Drop system windows and renumber `z` so the printed index matches the
+/// default `list-windows` view, where 0 is the front app window.
+pub fn hide_system_windows(windows: &[WindowInfo]) -> Vec<WindowInfo> {
+    windows
+        .iter()
+        .filter(|window| !is_system_window(window))
+        .enumerate()
+        .map(|(z, window)| {
+            let mut copy = window.clone();
+            copy.z = z as u32;
+            copy
+        })
+        .collect()
+}
+
+/// Stable kind for a window row.
+pub fn window_kind(window: &WindowInfo) -> &'static str {
+    if is_system_window(window) {
+        if window.layer >= 20 {
+            "panel"
+        } else {
+            "system"
+        }
+    } else {
+        "app"
+    }
+}
+
+/// True for daemons and helpers that are not user-facing apps.
+pub fn is_system_app(app: &AppInfo) -> bool {
+    if app.activation_policy == ActivationPolicy::Prohibited {
+        return true;
+    }
+    matches!(
+        app.name.to_ascii_lowercase().as_str(),
+        "loginwindow"
+            | "windowmanager"
+            | "universalaccessd"
+            | "dock"
+            | "systemuiserver"
+            | "control center"
+            | "notification center"
+            | "spotlight"
+    )
+}
+
+/// Stable kind for an app row.
+pub fn app_kind(app: &AppInfo) -> &'static str {
+    if is_system_app(app) {
+        return "system";
+    }
+    match app.activation_policy {
+        ActivationPolicy::Regular => "regular",
+        ActivationPolicy::Accessory => "accessory",
+        ActivationPolicy::Prohibited => "system",
+        ActivationPolicy::Unknown => "unknown",
+    }
 }
 
 /// Resolve an app and, when requested, one of its windows.
@@ -671,6 +784,52 @@ mod tests {
                 activation_policy: ActivationPolicy::Regular,
             },
         ]
+    }
+
+    #[test]
+    fn index_skips_system_windows_but_id_reaches_them() {
+        let bounds = WindowBounds {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        };
+        let windows = vec![
+            WindowInfo {
+                id: 1,
+                pid: 99,
+                app: "Window Server".into(),
+                title: "Menubar".into(),
+                z: 0,
+                bounds: WindowBounds {
+                    x: 0,
+                    y: 0,
+                    width: 1440,
+                    height: 24,
+                },
+                layer: 25,
+                on_screen: true,
+                ax_matched: false,
+            },
+            WindowInfo {
+                id: 2,
+                pid: 10,
+                app: "Notes".into(),
+                title: "Shopping".into(),
+                z: 1,
+                bounds,
+                layer: 0,
+                on_screen: true,
+                ax_matched: false,
+            },
+        ];
+        let front = resolve_window(&windows, &WindowSelector::Index(0)).unwrap();
+        assert_eq!(front.id, 2);
+        let by_id = resolve_window(&windows, &WindowSelector::Id(1)).unwrap();
+        assert_eq!(by_id.id, 1);
+        assert!(is_system_window(&windows[0]));
+        assert_eq!(window_kind(&windows[0]), "panel");
+        assert_eq!(window_kind(&windows[1]), "app");
     }
 
     fn windows() -> Vec<WindowInfo> {

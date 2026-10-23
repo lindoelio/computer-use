@@ -28,6 +28,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - New error code `timeout`.
 - The release binaries are built with `--features cdp`; `cargo install` keeps the optional `cdp` feature.
 
+#### Desktop hardening
+
+- `wait` is now a condition engine: `--element N --element-state exists|gone|visible|enabled`, `--text` (+`--within-element`), `--value`, `--window-state exists|gone`, `--tree-change`, `--app-running`, and `--title`, with `--ignore-case`, `--timeout-ms` (default 10000, max 300000), and `--poll-ms` (default 100, min 25). The duration form (`--ms`/`--seconds`) is unchanged when no condition is given.
+- New `verify` command and `verify` JSON action: the same conditions with a 2000 ms default and the dedicated `verification_failed` error code carrying the last `observed` value.
+- New `window` command group (`move`, `resize`, `set`, `state`, `info`) over `AXPosition`/`AXSize` on macOS, with `window move --to-display` centering and `[window] clamp` (default true) keeping moves and resizes inside a display.
+- `list-windows` hides system windows (menubar, Dock, notifications at layer >= 20) by default, adds `kind`/`system` per row and `system_hidden` plus a note; `--all` includes them. Index `0` and `--window N` always resolve app windows; `id:` reaches a system row.
+- `list-apps` gained `--match` (substring or `*` glob over name, bundle id, path) and reports `kind`/`system` plus `hidden_count`.
+- `ocr --image <PATH>` runs OCR on a file: `source` is `"image"`, `screen` equals the image pixel, and the response reports `width`/`height`. Secure-field redaction does not apply to a file.
+- macOS full-screen capture now uses ScreenCaptureKit with the desktop image as a non-terminal fallback (the warning names the ScreenCaptureKit error).
+- `doctor --full` validates the containing app bundle with `xcrun stapler validate` and reports `notarized`.
+- The custom confirm now fires for sensitive system shortcuts beyond `cmd+q` (`cmd+shift+q`, `ctrl+cmd+q`, `cmd+alt+esc`, `cmd+shift+delete` on macOS; `alt+F4` and the lock key elsewhere) and for menu paths that contain delete, erase, trash, discard, uninstall, send, submit, pay, or purchase. The confirm document carries `extra.combo` or `extra.path`.
+- Text-inserting actions without `--element` read the focused element first: a secure field is `policy_denied`, or a warning with `[security] secure_focus = "warn"`. `[security] unreadable_focus` controls platforms that cannot report focus.
+- Audit rotation: `[audit] max_bytes` (default 10 MiB) and `[audit] keep` (default 1, max 5) rotate `audit.jsonl` into numbered backups. `computer-use audit path` and `computer-use audit tail --lines N` expose the log without reading it by hand. `COMPUTER_USE_AUDIT_MAX_BYTES` can raise the threshold.
+- `tree` responses now carry `mode` (`full` or `diff`) and `diff_requested`.
+
 ### Changed
 
 - The CDP driver keeps one runtime alive for the whole command. The previous code created the runtime inside `connect`, spawned the chromiumoxide handler, and dropped the runtime before the command ran.
@@ -36,11 +51,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- `list-windows` indexes no longer count system rows: `--window 0` cannot land on the menubar, and app windows with small non-zero layers stay addressable.
 - `browser text` on `<input>`, `<textarea>`, and `<select>` reads `value` instead of an empty `innerText`.
 - Browser commands report `unsupported` when the feature is off and `invalid_arguments` when `--cdp` is missing, matching the CLI gate.
 
 ### Tests
 
+- `tests/ocr_live.rs` runs `ocr --image` through the compiled binary against a committed PNG fixture (macOS Vision, no TCC needed).
+- Wait/verify, audit rotation, secure-focus, sensitive-menu, list-windows/apps, window-control, and doctor `--full` unit coverage; `docs/CLI.md` and `tests/cli_doc_matches_help.rs` list the new actions and subcommands.
 - New `tests/cdp_live.rs` starts a real headless Chromium with an isolated profile and an in-process HTTP fixture server. It covers `tabs` (`kind`), navigate, snapshot, click by ref, type, secure-field refusal, and blocked URLs. The new `cdp-live` CI job runs it on macOS, Linux, and Windows.
 
 ## [0.3.2] - 2026-10-21

@@ -178,10 +178,7 @@ fn wait(object: &Map<String, Value>) -> Result<Action, ComputerError> {
     let ms = optional_i32(object, "ms")?;
     let seconds = object.get("seconds").and_then(Value::as_f64);
     if ms.is_none() && seconds.is_none() {
-        return Ok(Action::Wait {
-            ms: Some(0),
-            seconds: None,
-        });
+        return Ok(Action::wait_sleep(Some(0), None));
     }
     if let Some(value) = ms {
         if value < 0 {
@@ -190,8 +187,5 @@ fn wait(object: &Map<String, Value>) -> Result<Action, ComputerError> {
             ));
         }
     }
-    Ok(Action::Wait {
-        ms: ms.map(|value| value as u64),
-        seconds,
-    })
+    Ok(Action::wait_sleep(ms.map(|value| value as u64), seconds))
 }

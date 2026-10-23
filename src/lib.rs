@@ -44,6 +44,7 @@ mod tier;
 pub mod tree;
 pub mod types;
 pub mod vision;
+pub mod wait;
 pub mod window_groups;
 
 #[cfg(test)]

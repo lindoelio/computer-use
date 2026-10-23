@@ -21,8 +21,11 @@ pub(crate) mod scroll_ax;
 pub(crate) mod spaces;
 
 pub(crate) use apps::{activate, launch, list_apps, list_windows, quit};
-pub(crate) use ax::{browser_url, peek_element};
-pub(crate) use capture::session_display_block;
+pub(crate) use ax::{
+    browser_url, focused_peek, peek_element, set_window_frame, set_window_state, view_element,
+    window_status,
+};
+pub(crate) use capture::{capture_screen, session_display_block};
 pub(crate) use doctor::doctor;
 
 use crate::tree::{TreeQuery, TreeReport};

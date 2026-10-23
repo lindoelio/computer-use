@@ -18,6 +18,76 @@ use crate::error::ComputerError;
 
 static AUDIT_LOCK: Mutex<()> = Mutex::new(());
 
+/// Default rotation threshold: 10 MiB.
+pub const DEFAULT_MAX_BYTES: u64 = 10 * 1024 * 1024;
+/// Default number of rotated backups to keep.
+pub const DEFAULT_KEEP: u32 = 1;
+
+/// Runtime audit configuration. Policy sets it per action; the environment can
+/// only raise the rotation threshold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuditConfig {
+    /// Write audit lines at all.
+    pub enabled: bool,
+    /// Rotate when the current file reaches this many bytes.
+    pub max_bytes: u64,
+    /// Backups to keep (1..=5).
+    pub keep: u32,
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_bytes: DEFAULT_MAX_BYTES,
+            keep: DEFAULT_KEEP,
+        }
+    }
+}
+
+std::thread_local! {
+    static AUDIT_CONFIG: std::cell::RefCell<Option<AuditConfig>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Restores the previous audit configuration when dropped.
+pub struct ConfigGuard {
+    previous: Option<AuditConfig>,
+}
+
+impl Drop for ConfigGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        AUDIT_CONFIG.with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+/// Override the audit configuration until the guard drops. Tests use this.
+pub fn push_config(config: AuditConfig) -> ConfigGuard {
+    let previous = AUDIT_CONFIG.with(|slot| slot.borrow_mut().replace(config));
+    ConfigGuard { previous }
+}
+
+/// Set the configuration for the current process. Called once per action from
+/// the loaded policy.
+pub fn set_config(config: AuditConfig) {
+    AUDIT_CONFIG.with(|slot| *slot.borrow_mut() = Some(config));
+}
+
+fn config() -> AuditConfig {
+    #[allow(unused_mut)]
+    let mut config = AUDIT_CONFIG.with(|slot| *slot.borrow()).unwrap_or_default();
+    #[cfg(not(test))]
+    if let Ok(value) = std::env::var("COMPUTER_USE_AUDIT_MAX_BYTES") {
+        if let Ok(bytes) = value.trim().parse::<u64>() {
+            if bytes >= 1024 {
+                config.max_bytes = bytes;
+            }
+        }
+    }
+    config
+}
+
 std::thread_local! {
     static STATE_DIR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
@@ -135,6 +205,10 @@ pub fn record(entry: &AuditRecord<'_>) -> Result<(), ComputerError> {
     let Some(dir) = state_dir() else {
         return Ok(());
     };
+    let config = config();
+    if !config.enabled {
+        return Ok(());
+    }
     let line = AuditLine {
         ts: utc_timestamp(unix_secs()),
         session: entry.session,
@@ -154,7 +228,73 @@ pub fn record(entry: &AuditRecord<'_>) -> Result<(), ComputerError> {
     let _guard = AUDIT_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    append_line(&dir.join("audit.jsonl"), &text)
+    let path = dir.join("audit.jsonl");
+    rotate_best_effort(&dir, &path, &config);
+    append_line(&path, &text)
+}
+
+fn rotated_path(path: &Path, index: u32) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("audit.jsonl"));
+    name.push(format!(".{index}"));
+    path.with_file_name(name)
+}
+
+fn rotate_best_effort(dir: &Path, path: &Path, config: &AuditConfig) {
+    let Ok(metadata) = fs::metadata(path) else {
+        return;
+    };
+    if config.max_bytes == 0 || metadata.len() < config.max_bytes {
+        return;
+    }
+    let lock_path = dir.join("audit.lock");
+    let Ok(_lock) = crate::foreground::try_lock(&lock_path) else {
+        return;
+    };
+    let keep = config.keep.clamp(1, 5);
+    let oldest = rotated_path(path, keep);
+    let _ = fs::remove_file(&oldest);
+    for index in (1..keep).rev() {
+        let from = rotated_path(path, index);
+        let to = rotated_path(path, index + 1);
+        let _ = fs::rename(&from, &to);
+    }
+    let _ = fs::rename(path, rotated_path(path, 1));
+}
+
+/// Current audit file path, when a state directory is available.
+pub fn audit_path() -> Option<PathBuf> {
+    state_dir().map(|dir| dir.join("audit.jsonl"))
+}
+
+/// Newest `lines` audit entries, reading the rotated backup first when present.
+pub fn tail(lines: usize) -> Result<Vec<String>, ComputerError> {
+    let Some(dir) = state_dir() else {
+        return Ok(Vec::new());
+    };
+    let want = lines.clamp(1, 500);
+    let mut out: Vec<String> = Vec::new();
+    let base = dir.join("audit.jsonl");
+    for index in (1..=5).rev() {
+        let path = rotated_path(&base, index);
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in text.lines().filter(|line| !line.trim().is_empty()) {
+            out.push(line.to_string());
+        }
+    }
+    if let Ok(text) = fs::read_to_string(&base) {
+        for line in text.lines().filter(|line| !line.trim().is_empty()) {
+            out.push(line.to_string());
+        }
+    }
+    if out.len() > want {
+        out.drain(0..out.len() - want);
+    }
+    Ok(out)
 }
 
 fn append_line(path: &Path, line: &str) -> Result<(), ComputerError> {
@@ -220,6 +360,96 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rotation_keeps_a_backup_and_tail_returns_the_newest_lines() {
+        let dir = std::env::temp_dir().join(format!(
+            "computer-use-audit-rotation-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let _state = push_state_dir(&dir);
+        let _config = push_config(AuditConfig {
+            enabled: true,
+            max_bytes: 256,
+            keep: 1,
+        });
+        for index in 0..20 {
+            record(&AuditRecord {
+                session: "test",
+                action: "wait",
+                bundle_id: None,
+                pid: None,
+                window_id: None,
+                element: None,
+                code: "ok",
+                decision: "allow",
+                source: "default",
+                tier: None,
+                chars: Some(index),
+            })
+            .unwrap();
+        }
+        assert!(dir.join("audit.jsonl").is_file());
+        assert!(dir.join("audit.jsonl.1").is_file());
+        let lines = tail(100).unwrap();
+        assert!(!lines.is_empty(), "tail must return the retained lines");
+        assert!(
+            lines.last().unwrap().contains("\"chars\":19"),
+            "tail must end with the newest line: {lines:?}"
+        );
+        for line in &lines {
+            serde_json::from_str::<serde_json::Value>(line).expect("audit line is JSON");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(dir.join("audit.jsonl"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disabled_audit_writes_nothing() {
+        let dir = std::env::temp_dir().join(format!(
+            "computer-use-audit-disabled-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let _state = push_state_dir(&dir);
+        let _config = push_config(AuditConfig {
+            enabled: false,
+            ..AuditConfig::default()
+        });
+        record(&AuditRecord {
+            session: "test",
+            action: "wait",
+            bundle_id: None,
+            pid: None,
+            window_id: None,
+            element: None,
+            code: "ok",
+            decision: "allow",
+            source: "default",
+            tier: None,
+            chars: None,
+        })
+        .unwrap();
+        assert!(!dir.join("audit.jsonl").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn unix_epoch_formats_as_1970() {

@@ -33,7 +33,7 @@ use crate::error::ComputerError;
 use crate::policy;
 use crate::target::{
     bounds_match_frame, filter_windows_for_pid, parse_app_selector, parse_window_selector,
-    resolve_app, resolve_window, ActivationPolicy, AppInfo, WindowBounds, WindowInfo,
+    resolve_app, resolve_window, ActivationPolicy, AppInfo, WindowBounds, WindowInfo, WindowStatus,
 };
 use crate::tree::{
     self, ElectronEdit, FlagState, NodeFrame, TreeQuery, TreeReport, UiNode, CHILD_CAP, DEPTH_CAP,
@@ -248,6 +248,7 @@ fn element_action_inner(request: &ElementRequest) -> Result<ElementOutcome, Elem
         app: request.app.clone(),
         window: request.window.clone(),
         full: false,
+        diff: false,
         session: request.session.clone(),
     };
     if let Some(app) = query.app.as_deref() {
@@ -1003,6 +1004,10 @@ fn walk_element(
     let description = copy_string(element, "AXDescription").ok().flatten();
     let identifier = copy_string(element, "AXIdentifier").ok().flatten();
     let value = if secure { None } else { display_value(element) };
+    let enabled = copy_bool(element, "AXEnabled")
+        .ok()
+        .flatten()
+        .unwrap_or(true);
     let frame = copy_frame(element);
     let actions = copy_actions(element);
     let (children, child_count) = if depth >= DEPTH_CAP || ctx.remaining == 0 {
@@ -1021,6 +1026,7 @@ fn walk_element(
         description,
         identifier,
         value,
+        enabled,
         secure,
         actions,
         frame,
@@ -1352,6 +1358,7 @@ pub(crate) fn peek_element(
         app: app.map(str::to_string),
         window: window.map(str::to_string),
         full: false,
+        diff: false,
         session: session.map(str::to_string),
     };
     let Ok(resolved) = resolve_target(&query) else {
@@ -1391,6 +1398,261 @@ pub(crate) fn peek_element(
         title,
         secure: node.secure,
     }))
+}
+
+/// Live view of one element, for `wait` and `verify`.
+pub(crate) fn view_element(
+    query: &TreeQuery,
+    index: u32,
+) -> Result<Option<element::ElementView>, ComputerError> {
+    let root = root_node(query)?;
+    let Some(node) = crate::tree::find_ui(&root, index) else {
+        return Ok(None);
+    };
+    let secure = crate::tree::node_is_secure(node);
+    Ok(Some(element::ElementView {
+        role: node.role.clone(),
+        title: node
+            .title
+            .clone()
+            .or_else(|| node.description.clone())
+            .or_else(|| node.identifier.clone()),
+        value: if secure { None } else { node.value.clone() },
+        secure,
+        enabled: node.enabled,
+        frame: node.frame.map(crate::tree::SavedFrame::from),
+        subtree_text: subtree_text(node),
+    }))
+}
+
+fn subtree_text(node: &crate::tree::UiNode) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    collect_subtree_text(node, &mut parts);
+    parts.join(" ")
+}
+
+fn collect_subtree_text(node: &crate::tree::UiNode, parts: &mut Vec<String>) {
+    for text in [
+        node.value.as_deref(),
+        node.title.as_deref(),
+        node.description.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !text.is_empty() {
+            parts.push(text.to_string());
+        }
+    }
+    for child in &node.children {
+        collect_subtree_text(child, parts);
+    }
+}
+
+/// Move and/or resize one window through `AXPosition` and `AXSize`.
+pub(crate) fn set_window_frame(
+    app: &str,
+    window: Option<&str>,
+    x: Option<f64>,
+    y: Option<f64>,
+    width: Option<f64>,
+    height: Option<f64>,
+) -> Result<(), ComputerError> {
+    let element = resolve_ax_window(app, window)?;
+    if x.is_some() || y.is_some() {
+        let current = copy_frame(&element).ok_or_else(|| {
+            ComputerError::Unsupported("this window exposes no AXPosition".into())
+        })?;
+        let value = ax_value_point(x.unwrap_or(current.x), y.unwrap_or(current.y))?;
+        set_window_value(&element, "AXPosition", &value).map_err(|error| error.into_computer())?;
+    }
+    if width.is_some() || height.is_some() {
+        let current = copy_frame(&element)
+            .ok_or_else(|| ComputerError::Unsupported("this window exposes no AXSize".into()))?;
+        let value = ax_value_size(
+            width.unwrap_or(current.width),
+            height.unwrap_or(current.height),
+        )?;
+        set_window_value(&element, "AXSize", &value).map_err(|error| error.into_computer())?;
+    }
+    Ok(())
+}
+
+/// Set `AXMinimized` and/or `AXFullScreen` on one window.
+pub(crate) fn set_window_state(
+    app: &str,
+    window: Option<&str>,
+    minimized: Option<bool>,
+    fullscreen: Option<bool>,
+) -> Result<(), ComputerError> {
+    let element = resolve_ax_window(app, window)?;
+    if let Some(value) = minimized {
+        set_bool(&element, "AXMinimized", value).map_err(|error| error.into_computer())?;
+    }
+    if let Some(value) = fullscreen {
+        set_bool(&element, "AXFullScreen", value).map_err(|error| error.into_computer())?;
+    }
+    Ok(())
+}
+
+/// Read `AXMinimized`, `AXFullScreen`, `AXMain`, and `AXFocused`.
+pub(crate) fn window_status(
+    app: &str,
+    window: Option<&str>,
+) -> Result<WindowStatus, ComputerError> {
+    let element = resolve_ax_window(app, window)?;
+    Ok(WindowStatus {
+        minimized: copy_bool(&element, "AXMinimized").ok().flatten(),
+        fullscreen: copy_bool(&element, "AXFullScreen").ok().flatten(),
+        main: copy_bool(&element, "AXMain").ok().flatten(),
+        focused: copy_bool(&element, "AXFocused").ok().flatten(),
+    })
+}
+
+/// The `AXWindow` element for `app`/`window`, matched by title and frame and
+/// falling back to the main window, then the first window.
+fn resolve_ax_window(
+    app: &str,
+    window: Option<&str>,
+) -> Result<CFRetained<AXUIElement>, ComputerError> {
+    let (info, target) = apps::resolve_running(app, window)?;
+    if !trusted() {
+        return Err(ComputerError::PermissionRequired(permission_subject()));
+    }
+    let application = application(info.pid).map_err(|error| error.into_computer())?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let windows = copy_windows(&application, deadline).map_err(attr_error_to_computer)?;
+    let chosen = target
+        .as_ref()
+        .and_then(|target| {
+            windows.iter().position(|candidate| {
+                candidate.title.eq_ignore_ascii_case(&target.title)
+                    && candidate
+                        .frame
+                        .map(|frame| bounds_match_frame(target.bounds, frame))
+                        .unwrap_or(false)
+            })
+        })
+        .or_else(|| windows.iter().position(|candidate| candidate.main))
+        .or_else(|| (!windows.is_empty()).then_some(0));
+    let Some(index) = chosen else {
+        let label = target
+            .as_ref()
+            .map(|target| target.title.clone())
+            .filter(|title| !title.is_empty())
+            .or_else(|| window.map(str::to_string))
+            .unwrap_or_else(|| app.to_string());
+        return Err(ComputerError::WindowNotFound(label));
+    };
+    Ok(windows.into_iter().nth(index).expect("index").element)
+}
+
+fn ax_value_point(x: f64, y: f64) -> Result<CFRetained<AXValue>, ComputerError> {
+    let point = CGPoint { x, y };
+    // SAFETY: AXValueCreate copies the point out of the stack frame.
+    unsafe {
+        AXValue::new(
+            AXValueType::CGPoint,
+            NonNull::from(&point).cast::<std::ffi::c_void>(),
+        )
+    }
+    .ok_or_else(|| ComputerError::ExecutionFailed("could not build AXPosition".into()))
+}
+
+fn ax_value_size(width: f64, height: f64) -> Result<CFRetained<AXValue>, ComputerError> {
+    let size = CGSize { width, height };
+    // SAFETY: AXValueCreate copies the size out of the stack frame.
+    unsafe {
+        AXValue::new(
+            AXValueType::CGSize,
+            NonNull::from(&size).cast::<std::ffi::c_void>(),
+        )
+    }
+    .ok_or_else(|| ComputerError::ExecutionFailed("could not build AXSize".into()))
+}
+
+fn set_window_value(element: &AXUIElement, name: &str, value: &AXValue) -> Result<(), WalkError> {
+    let attribute = CFString::from_str(name);
+    // SAFETY: AXValue is a CFType, element is live, and the attribute name is
+    // a CFString we own for this call.
+    let value = unsafe { &*(value as *const AXValue).cast::<CFType>() };
+    let error = unsafe { element.set_attribute_value(&attribute, value) };
+    match classify(error) {
+        CopyClass::Ok | CopyClass::Missing => Ok(()),
+        CopyClass::Permission => Err(WalkError::Permission(permission_subject())),
+        CopyClass::Timeout => Err(WalkError::Timeout),
+        CopyClass::Failed => Err(WalkError::failed(None, 0)),
+    }
+}
+
+fn attr_error_to_computer(error: AttrError) -> ComputerError {
+    match error {
+        AttrError::Permission => ComputerError::PermissionRequired(permission_subject()),
+        AttrError::Timeout => {
+            ComputerError::Timeout("accessibility window lookup timed out".into())
+        }
+        AttrError::Missing | AttrError::Failed => {
+            ComputerError::ExecutionFailed("accessibility window lookup failed".into())
+        }
+    }
+}
+
+/// Focused element of the target app, for the secure-field guard.
+///
+/// Uses `AXFocusedUIElement`, then `AXFocusedWindow` + its focused element.
+/// `Ok(None)` means Accessibility is off or the app exposes no focus; the
+/// caller turns that into a warning.
+pub(crate) fn focused_peek(
+    app: Option<&str>,
+    _window: Option<&str>,
+) -> Result<Option<element::ElementPeek>, ComputerError> {
+    if !trusted() {
+        return Err(ComputerError::PermissionRequired(permission_subject()));
+    }
+    let app_text = match app.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(app) => app.to_string(),
+        None => match super::frontmost().app {
+            Some(name) => name,
+            None => return Ok(None),
+        },
+    };
+    let resolved = apps::resolve_running(&app_text, None)?;
+    let app_element = application(resolved.0.pid).map_err(|error| error.into_computer())?;
+    let Some(element) = focused_element(&app_element) else {
+        return Ok(None);
+    };
+    let role = copy_string(&element, "AXRole")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let subrole = copy_string(&element, "AXSubRole").ok().flatten();
+    let title = copy_string(&element, "AXTitle")
+        .ok()
+        .flatten()
+        .or_else(|| copy_string(&element, "AXDescription").ok().flatten());
+    let secure = role == "AXSecureTextField"
+        || subrole
+            .as_deref()
+            .is_some_and(|text| text.to_ascii_lowercase().contains("secure"));
+    Ok(Some(element::ElementPeek { title, secure }))
+}
+
+fn focused_element(app: &AXUIElement) -> Option<CFRetained<AXUIElement>> {
+    if let Ok(Some(value)) = copy_cf(app, "AXFocusedUIElement") {
+        if let Ok(element) = value.downcast::<AXUIElement>() {
+            return Some(element);
+        }
+    }
+    if let Ok(Some(value)) = copy_cf(app, "AXFocusedWindow") {
+        if let Ok(window) = value.downcast::<AXUIElement>() {
+            if let Ok(Some(inner)) = copy_cf(&window, "AXFocusedUIElement") {
+                if let Ok(element) = inner.downcast::<AXUIElement>() {
+                    return Some(element);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Frames of sheets or modals attached to the window that matches `bounds`.

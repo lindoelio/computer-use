@@ -78,7 +78,7 @@ computer-use --pretty exec '{"id":"a","action":"displays"}'
 
 ### Policy path
 
-`~/.config/computer-use/policy.toml` on every OS, including macOS and Windows. The admin file is `/etc/computer-use/policy.toml` on Linux and macOS, and `%ProgramData%\computer-use\policy.toml` on Windows. `--policy <PATH>` overrides the user file. A missing file is **default allow** plus the built-in deny list. `--policy check --app X` reports what the effective policy would decide without performing the action.
+`~/.config/computer-use/policy.toml` on every OS, including macOS and Windows. The admin file is `/etc/computer-use/policy.toml` on Linux and macOS, and `%ProgramData%\computer-use\policy.toml` on Windows. `--policy <PATH>` overrides the user file. A missing file is **default allow** plus the built-in deny list. `--policy check --app X` reports what the effective policy would decide without performing the action. Optional `[security]`, `[audit]`, and `[window]` sections tune the focused-element guard (`secure_focus`, `unreadable_focus`), audit rotation (`enabled`, `max_bytes`, `keep`), and window clamping (`clamp`); see `docs/CLI.md`.
 
 ### Feature flags
 
@@ -115,11 +115,12 @@ clipboard           Read or write the clipboard (`get`, `set`)
 zoom                Screenshot one region. With `--app`/`--window`, the region is window-local
 scroll              Scroll the mouse wheel
 get-state           Report displays, cursor, frontmost window, and a best-effort accessibility tree
-wait                Sleep, then return `waited_ms`
+wait                Sleep, or wait for one condition (element, text, value, window, tree change, app, title)
+verify              Assert one condition with a short timeout. Failure is `verification_failed`
 displays            List connected displays without capturing pixels
 isolation           Report what this build can isolate and what it cannot
 list-apps           List running applications
-list-windows        List on-screen windows in z-order. Index 0 is front
+list-windows        List on-screen windows in z-order. Index 0 is front; system windows are hidden unless --all
 launch              Launch an application by name, bundle id, path, or pid
 activate            Bring an application forward
 quit                Ask an application to quit
@@ -128,12 +129,14 @@ pause               Pause mutating actions until `resume`
 resume              Clear the pause flag
 doctor              Report permissions, the TCC identity, and how to fix what is missing
 tree                Print the key window's accessibility tree
-ocr                 Run OCR on the most recent capture for `--app` or `--window`
+ocr                 Run OCR on the most recent capture for `--app` or `--window`, or on an image file
+window              Move, resize, and inspect the front (or `--window`-selected) window
 menu                Walk a running app's menu bar (macOS only)
 apple-event         Send an Apple event script via `osascript` (macOS only)
 shortcuts           Run a Shortcuts workflow by name (macOS only)
 dock                List or click Dock items (macOS only)
 spaces              Group on-screen windows by the screen that contains each window's center
+audit               Audit log path and tail. Read-only
 session             Session cache and accessibility teardown (`end`, `prune`)
 serve               Read newline-delimited JSON actions from stdin
 exec                Run one JSON action from an argument
@@ -152,7 +155,7 @@ Input and capture need permission from the operating system. `get-state` still r
 
 | Permission | What uses it | Where to grant |
 | --- | --- | --- |
-| **Screen Recording** | `screenshot`, `zoom`, the `capture` path in `get-state`, ScreenCaptureKit window capture | System Settings → Privacy & Security → Screen Recording |
+| **Screen Recording** | `screenshot`, `zoom`, the `capture` path in `get-state`, ScreenCaptureKit display and window capture (the desktop image is the fallback) | System Settings → Privacy & Security → Screen Recording |
 | **Accessibility** | The accessibility tree, hit-testing, `AXPress`, `set_value`, `select_text`, element `type`, `menu`, Apple events, `osascript` fallback | System Settings → Privacy & Security → Accessibility |
 | **Post Event** | Tier `event` (`CGEventPostToPid`), `CGEventCreate`, hit-test | System Settings → Privacy & Security → Accessibility |
 | **Input Monitoring** | The P6 kill-switch tap | System Settings → Privacy & Security → Input Monitoring |
@@ -252,21 +255,29 @@ The `Action` enum in `src/protocol.rs` is the protocol. `id` is echoed on the re
 | `scroll_to` | none | Aliases: `scroll-to`, `scroll_to_visible`, `scroll-to-visible`. |
 | `get_state` | none | Alias: `get-state`. |
 | `cursor_position` | none | Reads the pointer. The Anthropic adapter maps `cursor_position` here. |
-| `wait` | `ms`, `seconds` | Summed when both are set. Fractions are allowed in `seconds`. |
+| `wait` | `ms`, `seconds`, or one condition: `element` (+`element_state`), `text` (+`within_element`), `value`, `window_state`, `tree_change`, `app_running`, `title`; plus `ignore_case`, `timeout_ms` (default 10000, max 300000), `poll_ms` (default 100, min 25) | Summed when both durations are set. |
+| `verify` | Same condition fields as `wait`; `timeout_ms` default 2000 | Assertion, not a sleep. Failure is `verification_failed` with the last `observed` in the body. |
 | `displays` | none | List displays without capturing pixels. |
 | `isolation` | none | Pure report: what this build can isolate. |
-| `list_apps` | `all` | `all: true` includes accessory and prohibited apps. |
-| `list_windows` | none | z-order; index 0 is front. |
+| `list_apps` | `all`, `match` | `all: true` includes accessory and prohibited apps. `match` is a substring or `*` glob over name, bundle id, and path; rows carry `kind` and `system`. |
+| `list_windows` | `all` | z-order; index 0 is front. System rows (menubar, Dock, notifications) are hidden by default; `--all` includes them and rows carry `kind`/`system`. Use `id:` for a system row. |
 | `launch` | `app` (sibling) | Launch via `NSWorkspace` on macOS; otherwise `unsupported`. |
 | `activate` | `app`, `window` | `--window` is checked first. |
 | `quit` | `force` | `--force` is a confirm-gated terminate. |
 | `policy_check` | `app` (sibling) | Reports `allow`/`deny` without performing the action. |
 | `pause` / `resume` | none | Cross-process kill switch. macOS only (CGEventTap). |
-| `doctor` | `prompt` (alias `request`), `open_settings`, `x11` | Envelope `ok: true` even when a permission is missing. |
+| `doctor` | `prompt` (alias `request`), `open_settings`, `x11`, `full` | Envelope `ok: true` even when a permission is missing. `full` validates notarization and reports `notarized`. |
 | `tree` | none | Numbered accessibility tree for the key window. |
-| `ocr` | `force` | Re-run OCR even when `--app` already produced it. |
+| `ocr` | `force`, `image` | Re-run OCR even when `--app` already produced it. `image` reads a file; `screen` equals the image pixel. |
 | `session_end` | none | Restore Electron accessibility flags this process changed. |
 | `session_prune` | `dry_run`, `ttl_secs` | Remove empty session directories and stale ones. Default TTL is 24h. |
+| `audit_path` | none | Alias: `audit-path`. Prints the audit log path. |
+| `audit_tail` | `lines` | Alias: `audit-tail`. Newest entries, default 50, max 500; reads the rotated backup first. |
+| `window_move` | `x`, `y`, `to_display` | macOS only. `to_display` centers the window on that display. |
+| `window_resize` | `width`, `height` | macOS only. |
+| `window_set` | `x`, `y`, `width`, `height` | macOS only. At least one field. |
+| `window_state` | `minimized`, `fullscreen` | macOS only. No fields reports the current flags. |
+| `window_info` | none | macOS only. Bounds, display, and status. |
 | `menu_list` | `app` (override), `depth` | macOS only. Walks `AXMenuBar → AXMenuBarItem → AXMenu`. |
 | `menu_click` | `app` (override), `path` (`"File > Save"`) | macOS only. `AXPress`es the leaf. |
 | `apple_event` | `app` (override), `script`, `language` (`applescript`/`javascript`) | macOS only. Runs `osascript`. The script body is never logged. |
@@ -274,6 +285,7 @@ The `Action` enum in `src/protocol.rs` is the protocol. `id` is echoed on the re
 | `dock_list` | none | macOS only. Lists Dock items. |
 | `dock_click` | `title` | macOS only. Case-insensitive title match. |
 | `spaces` | none | Groups on-screen windows by screen. Mission Control moves are not attempted. |
+| `spaces_move` | `to_space` | Always `unsupported`: the private SkyLight window-to-space API is not implemented. Use `window move --to-display`. |
 | `batch` | `actions`, `stop_on_error` | One resolved target, one revision sequence. Each step re-validates. Nested batch is `invalid_arguments`. |
 | `browser_tabs` | none | `cdp` feature. Returns `{tabs, count}`; each tab has `kind`, `target_id`, `url`, `title`. |
 | `browser_activate` | `target_id` | `cdp` feature. |

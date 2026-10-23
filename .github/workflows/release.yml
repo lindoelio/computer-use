@@ -160,6 +160,16 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - name: Require a signed and notarized macOS helper for tags
+        if: hashFiles('dist/computer-use-macos-arm64-app-unsigned.zip') != ''
+        env:
+          ALLOW_UNSIGNED_RELEASE: ${{ vars.ALLOW_UNSIGNED_RELEASE }}
+        run: |
+          set -euo pipefail
+          if [ "${ALLOW_UNSIGNED_RELEASE:-0}" != "1" ]; then
+            echo "::error::This tag built only an ad-hoc signed macOS app. Tag releases require Developer ID signing and notarization. Set the repository variable ALLOW_UNSIGNED_RELEASE=1 only for a pre-release."
+            exit 1
+          fi
       - name: Write SHA256SUMS
         shell: bash
         working-directory: dist
@@ -178,6 +188,7 @@ jobs:
           sha256sum "${files[@]}" > SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
+          prerelease: ${{ hashFiles('dist/computer-use-macos-arm64-app-unsigned.zip') != '' }}
           files: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
@@ -193,7 +204,7 @@ jobs:
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
           existing=$(gh release view "${tag}" --repo "$GITHUB_REPOSITORY" --json body --jq .body)
-          note='`computer-use-macos-arm64-app-unsigned.zip` is ad-hoc signed and not notarized. Developer ID signing secrets were not configured. See docs/PACKAGING.md.'
+          note='`computer-use-macos-arm64-app-unsigned.zip` is ad-hoc signed and not notarized, and this release is marked pre-release. Developer ID signing secrets were not configured. See docs/PACKAGING.md.'
           {
             printf '%s\n\n' "${note}"
             printf '%s\n' "${existing}"

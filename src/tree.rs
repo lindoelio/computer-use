@@ -31,6 +31,8 @@ pub struct UiNode {
     pub identifier: Option<String>,
     /// Display value. Secure nodes must leave this empty; the renderer never reads a secret.
     pub value: Option<String>,
+    /// `AXEnabled`/UIA `IsEnabled`. True when the platform does not expose it.
+    pub enabled: bool,
     /// `AXSecureTextField`, or a subrole containing `Secure`.
     pub secure: bool,
     /// Action names, already copied off the element.
@@ -103,6 +105,7 @@ impl UiNode {
             description: None,
             identifier: None,
             value: None,
+            enabled: true,
             secure: false,
             actions: Vec::new(),
             frame: None,
@@ -214,6 +217,9 @@ pub struct TreeQuery {
     pub window: Option<String>,
     /// Print the full tree and replace the baseline.
     pub full: bool,
+    /// Request a diff explicitly. The renderer already diffs once a baseline
+    /// exists; this flag makes the request visible and is a no-op otherwise.
+    pub diff: bool,
     /// Session cache namespace. Empty uses the process id.
     pub session: Option<String>,
 }

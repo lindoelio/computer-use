@@ -76,6 +76,8 @@ The script does this when `MACOS_SIGN_IDENTITY`, `APPLE_ID`, `APPLE_APP_SPECIFIC
 
 The release workflow signs only when the first three secrets exist. It notarizes only when the Apple ID secrets exist too. With none of them, it uploads `computer-use-macos-arm64-app-unsigned.zip` and adds a line to the release notes saying the zip is ad-hoc signed and not notarized.
 
+Tag releases **require** the signed and notarized bundle. If a tag builds only the ad-hoc zip, the release job fails with an error unless the repository variable `ALLOW_UNSIGNED_RELEASE=1` is set. That variable exists for pre-releases only: when the unsigned asset is attached, the GitHub release is marked pre-release. The skill's `scripts/setup.sh` prefers `computer-use-macos-arm64-app.zip` and falls back to the unsigned asset so local installs keep working without secrets.
+
 | Secret | Required for | Value |
 | --- | --- | --- |
 | `MACOS_CERTIFICATE_P12` | signing | base64 of the Developer ID Application `.p12` |

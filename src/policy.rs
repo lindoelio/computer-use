@@ -506,6 +506,43 @@ pub struct LoadedPolicy {
     builtin_exempt: Vec<String>,
     /// True only when a loaded file sets the key. A missing file stays false.
     pub pause_on_user_input: bool,
+    /// `[security] secure_focus`. Default deny.
+    secure_focus: FocusDecision,
+    /// `[security] unreadable_focus`. Default warn.
+    unreadable_focus: FocusDecision,
+    /// `[audit] enabled`. Default true.
+    audit_enabled: bool,
+    /// `[audit] max_bytes`. Default 10 MiB.
+    audit_max_bytes: u64,
+    /// `[audit] keep`. Default 1, capped at 5.
+    audit_keep: u32,
+    /// `[window] clamp`. Default true.
+    window_clamp: bool,
+    /// Admin already set the security section, so the user file cannot relax it.
+    security_admin: bool,
+    /// Admin already set the audit section.
+    audit_admin: bool,
+    /// Admin already set the window section.
+    window_admin: bool,
+}
+
+/// Direction for a security toggle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FocusDecision {
+    /// Refuse the action.
+    Deny,
+    /// Proceed with a warning.
+    Warn,
+}
+
+impl FocusDecision {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "deny" => Some(Self::Deny),
+            "warn" => Some(Self::Warn),
+            _ => None,
+        }
+    }
 }
 
 impl Default for LoadedPolicy {
@@ -520,6 +557,15 @@ impl Default for LoadedPolicy {
             timeout_secs: 30,
             builtin_exempt: Vec::new(),
             pause_on_user_input: false,
+            secure_focus: FocusDecision::Deny,
+            unreadable_focus: FocusDecision::Warn,
+            audit_enabled: true,
+            audit_max_bytes: crate::audit::DEFAULT_MAX_BYTES,
+            audit_keep: 1,
+            window_clamp: true,
+            security_admin: false,
+            audit_admin: false,
+            window_admin: false,
         }
     }
 }
@@ -533,6 +579,36 @@ impl LoadedPolicy {
     /// Built-in deny entries the user policy exempts.
     pub fn builtin_exempt(&self) -> &[String] {
         &self.builtin_exempt
+    }
+
+    /// What to do when the focused element is a secure field.
+    pub fn secure_focus(&self) -> FocusDecision {
+        self.secure_focus
+    }
+
+    /// What to do when the focused element cannot be read.
+    pub fn unreadable_focus(&self) -> FocusDecision {
+        self.unreadable_focus
+    }
+
+    /// Whether the audit log is enabled.
+    pub fn audit_enabled(&self) -> bool {
+        self.audit_enabled
+    }
+
+    /// Audit rotation threshold in bytes.
+    pub fn audit_max_bytes(&self) -> u64 {
+        self.audit_max_bytes
+    }
+
+    /// Audit backups to keep.
+    pub fn audit_keep(&self) -> u32 {
+        self.audit_keep
+    }
+
+    /// Whether window actions clamp to a display's visible frame.
+    pub fn window_clamp(&self) -> bool {
+        self.window_clamp
     }
 
     /// Timeout for the confirm hook. Capped at 120 seconds.
@@ -691,8 +767,8 @@ fn confirm_reason(action: &PolicyAction) -> Option<String> {
     match action {
         PolicyAction::Quit => Some("quit".into()),
         PolicyAction::ClipboardSet => Some("clipboard_set".into()),
-        PolicyAction::Key { combo } if key_needs_confirm(combo) => {
-            Some(format!("key combination {combo}"))
+        PolicyAction::Key { combo } => {
+            sensitive_combo(combo).map(|kind| format!("key combination {combo}: {}", kind.reason()))
         }
         _ => None,
     }
@@ -977,6 +1053,15 @@ fn merge_file(
     let source = match origin {
         PolicyOrigin::User => {
             policy.user_default_deny = default_deny;
+            if !policy.security_admin {
+                apply_security(policy, parsed.security.as_ref(), origin, path, &text)?;
+            }
+            if !policy.audit_admin {
+                apply_audit(policy, parsed.audit.as_ref(), origin, path, &text)?;
+            }
+            if !policy.window_admin {
+                apply_window(policy, parsed.window.as_ref(), origin, path, &text)?;
+            }
             if let Some(builtin) = parsed.builtin_deny.as_ref() {
                 for entry in &builtin.exempt {
                     let entry = entry.trim();
@@ -1002,6 +1087,12 @@ fn merge_file(
         }
         PolicyOrigin::Admin => {
             policy.admin_default_deny = default_deny;
+            apply_security(policy, parsed.security.as_ref(), origin, path, &text)?;
+            policy.security_admin = parsed.security.is_some();
+            apply_audit(policy, parsed.audit.as_ref(), origin, path, &text)?;
+            policy.audit_admin = parsed.audit.is_some();
+            apply_window(policy, parsed.window.as_ref(), origin, path, &text)?;
+            policy.window_admin = parsed.window.is_some();
             if let Some(confirm) = parsed.confirm.as_ref() {
                 if let Some(command) = confirm
                     .command
@@ -1035,6 +1126,91 @@ fn merge_file(
     }
     if let Some(browser) = parsed.browser {
         policy.blocked_urls.extend(browser.blocked_urls);
+    }
+    Ok(())
+}
+
+fn apply_security(
+    policy: &mut LoadedPolicy,
+    section: Option<&SecuritySection>,
+    origin: PolicyOrigin,
+    path: &Path,
+    text: &str,
+) -> Result<(), ComputerError> {
+    let Some(section) = section else {
+        return Ok(());
+    };
+    if let Some(value) = section.secure_focus.as_deref() {
+        policy.secure_focus = FocusDecision::parse(value).ok_or_else(|| {
+            origin_error(
+                origin,
+                path,
+                format!(
+                    "line {}: security.secure_focus must be deny or warn (got {value})",
+                    line_of_key(text, "secure_focus")
+                ),
+            )
+        })?;
+    }
+    if let Some(value) = section.unreadable_focus.as_deref() {
+        policy.unreadable_focus = FocusDecision::parse(value).ok_or_else(|| {
+            origin_error(
+                origin,
+                path,
+                format!(
+                    "line {}: security.unreadable_focus must be deny or warn (got {value})",
+                    line_of_key(text, "unreadable_focus")
+                ),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn apply_audit(
+    policy: &mut LoadedPolicy,
+    section: Option<&AuditSection>,
+    origin: PolicyOrigin,
+    path: &Path,
+    text: &str,
+) -> Result<(), ComputerError> {
+    let Some(section) = section else {
+        return Ok(());
+    };
+    if let Some(enabled) = section.enabled {
+        policy.audit_enabled = enabled;
+    }
+    if let Some(max_bytes) = section.max_bytes {
+        if max_bytes < 1024 {
+            return Err(origin_error(
+                origin,
+                path,
+                format!(
+                    "line {}: audit.max_bytes must be at least 1024",
+                    line_of_key(text, "max_bytes")
+                ),
+            ));
+        }
+        policy.audit_max_bytes = max_bytes;
+    }
+    if let Some(keep) = section.keep {
+        policy.audit_keep = keep.clamp(1, 5);
+    }
+    Ok(())
+}
+
+fn apply_window(
+    policy: &mut LoadedPolicy,
+    section: Option<&WindowSection>,
+    _origin: PolicyOrigin,
+    _path: &Path,
+    _text: &str,
+) -> Result<(), ComputerError> {
+    let Some(section) = section else {
+        return Ok(());
+    };
+    if let Some(clamp) = section.clamp {
+        policy.window_clamp = clamp;
     }
     Ok(())
 }
@@ -1129,6 +1305,39 @@ struct PolicyFile {
     browser: Option<BrowserSection>,
     #[serde(default)]
     builtin_deny: Option<BuiltinDenySection>,
+    #[serde(default)]
+    security: Option<SecuritySection>,
+    #[serde(default)]
+    audit: Option<AuditSection>,
+    #[serde(default)]
+    window: Option<WindowSection>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SecuritySection {
+    #[serde(default)]
+    secure_focus: Option<String>,
+    #[serde(default)]
+    unreadable_focus: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuditSection {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    max_bytes: Option<u64>,
+    #[serde(default)]
+    keep: Option<u32>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WindowSection {
+    #[serde(default)]
+    clamp: Option<bool>,
 }
 
 /// Exemptions from the built-in deny list. Only the user policy file may set
@@ -1301,7 +1510,15 @@ pub fn sensitive_title(title: &str) -> bool {
         .any(|word| {
             matches!(
                 word.to_ascii_lowercase().as_str(),
-                "delete" | "erase" | "pay" | "purchase" | "send" | "submit"
+                "delete"
+                    | "erase"
+                    | "pay"
+                    | "purchase"
+                    | "send"
+                    | "submit"
+                    | "trash"
+                    | "discard"
+                    | "uninstall"
             )
         })
 }
@@ -1319,18 +1536,120 @@ pub fn script_hash(bytes: &[u8]) -> String {
     format!("{hash:016x}")
 }
 
-/// `cmd+q` and `alt+f4`.
+std::thread_local! {
+    static WINDOW_CLAMP: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Store `[window] clamp` from the loaded policy for this action.
+pub fn set_window_clamp(value: bool) {
+    WINDOW_CLAMP.with(|cell| cell.set(value));
+}
+
+/// Whether window moves and resizes clamp to a display's frame. Default true.
+pub fn window_clamp() -> bool {
+    WINDOW_CLAMP.with(|cell| cell.get())
+}
+
+/// A sensitive system shortcut that needs explicit confirmation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SensitiveCombo {
+    /// Quit the frontmost app.
+    Quit,
+    /// Log out of the session.
+    LogOut,
+    /// Lock the screen.
+    LockScreen,
+    /// Force Quit the frontmost app.
+    ForceQuit,
+    /// Move the Finder selection to the trash.
+    EmptyTrash,
+}
+
+impl SensitiveCombo {
+    /// Stable token for the confirm document.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Quit => "quit",
+            Self::LogOut => "log_out",
+            Self::LockScreen => "lock_screen",
+            Self::ForceQuit => "force_quit",
+            Self::EmptyTrash => "empty_trash",
+        }
+    }
+
+    /// Human reason for the confirm hook.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Quit => "quits the frontmost application",
+            Self::LogOut => "logs out of the session",
+            Self::LockScreen => "locks the screen",
+            Self::ForceQuit => "force quits the frontmost application",
+            Self::EmptyTrash => "moves the selection to the trash",
+        }
+    }
+}
+
+/// Detect a sensitive system shortcut. Extra modifiers do not hide it:
+/// `cmd+shift+q` is still a logout.
+pub fn sensitive_combo(keys: &str) -> Option<SensitiveCombo> {
+    let combos = crate::keys::parse_key_sequence(keys).ok()?;
+    for combo in combos {
+        use crate::types::Modifier;
+        let key = combo.key.to_ascii_lowercase();
+        let has = |modifier: Modifier| combo.modifiers.contains(&modifier);
+        let command = has(Modifier::Command) || has(Modifier::Meta);
+        let control = has(Modifier::Control);
+        let alt = has(Modifier::Alt);
+        let shift = has(Modifier::Shift);
+        #[cfg(target_os = "windows")]
+        let _ = shift;
+        #[cfg(target_os = "linux")]
+        let _ = shift;
+        #[cfg(target_os = "macos")]
+        {
+            if key == "q" && command && shift {
+                return Some(SensitiveCombo::LogOut);
+            }
+            if key == "q" && command && control {
+                return Some(SensitiveCombo::LockScreen);
+            }
+            if key == "q" && command {
+                return Some(SensitiveCombo::Quit);
+            }
+            if (key == "escape" || key == "esc") && command && alt {
+                return Some(SensitiveCombo::ForceQuit);
+            }
+            if key == "delete" && command && shift {
+                return Some(SensitiveCombo::EmptyTrash);
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let _ = control;
+            if key == "f4" && alt {
+                return Some(SensitiveCombo::Quit);
+            }
+            if key == "l" && command {
+                return Some(SensitiveCombo::LockScreen);
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = command;
+            if key == "f4" && alt {
+                return Some(SensitiveCombo::Quit);
+            }
+            if key == "l" && control && alt {
+                return Some(SensitiveCombo::LockScreen);
+            }
+        }
+    }
+    None
+}
+
+/// True when the combination is one of the sensitive system shortcuts.
 pub fn key_needs_confirm(keys: &str) -> bool {
-    let Ok(combos) = crate::keys::parse_key_sequence(keys) else {
-        return false;
-    };
-    combos.iter().any(|combo| {
-        let command =
-            combo.modifiers.len() == 1 && combo.modifiers[0] == crate::types::Modifier::Command;
-        let alt = combo.modifiers.len() == 1 && combo.modifiers[0] == crate::types::Modifier::Alt;
-        (command && combo.key.eq_ignore_ascii_case("q"))
-            || (alt && combo.key.eq_ignore_ascii_case("f4"))
-    })
+    sensitive_combo(keys).is_some()
 }
 
 /// Safari, Chrome, Chromium, Edge, Brave, Arc, and Firefox.
@@ -1872,10 +2191,29 @@ mod tests {
         assert!(sensitive_title("Delete Note"));
         assert!(sensitive_title("SEND"));
         assert!(!sensitive_title("Save"));
-        assert!(key_needs_confirm("cmd+q"));
-        assert!(key_needs_confirm("alt+f4"));
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(sensitive_combo("cmd+q"), Some(SensitiveCombo::Quit));
+            assert_eq!(sensitive_combo("cmd+shift+q"), Some(SensitiveCombo::LogOut));
+            assert_eq!(
+                sensitive_combo("ctrl+cmd+q"),
+                Some(SensitiveCombo::LockScreen)
+            );
+            assert_eq!(
+                sensitive_combo("cmd+alt+esc"),
+                Some(SensitiveCombo::ForceQuit)
+            );
+            assert_eq!(
+                sensitive_combo("cmd+shift+delete"),
+                Some(SensitiveCombo::EmptyTrash)
+            );
+            assert!(key_needs_confirm("meta+q"));
+        }
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        {
+            assert!(key_needs_confirm("alt+f4"));
+        }
         assert!(!key_needs_confirm("cmd+s"));
-        assert!(!key_needs_confirm("meta+q"));
         assert!(!event_is_synthetic(1));
         assert!(event_is_synthetic(SYNTHETIC_EVENT_USER_DATA));
     }

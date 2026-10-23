@@ -57,8 +57,22 @@ pub struct StubBackend {
     pub doctor_report: DoctorReport,
     /// Value shown on the stub text node. Tests change it to force a diff.
     pub stub_value: Mutex<String>,
+    /// Per-observation values for `wait`/`verify`. The last value repeats.
+    pub tree_values: Mutex<std::collections::VecDeque<String>>,
+    /// Per-observation element views for `wait`/`verify`. The last value repeats.
+    pub element_views: Mutex<std::collections::VecDeque<Option<crate::element::ElementView>>>,
+    /// OCR blocks the stub returns. `None` keeps the unsupported error.
+    pub ocr_blocks: Mutex<Option<Vec<crate::vision::OcrBlock>>>,
+    /// Window frame/state calls the stub recorded, one line each.
+    pub window_calls: Mutex<Vec<String>>,
+    /// Status the stub reports from `window_status`.
+    pub window_status_fixture: Mutex<crate::target::WindowStatus>,
     /// Frontmost app name the stub reports. `None` means Finder.
     pub frontmost_app: Option<String>,
+    /// Focused element the stub reports for the secure-field guard.
+    pub focused: Mutex<Option<crate::element::ElementPeek>>,
+    /// When true, `peek_focused` returns an error and the caller warns.
+    pub fail_focused: bool,
     /// In-memory tree baselines keyed by session, pid, and window id.
     pub baselines: Mutex<HashMap<(String, i32, u32), SigNode>>,
     /// `type --element` uses `AXValue` when this is true.
@@ -186,7 +200,14 @@ impl Default for StubBackend {
             accessibility_apps: Mutex::new(Vec::new()),
             doctor_report: fixture_doctor(),
             stub_value: Mutex::new("a".into()),
+            tree_values: Mutex::new(std::collections::VecDeque::new()),
+            element_views: Mutex::new(std::collections::VecDeque::new()),
+            ocr_blocks: Mutex::new(None),
+            window_calls: Mutex::new(Vec::new()),
+            window_status_fixture: Mutex::new(crate::target::WindowStatus::default()),
             frontmost_app: Some("Finder".into()),
+            focused: Mutex::new(None),
+            fail_focused: false,
             baselines: Mutex::new(HashMap::new()),
             value_settable: true,
             char_count: None,
@@ -378,6 +399,30 @@ impl DesktopBackend for StubBackend {
         }
     }
 
+    fn peek_focused(
+        &self,
+        _app: Option<&str>,
+        _window: Option<&str>,
+    ) -> Result<Option<crate::element::ElementPeek>, ComputerError> {
+        if self.fail_focused {
+            return Err(ComputerError::ExecutionFailed("focus lookup failed".into()));
+        }
+        Ok(self.focused.lock().expect("focused").clone())
+    }
+
+    fn view_element(
+        &self,
+        _query: &TreeQuery,
+        _index: u32,
+    ) -> Result<Option<crate::element::ElementView>, ComputerError> {
+        let mut queue = self.element_views.lock().expect("element views");
+        if queue.len() > 1 {
+            Ok(queue.pop_front().unwrap_or(None))
+        } else {
+            Ok(queue.front().cloned().flatten())
+        }
+    }
+
     fn inspect_accessibility(&self, app_name: Option<&str>) -> Result<String, ComputerError> {
         self.accessibility_apps
             .lock()
@@ -405,6 +450,58 @@ impl DesktopBackend for StubBackend {
             windows: self.windows.clone(),
             note: None,
         })
+    }
+
+    fn set_window_frame(
+        &self,
+        app: &str,
+        window: Option<&str>,
+        x: Option<f64>,
+        y: Option<f64>,
+        width: Option<f64>,
+        height: Option<f64>,
+    ) -> Result<(), ComputerError> {
+        self.window_calls
+            .lock()
+            .expect("window calls")
+            .push(format!(
+                "frame app={app} window={} x={} y={} width={} height={}",
+                window.unwrap_or("-"),
+                opt_f64(x),
+                opt_f64(y),
+                opt_f64(width),
+                opt_f64(height),
+            ));
+        Ok(())
+    }
+
+    fn set_window_state(
+        &self,
+        app: &str,
+        window: Option<&str>,
+        minimized: Option<bool>,
+        fullscreen: Option<bool>,
+    ) -> Result<(), ComputerError> {
+        self.window_calls
+            .lock()
+            .expect("window calls")
+            .push(format!(
+                "state app={app} window={} minimized={minimized:?} fullscreen={fullscreen:?}",
+                window.unwrap_or("-"),
+            ));
+        Ok(())
+    }
+
+    fn window_status(
+        &self,
+        _app: &str,
+        _window: Option<&str>,
+    ) -> Result<crate::target::WindowStatus, ComputerError> {
+        Ok(self
+            .window_status_fixture
+            .lock()
+            .expect("window status")
+            .clone())
     }
 
     fn launch(&self, app: &str) -> Result<LaunchResult, ComputerError> {
@@ -500,7 +597,17 @@ impl DesktopBackend for StubBackend {
         }
         let (info, window_id, title, _) = self.resolve_tree_target(query)?;
         let pid = info.pid;
-        let value = self.stub_value.lock().expect("stub value").clone();
+        let value = {
+            let mut queue = self.tree_values.lock().expect("tree values");
+            if queue.len() > 1 {
+                queue.pop_front().unwrap_or_default()
+            } else {
+                queue
+                    .front()
+                    .cloned()
+                    .unwrap_or_else(|| self.stub_value.lock().expect("stub value").clone())
+            }
+        };
         let mut window = UiNode::bare("AXWindow");
         window.title = Some(title);
         window.frame = Some(NodeFrame {
@@ -556,6 +663,7 @@ impl DesktopBackend for StubBackend {
             app: request.app.clone(),
             window: request.window.clone(),
             full: false,
+            diff: false,
             session: request.session.clone(),
         };
         if let Some(app) = query.app.as_deref() {
@@ -840,6 +948,7 @@ impl DesktopBackend for StubBackend {
             app: app.map(str::to_string),
             window: window.map(str::to_string),
             full: false,
+            diff: false,
             session: session.map(str::to_string),
         };
         let Ok((info, window_id, _, _)) = self.resolve_tree_target(&query) else {
@@ -1057,6 +1166,12 @@ impl DesktopBackend for StubBackend {
         _image: &image::RgbaImage,
         _map: &crate::image_util::ScreenshotMap,
     ) -> Result<crate::vision::OcrResult, ComputerError> {
+        if let Some(blocks) = self.ocr_blocks.lock().expect("ocr blocks").clone() {
+            return Ok(crate::vision::OcrResult {
+                blocks,
+                note: Some("stub".into()),
+            });
+        }
         Err(ComputerError::Unsupported(
             "ocr is not available in the mock backend".into(),
         ))
@@ -1373,6 +1488,14 @@ fn accessory_app() -> AppInfo {
         active: false,
         hidden: true,
         activation_policy: ActivationPolicy::Accessory,
+    }
+}
+
+fn opt_f64(value: Option<f64>) -> String {
+    match value {
+        Some(value) if value.fract() == 0.0 => format!("{}", value as i64),
+        Some(value) => format!("{value}"),
+        None => "-".into(),
     }
 }
 

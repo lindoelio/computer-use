@@ -126,7 +126,14 @@ pub trait DesktopBackend: Send + Sync {
 
     /// Desktop or region capture plus the map inputs (origin and logical size).
     fn capture_screen(&self, region: Option<Region>) -> Result<RawCapture, ComputerError> {
-        capture::capture_screen(region)
+        #[cfg(target_os = "macos")]
+        {
+            macos::capture_screen(region)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            capture::capture_screen(region)
+        }
     }
 
     /// Capture one window. macOS uses ScreenCaptureKit. Other platforms crop
@@ -306,6 +313,122 @@ pub trait DesktopBackend: Send + Sync {
         {
             let _ = pid;
             Ok(None)
+        }
+    }
+
+    /// Move and/or resize one window. `None` leaves that edge unchanged.
+    ///
+    /// macOS reads `AXPosition`/`AXSize` from the app's `AXWindows`. Windows
+    /// and Linux return `unsupported` until their native layers land.
+    fn set_window_frame(
+        &self,
+        app: &str,
+        window: Option<&str>,
+        x: Option<f64>,
+        y: Option<f64>,
+        width: Option<f64>,
+        height: Option<f64>,
+    ) -> Result<(), ComputerError> {
+        #[cfg(target_os = "macos")]
+        {
+            macos::set_window_frame(app, window, x, y, width, height)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (app, window, x, y, width, height);
+            Err(unsupported("window_move"))
+        }
+    }
+
+    /// Set `AXMinimized`/`AXFullScreen` on one window. `None` leaves it.
+    fn set_window_state(
+        &self,
+        app: &str,
+        window: Option<&str>,
+        minimized: Option<bool>,
+        fullscreen: Option<bool>,
+    ) -> Result<(), ComputerError> {
+        #[cfg(target_os = "macos")]
+        {
+            macos::set_window_state(app, window, minimized, fullscreen)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (app, window, minimized, fullscreen);
+            Err(unsupported("window_state"))
+        }
+    }
+
+    /// Read `AXMinimized`, `AXFullScreen`, `AXMain`, and `AXFocused`.
+    fn window_status(
+        &self,
+        app: &str,
+        window: Option<&str>,
+    ) -> Result<crate::target::WindowStatus, ComputerError> {
+        #[cfg(target_os = "macos")]
+        {
+            macos::window_status(app, window)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (app, window);
+            Err(unsupported("window_status"))
+        }
+    }
+
+    /// Live view of one element from the current tree, for `wait`/`verify`.
+    fn view_element(
+        &self,
+        query: &TreeQuery,
+        index: u32,
+    ) -> Result<Option<crate::element::ElementView>, ComputerError> {
+        #[cfg(target_os = "macos")]
+        {
+            macos::view_element(query, index)
+        }
+        #[cfg(target_os = "windows")]
+        {
+            windows::view_element(query, index)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = (query, index);
+            Ok(None)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+        {
+            let _ = (query, index);
+            Ok(None)
+        }
+    }
+
+    /// Title and secure bit of the focused element, for the secure-field
+    /// guard. `Ok(None)` means the platform cannot read focus (or exposes
+    /// none); callers warn instead of failing.
+    fn peek_focused(
+        &self,
+        app: Option<&str>,
+        window: Option<&str>,
+    ) -> Result<Option<crate::element::ElementPeek>, ComputerError> {
+        #[cfg(target_os = "macos")]
+        {
+            macos::focused_peek(app, window)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            #[cfg(target_os = "windows")]
+            {
+                windows::focused_peek(app, window)
+            }
+            #[cfg(target_os = "linux")]
+            {
+                linux::focused_peek(app, window)
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+            {
+                let _ = (app, window);
+                Ok(None)
+            }
         }
     }
 
