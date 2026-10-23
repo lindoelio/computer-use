@@ -493,6 +493,7 @@ fn protocol_action_names() -> Vec<String> {
         "browser_launch",
         "browser_quit",
         "browser_sessions",
+        "browser_batch",
     ]
     .into_iter()
     .map(String::from)

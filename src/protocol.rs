@@ -776,6 +776,16 @@ pub enum Action {
     /// List managed Chromium sessions.
     #[serde(rename = "browser_sessions", alias = "browser-sessions")]
     BrowserSessions {},
+    /// Run several browser actions in one call. One process, one connection
+    /// per step, and one result array. A nested batch is `invalid_arguments`.
+    #[serde(rename = "browser_batch", alias = "browser-batch")]
+    BrowserBatch {
+        /// Browser actions. Each entry uses the native `action` tag.
+        actions: Vec<Action>,
+        /// Stop at the first failure. Default true.
+        #[serde(default = "default_true", skip_serializing_if = "is_true")]
+        stop_on_error: bool,
+    },
     /// Run OCR on the most recent capture for `--app`/window target. macOS
     /// only. Linux returns `unsupported`; Windows is a stub until P12.
     #[serde(rename = "ocr")]
@@ -788,6 +798,10 @@ pub enum Action {
 
 fn default_true() -> bool {
     true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 fn is_zero_f64(value: &f64) -> bool {
@@ -904,6 +918,8 @@ pub struct CallContext {
     pub browser_blocked_urls: Vec<String>,
     /// What to do when a JavaScript dialog opens: `accept`, `dismiss`, `fail`.
     pub on_dialog: Option<String>,
+    /// Visible agent marker: `auto`, `on`, `off`.
+    pub agent_overlay: Option<String>,
 }
 
 /// A JSON request: an optional `id`, shared flags, and an [`Action`].
@@ -964,6 +980,7 @@ fn take_context(object: &mut Map<String, Value>) -> Result<CallContext, Computer
         cdp_url: take_stringish(object, "cdp_url")?,
         browser_blocked_urls: take_string_list(object, "browser_blocked_urls")?,
         on_dialog: take_stringish(object, "on_dialog")?,
+        agent_overlay: take_stringish(object, "agent_overlay")?,
     })
 }
 
@@ -1064,6 +1081,8 @@ pub struct LineOptions<'a> {
     pub cdp_url: Option<&'a str>,
     /// Process `--on-dialog` flag. A request field wins.
     pub on_dialog: Option<&'a str>,
+    /// Process `--agent-overlay` flag. A request field wins.
+    pub agent_overlay: Option<&'a str>,
 }
 
 /// Decode one JSON line. `cli_adapter` is the process `--adapter` flag.
@@ -1118,6 +1137,11 @@ pub fn handle_request_line_opts(line: &str, options: LineOptions<'_>) -> Respons
             if request.context.on_dialog.is_none() {
                 if let Some(mode) = options.on_dialog {
                     request.context.on_dialog = Some(mode.to_string());
+                }
+            }
+            if request.context.agent_overlay.is_none() {
+                if let Some(mode) = options.agent_overlay {
+                    request.context.agent_overlay = Some(mode.to_string());
                 }
             }
             dispatch_context(request.action, &request.context).with_id(request.id)
@@ -1685,6 +1709,7 @@ fn action_label(action: &Action) -> &'static str {
         Action::BrowserLaunch { .. } => "browser_launch",
         Action::BrowserQuit { .. } => "browser_quit",
         Action::BrowserSessions {} => "browser_sessions",
+        Action::BrowserBatch { .. } => "browser_batch",
         Action::Ocr { .. } => "ocr",
     }
 }
@@ -2231,6 +2256,7 @@ fn post_state_kind(action: &Action) -> PostKind {
         | Action::BrowserTabClose { .. }
         | Action::BrowserLaunch { .. }
         | Action::BrowserQuit { .. }
+        | Action::BrowserBatch { .. }
         | Action::Ocr { .. } => PostKind::Mutating,
         Action::GetState
         | Action::Wait { .. }
@@ -7461,6 +7487,7 @@ fn is_browser_action(action: &Action) -> bool {
             | Action::BrowserLaunch { .. }
             | Action::BrowserQuit { .. }
             | Action::BrowserSessions {}
+            | Action::BrowserBatch { .. }
     )
 }
 
@@ -7484,6 +7511,10 @@ fn browser_options(
         on_dialog: match context.on_dialog.as_deref() {
             Some(value) => crate::browser::DialogMode::parse(value)?,
             None => crate::browser::DialogMode::Dismiss,
+        },
+        agent_overlay: match context.agent_overlay.as_deref() {
+            Some(value) => crate::browser::AgentOverlay::parse(value)?,
+            None => crate::browser::AgentOverlay::Auto,
         },
     })
 }
@@ -7738,6 +7769,24 @@ fn browser_command(
             purge: *purge,
         },
         Action::BrowserSessions {} => BrowserCommand::Sessions,
+        Action::BrowserBatch {
+            actions,
+            stop_on_error,
+        } => {
+            let mut steps = Vec::with_capacity(actions.len());
+            for step in actions {
+                if matches!(step, Action::BrowserBatch { .. }) {
+                    return Err(ComputerError::InvalidArguments(
+                        "nested browser batch is not allowed".into(),
+                    ));
+                }
+                steps.push(browser_command(step, context)?);
+            }
+            BrowserCommand::Batch {
+                steps,
+                stop_on_error: *stop_on_error,
+            }
+        }
         _ => {
             return Err(ComputerError::InvalidArguments(format!(
                 "{} is not a browser action",

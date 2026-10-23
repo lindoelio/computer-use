@@ -71,6 +71,7 @@ These flags apply to every subcommand. The JSON equivalents are sibling keys of 
 | `--cdp` | `cdp` | off | Route `browser` commands through Chrome DevTools Protocol. The release binaries include the feature; a default `cargo install` needs `--features cdp`. |
 | `--cdp-url <URL>` | `cdp_url` | argv discovery / managed session | Override the discovered CDP endpoint. |
 | `--on-dialog <MODE>` | `on_dialog` | dismiss | Browser dialog policy: accept, dismiss, or fail. |
+| `--agent-overlay <MODE>` | `agent_overlay` | auto | Browser agent marker: auto, on, or off. |
 | `--display <ID\|VIRTUAL>` | `display` | all | Restrict capture and coordinate conversion to one monitor id from `displays`. `--display virtual` is the Linux Xvfb recipe. |
 | `--exec <CMD>...` | n/a | none | With `--display virtual`, replace this process with a command inside the prepared environment (`DISPLAY=:99`). |
 
@@ -672,6 +673,7 @@ Commands:
   launch       Start a managed Chromium with an isolated profile.
   quit         Stop a managed Chromium (`--purge` removes the profile).
   sessions     List managed Chromium sessions.
+  batch        Run several browser actions in one call.
 ```
 
 Attach mode stays the default. `--cdp-url` wins; otherwise the port is
@@ -707,10 +709,18 @@ browser tab-close  --target <TARGET>
 browser launch     [--browser <NAME|PATH>] [--headless] [--profile <DIR>] [--port <PORT>] [--url <URL>]
 browser quit       [--session <ID>] [--purge]
 browser sessions
+browser batch      '<JSON>' [--continue-on-error]
 ```
 
 `--wait` accepts `none`, `load` (default), `domcontentloaded`, `networkidle`,
 `selector:<css>`, or `url:<glob>`. `--timeout-ms` defaults to 30000.
+`browser batch` takes a JSON array of native browser actions and runs them in
+one process, so a whole flow is one call: `computer-use --cdp browser batch
+'[{"action":"browser_navigate","url":"https://example.com"},{"action":"browser_snapshot"}]'`.
+
+The global `--agent-overlay auto|on|off` controls the visible agent marker:
+a badge, a cursor ring that follows click/type/hover/scroll, and a tab title
+prefixed with 🤖. `auto` is on for `browser launch` and off for an attach.
 
 The CLI flag is `--cdp` and the JSON field is `cdp: true`. A binary built
 without the feature returns `unsupported`; without `--cdp` the CLI returns
@@ -794,6 +804,7 @@ The protocol is `src/protocol.rs::Action`. The tag is `action`; the rename rule 
 | `browser_launch` | `browser`, `headless`, `profile`, `port`, `url` | `cdp` feature. |
 | `browser_quit` | `session`, `purge` | `cdp` feature. |
 | `browser_sessions` | none | `cdp` feature. |
+| `browser_batch` | `actions`, `stop_on_error` | `cdp` feature. |
 
 `adapter` values:
 

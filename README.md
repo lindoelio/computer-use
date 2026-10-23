@@ -297,6 +297,7 @@ The `Action` enum in `src/protocol.rs` is the protocol. `id` is echoed on the re
 | `browser_launch` | `browser`, `headless`, `profile`, `port`, `url` | `cdp` feature. Starts a managed Chromium with an isolated profile. |
 | `browser_quit` | `session`, `purge` | `cdp` feature. |
 | `browser_sessions` | none | `cdp` feature. |
+| `browser_batch` | `actions`, `stop_on_error` | `cdp` feature. One process for a whole flow. |
 
 ```json
 {"id":1,"action":"click","x":10,"y":20,"button":"left"}

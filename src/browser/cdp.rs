@@ -11,7 +11,9 @@
 
 use std::time::{Duration, Instant};
 
-use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
+use chromiumoxide::cdp::browser_protocol::page::{
+    AddScriptToEvaluateOnNewDocumentParams, CaptureScreenshotFormat,
+};
 use chromiumoxide::cdp::browser_protocol::target::TargetId;
 use chromiumoxide::{Browser, Page};
 use futures::StreamExt;
@@ -394,6 +396,80 @@ fn spawn_dialog_handler(page: &Page, mode: crate::browser::DialogMode) {
     });
 }
 
+/// The visible agent marker. It is idempotent: the guard stops a second
+/// injection from stacking badges or double-prefixing the title.
+const AGENT_MARKER_JS: &str = r##"(() => {
+  if (window.__cuAgentMarker) return;
+  window.__cuAgentMarker = true;
+  const install = () => {
+    if (!document.documentElement || document.getElementById('__cu-agent-host')) return;
+    const host = document.createElement('div');
+    host.id = '__cu-agent-host';
+    host.style.cssText = 'all:initial;position:fixed;inset:auto 16px 16px auto;z-index:2147483647;pointer-events:none;';
+    const root = host.attachShadow({mode: 'open'});
+    root.innerHTML = '<style>' +
+      '.badge{font:600 12px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;color:#fff;background:rgba(17,17,17,.82);padding:6px 10px;border-radius:999px;display:flex;align-items:center;gap:6px;box-shadow:0 2px 12px rgba(0,0,0,.35)}' +
+      '.dot{width:8px;height:8px;border-radius:50%;background:#34d399;animation:cu-pulse 1.6s infinite}' +
+      '@keyframes cu-pulse{0%{box-shadow:0 0 0 0 rgba(52,211,153,.7)}70%{box-shadow:0 0 0 8px rgba(52,211,153,0)}100%{box-shadow:0 0 0 0 rgba(52,211,153,0)}}' +
+      '.ring{position:fixed;left:0;top:0;width:28px;height:28px;margin:-14px 0 0 -14px;border:2px solid rgba(52,211,153,.9);border-radius:50%;box-shadow:0 0 0 6px rgba(52,211,153,.18);opacity:0;transform:scale(.6);transition:transform .15s ease,opacity .15s ease;pointer-events:none}' +
+      '.ring.on{opacity:1;transform:scale(1)}' +
+      '.ring.click{transform:scale(.75);background:rgba(52,211,153,.25)}' +
+      '</style><div class="badge"><span class="dot"></span>computer-use agent</div><div class="ring"></div>';
+    document.documentElement.appendChild(host);
+    const ring = root.querySelector('.ring');
+    window.__cuAgent = {
+      move(x, y, kind) {
+        ring.style.left = x + 'px';
+        ring.style.top = y + 'px';
+        ring.classList.add('on');
+        ring.classList.toggle('click', kind === 'click');
+        clearTimeout(window.__cuAgent._t);
+        window.__cuAgent._t = setTimeout(() => ring.classList.remove('on', 'click'), kind === 'click' ? 900 : 1400);
+      },
+      hide() { ring.classList.remove('on', 'click'); }
+    };
+    if (!document.title.startsWith('\u{1F916} ')) document.title = '\u{1F916} ' + document.title;
+    const title = document.querySelector('title');
+    if (title) {
+      new MutationObserver(() => {
+        if (!document.title.startsWith('\u{1F916} ')) document.title = '\u{1F916} ' + document.title;
+      }).observe(title, {childList: true, characterData: true, subtree: true});
+    }
+  };
+  if (document.documentElement) install();
+  else document.addEventListener('DOMContentLoaded', install, {once: true});
+})();"##;
+
+/// Whether the endpoint is the newest managed `browser launch` session.
+fn endpoint_is_managed(options: &BrowserOptions) -> bool {
+    if options.debug_url.is_some() || options.app_pid.is_some() {
+        return false;
+    }
+    launch::list_records()
+        .ok()
+        .and_then(|records| records.into_iter().next_back())
+        .map(|record| crate::cache::pid_alive(record.pid))
+        .unwrap_or(false)
+}
+
+fn marker_enabled(options: &BrowserOptions) -> bool {
+    match options.agent_overlay {
+        crate::browser::AgentOverlay::On => true,
+        crate::browser::AgentOverlay::Off => false,
+        crate::browser::AgentOverlay::Auto => endpoint_is_managed(options),
+    }
+}
+
+async fn install_agent_marker(browser: &Browser, page: &Page) {
+    let params = AddScriptToEvaluateOnNewDocumentParams::builder()
+        .source(AGENT_MARKER_JS)
+        .run_immediately(true)
+        .build()
+        .expect("marker params");
+    let _ = browser.execute(params).await;
+    let _ = actions::evaluate(page, AGENT_MARKER_JS, false).await;
+}
+
 /// Run an async closure with a connected browser and a resolved page.
 pub fn run_page<T, F, Fut>(
     options: &BrowserOptions,
@@ -413,6 +489,9 @@ where
             return Err(ComputerError::BlockedUrl(format!(
                 "current page matched {pattern}"
             )));
+        }
+        if marker_enabled(options) {
+            install_agent_marker(&browser, &page).await;
         }
         if dialog_mode != crate::browser::DialogMode::Fail {
             spawn_dialog_handler(&page, dialog_mode);
@@ -1470,6 +1549,38 @@ pub fn dispatch(command: BrowserCommand, options: &BrowserOptions) -> Result<Val
                     "script_hash": script_hash,
                 }))
             })
+        }
+        BrowserCommand::Batch {
+            steps,
+            stop_on_error,
+        } => {
+            let mut results = Vec::new();
+            let mut failed = 0usize;
+            for (index, step) in steps.into_iter().enumerate() {
+                match dispatch(step, options) {
+                    Ok(value) => results.push(json!({"ok": true, "result": value})),
+                    Err(error) => {
+                        failed += 1;
+                        results.push(json!({
+                            "ok": false,
+                            "error": {"code": error.code(), "message": error.to_string()},
+                        }));
+                        if stop_on_error {
+                            return Ok(json!({
+                                "results": results,
+                                "count": results.len(),
+                                "failed": failed,
+                                "stopped_at": index,
+                            }));
+                        }
+                    }
+                }
+            }
+            Ok(json!({
+                "results": results,
+                "count": results.len(),
+                "failed": failed,
+            }))
         }
     }
 }

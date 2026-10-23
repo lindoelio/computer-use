@@ -291,6 +291,13 @@ async fn actionability(
     Ok(())
 }
 
+/// Move the visible agent ring when the page has the marker installed.
+/// The call is a no-op when `window.__cuAgent` is absent.
+async fn move_marker(page: &Page, x: f64, y: f64, kind: &str) {
+    let expression = format!("window.__cuAgent && window.__cuAgent.move({x}, {y}, '{kind}')");
+    let _ = evaluate(page, &expression, false).await;
+}
+
 fn cdp_button(button: MouseButton) -> CdpMouseButton {
     match button {
         MouseButton::Left => CdpMouseButton::Left,
@@ -322,6 +329,7 @@ pub async fn click(
     actionability(page, handle, force).await?;
     scroll_into_view(page, handle).await?;
     let (x, y) = box_center(page, handle).await?;
+    move_marker(page, x, y, "click").await;
     for index in 1..=count.max(1) {
         let pressed = DispatchMouseEventParams::builder()
             .r#type(DispatchMouseEventType::MousePressed)
@@ -379,6 +387,9 @@ pub async fn type_text(
         ));
     }
     scroll_into_view(page, handle).await?;
+    if let Ok((x, y)) = box_center(page, handle).await {
+        move_marker(page, x, y, "type").await;
+    }
     call_on(
         page,
         handle,
@@ -456,6 +467,7 @@ pub async fn press(page: &Page, combo: &str) -> Result<(), ComputerError> {
 pub async fn hover(page: &Page, handle: &ElementHandle) -> Result<(), ComputerError> {
     scroll_into_view(page, handle).await?;
     let (x, y) = box_center(page, handle).await?;
+    move_marker(page, x, y, "hover").await;
     let moved = DispatchMouseEventParams::builder()
         .r#type(DispatchMouseEventType::MouseMoved)
         .x(x)
@@ -487,6 +499,7 @@ pub async fn scroll(
     .unwrap_or_else(|_| json!({"x": 0.0, "y": 0.0}));
     let x = center.get("x").and_then(Value::as_f64).unwrap_or(0.0);
     let y = center.get("y").and_then(Value::as_f64).unwrap_or(0.0);
+    move_marker(page, x, y, "scroll").await;
     let params = DispatchMouseEventParams::builder()
         .r#type(DispatchMouseEventType::MouseWheel)
         .x(x)

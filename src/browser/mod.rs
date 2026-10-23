@@ -42,6 +42,35 @@ pub struct BrowserOptions {
     pub session: Option<String>,
     /// What to do when a JavaScript dialog opens.
     pub on_dialog: DialogMode,
+    /// Visible agent marker in the page: badge, cursor ring, tab title prefix.
+    pub agent_overlay: AgentOverlay,
+}
+
+/// When to show the visible agent marker in the page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentOverlay {
+    /// On for a managed browser, off for an attach.
+    #[default]
+    Auto,
+    /// Always inject the badge, cursor ring, and tab title prefix.
+    On,
+    /// Never inject it.
+    Off,
+}
+
+impl AgentOverlay {
+    /// Parse `auto`, `on`, or `off`.
+    pub fn parse(value: &str) -> Result<Self, ComputerError> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "on" => Ok(Self::On),
+            "off" => Ok(Self::Off),
+            other => Err(ComputerError::InvalidArguments(format!(
+                "agent-overlay must be auto, on, or off (got {other})"
+            ))),
+        }
+    }
 }
 
 /// JavaScript dialog policy for actions that might open one.
@@ -291,6 +320,11 @@ pub enum BrowserCommand {
     },
     /// List managed Chromium sessions.
     Sessions,
+    /// Run several browser commands in one call.
+    Batch {
+        steps: Vec<BrowserCommand>,
+        stop_on_error: bool,
+    },
 }
 
 /// Screenshot format for `browser screenshot`.

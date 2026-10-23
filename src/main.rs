@@ -139,6 +139,11 @@ struct Cli {
     #[arg(long, global = true, value_name = "accept|dismiss|fail")]
     on_dialog: Option<String>,
 
+    /// Show a visible agent marker in a browser page: a badge, a cursor ring,
+    /// and a tab title prefix. auto is on for `browser launch`, off for attach.
+    #[arg(long, global = true, value_name = "auto|on|off")]
+    agent_overlay: Option<String>,
+
     /// Restrict capture and coordinate conversion to one monitor id from
     /// `displays`. Points stay virtual-desktop points, and a point outside the
     /// monitor is `invalid_arguments`.
@@ -1157,6 +1162,20 @@ enum CliBrowserCommand {
 
     /// List managed Chromium sessions.
     Sessions,
+
+    /// Run several browser actions in one call.
+    ///
+    /// The argument is a JSON array of native browser actions, or an object
+    /// with an `actions` array. One process and one permission prompt for the
+    /// whole flow.
+    Batch {
+        /// JSON array of browser actions, or `{"actions":[...]}`.
+        #[arg(value_name = "JSON")]
+        json: String,
+        /// Continue after a failed step instead of stopping.
+        #[arg(long)]
+        continue_on_error: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1437,6 +1456,7 @@ fn run() -> u8 {
                 cdp: cli.cdp,
                 cdp_url: cli.cdp_url.clone(),
                 on_dialog: cli.on_dialog.clone(),
+                agent_overlay: cli.agent_overlay.clone(),
                 display: cli.display.clone(),
                 ..CallContext::default()
             };
@@ -2016,6 +2036,37 @@ fn browser_action(
             purge: *purge,
         },
         CliBrowserCommand::Sessions => Action::BrowserSessions {},
+        CliBrowserCommand::Batch {
+            json,
+            continue_on_error,
+        } => {
+            let value: serde_json::Value = serde_json::from_str(json).map_err(|error| {
+                Response::failure(
+                    "invalid_arguments",
+                    format!("browser batch needs JSON: {error}"),
+                )
+            })?;
+            let actions_value = if value.is_array() {
+                value
+            } else if let Some(actions) = value.get("actions") {
+                actions.clone()
+            } else {
+                return Err(Response::failure(
+                    "invalid_arguments",
+                    "browser batch needs a JSON array or an object with an actions array",
+                ));
+            };
+            let actions: Vec<Action> = serde_json::from_value(actions_value).map_err(|error| {
+                Response::failure(
+                    "invalid_arguments",
+                    format!("browser batch actions are invalid: {error}"),
+                )
+            })?;
+            Action::BrowserBatch {
+                actions,
+                stop_on_error: !*continue_on_error,
+            }
+        }
     };
     Ok(action)
 }
@@ -2072,6 +2123,7 @@ fn line_options(cli: &Cli) -> LineOptions<'_> {
         cdp: cli.cdp,
         cdp_url: cli.cdp_url.as_deref(),
         on_dialog: cli.on_dialog.as_deref(),
+        agent_overlay: cli.agent_overlay.as_deref(),
     }
 }
 

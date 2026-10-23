@@ -352,6 +352,58 @@ fn type_and_secure_field_refusal() {
 }
 
 #[test]
+fn browser_batch_runs_steps_in_one_call() {
+    if chrome_binary().is_none() {
+        eprintln!("skipping live CDP test: no Chromium binary found");
+        return;
+    }
+    let fixture = fixture();
+    let _guard = fixture.lock.lock().expect("test lock");
+    let url = base_url();
+    let steps = format!(
+        r##"[{{"action":"browser_navigate","url":{url:?},"wait":"load"}},{{"action":"browser_click","selector":"#hello","wait":"none"}},{{"action":"browser_text","selector":"#out"}}]"##
+    );
+    let response = run_cdp(&["browser", "batch", &steps]);
+    assert_eq!(response["ok"], true, "{response}");
+    assert_eq!(response["count"], 3, "{response}");
+    assert_eq!(response["failed"], 0, "{response}");
+    assert_eq!(
+        response["results"][2]["result"]["text"], "clicked",
+        "{response}"
+    );
+}
+
+#[test]
+fn agent_marker_is_visible() {
+    if chrome_binary().is_none() {
+        eprintln!("skipping live CDP test: no Chromium binary found");
+        return;
+    }
+    let fixture = fixture();
+    let _guard = fixture.lock.lock().expect("test lock");
+    let url = base_url();
+    let response = run_cdp(&["browser", "navigate", "--url", &url, "--wait", "load"]);
+    assert_eq!(response["ok"], true, "{response}");
+    let response = run_cdp(&[
+        "--agent-overlay",
+        "on",
+        "browser",
+        "eval",
+        "--eval",
+        "(() => ({host: document.getElementById('__cu-agent-host') !== null, title: document.title}))()",
+    ]);
+    assert_eq!(response["ok"], true, "{response}");
+    assert_eq!(response["result"]["host"], true, "{response}");
+    assert!(
+        response["result"]["title"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with('\u{1F916}'),
+        "title was not prefixed: {response}"
+    );
+}
+
+#[test]
 fn blocked_url_is_refused_before_connecting() {
     if chrome_binary().is_none() {
         eprintln!("skipping live CDP test: no Chromium binary found");
