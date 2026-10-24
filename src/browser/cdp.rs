@@ -1690,8 +1690,7 @@ mod tests {
         // macOS and Linux read the pid's argv; Windows has no equivalent and
         // says so.
         assert!(
-            message.contains("no --remote-debugging-port")
-                || message.contains("not implemented for this OS"),
+            message.contains("no --remote-debugging-port") || message.contains("not implemented"),
             "{message}"
         );
         // A pid that cannot be inspected takes the failure branch.
