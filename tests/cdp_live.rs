@@ -55,7 +55,13 @@ impl Drop for Browser {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.profile);
+        // A Chrome profile is thousands of small files, and removing them is
+        // slow on Windows. Clean it up off the test's thread so the suite
+        // does not wait for the file system.
+        let profile = self.profile.clone();
+        std::thread::spawn(move || {
+            let _ = std::fs::remove_dir_all(&profile);
+        });
     }
 }
 
@@ -713,14 +719,9 @@ impl Drop for ManagedQuit {
     fn drop(&mut self) {
         let mut command = Command::new(bin());
         command
-            .args([
-                "--cdp",
-                "browser",
-                "quit",
-                "--session",
-                &self.session,
-                "--purge",
-            ])
+            // No `--purge`: deleting a whole Chrome profile takes minutes on
+            // the Windows runner.
+            .args(["--cdp", "browser", "quit", "--session", &self.session])
             .env("XDG_CACHE_HOME", &self.cache)
             .env("XDG_CONFIG_HOME", &self.cache)
             .env("XDG_STATE_HOME", &self.cache)
@@ -778,7 +779,9 @@ fn managed_launch_sessions_and_quit() {
         "{sessions}"
     );
 
-    let quit = run_cdp(&["browser", "quit", "--session", &session, "--purge"]);
+    // No `--purge` here: deleting a whole Chrome profile takes minutes on
+    // the Windows runner. The session record is removed either way.
+    let quit = run_cdp(&["browser", "quit", "--session", &session]);
     assert_eq!(quit["ok"], true, "{quit}");
     assert_eq!(quit["session"], session.as_str(), "{quit}");
 

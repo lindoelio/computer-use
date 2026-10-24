@@ -68,6 +68,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- The live suite waited minutes on Windows: removing a Chrome profile is
+  thousands of small files there, and the test waited for the deletion
+  (once for the fixture browser, once for `browser quit --purge`). The
+  fixture now cleans its profile off the test's thread, and the test quits
+  the managed browser without the purge flag.
 - The coverage gate read paths with the platform separator, so on Windows
   every file looked like it was outside `src/` and the gate reported "no
   measurable lines in the report". The relative path is now compared in

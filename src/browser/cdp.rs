@@ -1686,9 +1686,13 @@ mod tests {
     fn discover_debug_port_reports_a_clean_error() {
         let self_pid = i32::try_from(std::process::id()).expect("pid fits i32");
         let error = discover_debug_port(self_pid).unwrap_err();
+        let message = error.to_string();
+        // macOS and Linux read the pid's argv; Windows has no equivalent and
+        // says so.
         assert!(
-            error.to_string().contains("no --remote-debugging-port"),
-            "{error}"
+            message.contains("no --remote-debugging-port")
+                || message.contains("not implemented for this OS"),
+            "{message}"
         );
         // A pid that cannot be inspected takes the failure branch.
         assert!(discover_debug_port(-1).is_err());
