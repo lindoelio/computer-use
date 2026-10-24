@@ -9,12 +9,15 @@ reports it on Linux and Windows.
 ```bash
 rustup component add llvm-tools-preview
 cargo install cargo-llvm-cov          # or: brew install cargo-llvm-cov
+export COMPUTER_USE_REQUIRE_LIVE=1    # the live CDP suite is part of the 95%
 cargo llvm-cov --all-targets --all-features --json --output-path cov.json
 python3 scripts/coverage-gate.py cov.json --os macos
 ```
 
-`cov.json` is not committed. `--mode report` prints the same numbers without
-failing, which is what the Linux and Windows jobs do for now.
+`cov.json` is not committed. Without `COMPUTER_USE_REQUIRE_LIVE=1` the live
+CDP tests skip and the measured set falls below the floor; CI installs Chrome
+and sets the variable for the same reason. `--mode report` prints the numbers
+without failing, which is what the Linux and Windows jobs do for now.
 
 ## Policy
 
