@@ -611,6 +611,19 @@ fn render_text(report: &DoctorReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn push_note_appends_and_ignores_blank_text() {
+        let mut report = crate::target::DoctorReport::blank();
+        push_note(&mut report, "   ");
+        assert!(report.note.is_none());
+        push_note(&mut report, "first");
+        assert_eq!(report.note.as_deref(), Some("first"));
+        assert_eq!(report.text, "first");
+        push_note(&mut report, "second");
+        assert_eq!(report.note.as_deref(), Some("first; second"));
+        assert_eq!(report.text, "first\nsecond");
+    }
     use serde_json::json;
 
     struct CountingProbe {

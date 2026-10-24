@@ -846,12 +846,10 @@ mod tests {
     /// End-to-end smoke: render a known label into an RGBA buffer with a
     /// small embedded 5x7 bitmap font, run the real Vision pipeline through
     /// the public entry point, and assert the top candidate contains the
-    /// label text. Skipped on CI / headless (no display context, Vision may
-    /// still work but text rendering and disk read of fixtures is enough —
-    /// run locally with `cargo test --release`).
+    /// label text. Vision needs no TCC grant, so this runs on the macOS
+    /// runner as a normal test.
     #[cfg(target_os = "macos")]
     #[test]
-    #[ignore = "requires a live Vision framework; run locally with `cargo test --release vision_recognizes_drawn_text -- --ignored --nocapture`"]
     fn vision_recognizes_drawn_text() {
         use image::{Rgba, RgbaImage};
 

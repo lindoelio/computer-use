@@ -414,6 +414,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn region_object_visitor_reports_missing_and_invalid_fields() {
+        let missing_height = serde_json::from_str::<Region>(r#"{"x":1,"y":2,"width":3}"#);
+        assert!(missing_height.is_err());
+        let zero_width = serde_json::from_str::<Region>(r#"{"x":1,"y":2,"width":0,"height":4}"#);
+        assert!(zero_width.is_err());
+        let negative_y = serde_json::from_str::<Region>(r#"{"x":1,"y":-2,"width":3,"height":4}"#);
+        assert!(negative_y.is_ok(), "negative origins are valid");
+    }
+
+    #[test]
+    fn frame_debug_names_the_dimensions_not_the_pixels() {
+        let frame = Frame::new(4, 2, 2.0, vec![0u8; 4 * 2 * 4]).unwrap();
+        let text = format!("{frame:?}");
+        assert!(text.contains("width: 4"), "{text}");
+        assert!(text.contains("height: 2"), "{text}");
+        assert!(text.contains("scale: 2.0"), "{text}");
+        assert!(!text.contains("0, 0, 0"), "pixels stay out of Debug");
+    }
+
+    #[test]
     fn parse_region_accepts_whitespace_and_rejects_bad_shapes() {
         let region = parse_region(" 10, 20, 30, 40 ").unwrap();
         assert_eq!(

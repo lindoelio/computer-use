@@ -202,6 +202,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn named_keys_and_function_keys_parse() {
+        let named = [
+            ("enter", "Enter", 13),
+            ("tab", "Tab", 9),
+            ("esc", "Escape", 27),
+            ("backspace", "Backspace", 8),
+            ("delete", "Delete", 46),
+            ("space", " ", 32),
+            ("up", "ArrowUp", 38),
+            ("down", "ArrowDown", 40),
+            ("left", "ArrowLeft", 37),
+            ("right", "ArrowRight", 39),
+            ("home", "Home", 36),
+            ("end", "End", 35),
+            ("pageup", "PageUp", 33),
+            ("pagedown", "PageDown", 34),
+            ("insert", "Insert", 45),
+            ("capslock", "CapsLock", 20),
+        ];
+        for (token, key, vk) in named {
+            let stroke = parse(token).unwrap_or_else(|error| panic!("{token}: {error}"));
+            assert_eq!(stroke.key, key, "{token}");
+            assert_eq!(stroke.virtual_key_code, vk, "{token}");
+        }
+        for number in 1..=12 {
+            let stroke = parse(&format!("f{number}")).unwrap();
+            assert_eq!(stroke.key, format!("F{number}"));
+            assert_eq!(stroke.virtual_key_code, 111 + i64::from(number));
+        }
+        assert!(parse("f13").is_err());
+        assert!(parse("f0").is_err());
+        assert!(parse("ctrl+shift+tab").is_ok());
+    }
+
+    #[test]
     fn named_keys_and_modifiers_parse() {
         let stroke = parse("ctrl+shift+Tab").unwrap();
         assert_eq!(stroke.key, "Tab");

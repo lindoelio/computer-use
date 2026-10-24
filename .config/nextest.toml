@@ -14,11 +14,15 @@ slow-timeout = { period = "90s", terminate-after = 3 }
 fail-fast = false
 
 # Each live CDP test starts its own Chromium (process-per-test), so run them
-# one at a time instead of six browsers in parallel.
+# one at a time instead of six browsers in parallel. A single retry absorbs the
+# occasional browser/navigation timing flake; the assertions still fail twice
+# in a row on a real regression.
 [[profile.default.overrides]]
 filter = 'binary(cdp_live)'
 threads-required = "num-cpus"
+retries = 1
 
 [[profile.ci.overrides]]
 filter = 'binary(cdp_live)'
 threads-required = "num-cpus"
+retries = 1

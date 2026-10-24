@@ -35,6 +35,10 @@ const INDEX: &str = r#"<!doctype html>
   <label><input id="agree" type="checkbox" /> Agree</label>
   <label for="password">Password</label>
   <input id="password" type="password" />
+  <label for="file">File</label>
+  <input id="file" type="file" />
+  <button id="alert" onclick="alert('hi')">Alert</button>
+  <div id="scrollbox" style="height:60px;overflow:auto;border:1px solid #000"><div style="height:300px">tall content</div></div>
   <a id="next" href="/next.html">Next page</a>
 </body></html>"#;
 
@@ -443,6 +447,449 @@ fn blocked_url_is_refused_before_connecting() {
     ]);
     assert_eq!(response["ok"], false, "{response}");
     assert_eq!(response["error"]["code"], "blocked_url", "{response}");
+}
+
+/// Press, hover, scroll, select, and check against a live page.
+#[test]
+fn press_hover_scroll_select_and_check() {
+    skip_without_chrome!();
+    let fixture = fixture();
+    let _guard = fixture.lock.lock().expect("test lock");
+    let url = base_url();
+    let nav = run_cdp(&["browser", "navigate", "--url", &url, "--wait", "load"]);
+    assert_eq!(nav["ok"], true, "{nav}");
+
+    let hover = run_cdp(&["browser", "hover", "--selector", "#hello"]);
+    assert_eq!(hover["ok"], true, "{hover}");
+
+    let page_press = run_cdp(&["browser", "press", "--keys", "Tab"]);
+    assert_eq!(page_press["ok"], true, "{page_press}");
+    let element_press = run_cdp(&["browser", "press", "--selector", "#name", "--keys", "a"]);
+    assert_eq!(element_press["ok"], true, "{element_press}");
+
+    let page_scroll = run_cdp(&["browser", "scroll", "--dy", "100"]);
+    assert_eq!(page_scroll["ok"], true, "{page_scroll}");
+    let box_scroll = run_cdp(&[
+        "browser",
+        "scroll",
+        "--selector",
+        "#scrollbox",
+        "--dy",
+        "50",
+    ]);
+    assert_eq!(box_scroll["ok"], true, "{box_scroll}");
+
+    let by_value = run_cdp(&[
+        "browser",
+        "select",
+        "--selector",
+        "#country",
+        "--value",
+        "pt",
+    ]);
+    assert_eq!(by_value["ok"], true, "{by_value}");
+    let by_label = run_cdp(&[
+        "browser",
+        "select",
+        "--selector",
+        "#country",
+        "--label",
+        "Brazil",
+    ]);
+    assert_eq!(by_label["ok"], true, "{by_label}");
+    let selected = run_cdp(&[
+        "browser",
+        "eval",
+        "--eval",
+        "document.getElementById('country').value",
+    ]);
+    assert_eq!(selected["result"], "br", "{selected}");
+
+    let checked = run_cdp(&["browser", "check", "--selector", "#agree"]);
+    assert_eq!(checked["ok"], true, "{checked}");
+    let unchecked = run_cdp(&["browser", "check", "--selector", "#agree", "--unchecked"]);
+    assert_eq!(unchecked["ok"], true, "{unchecked}");
+    let state = run_cdp(&[
+        "browser",
+        "eval",
+        "--eval",
+        "document.getElementById('agree').checked",
+    ]);
+    assert_eq!(state["result"], false, "{state}");
+}
+
+/// Upload, screenshot, eval, dialogs, and tab lifecycle.
+#[test]
+fn upload_screenshot_eval_dialog_and_tabs() {
+    skip_without_chrome!();
+    let fixture = fixture();
+    let _guard = fixture.lock.lock().expect("test lock");
+    let url = base_url();
+    let nav = run_cdp(&["browser", "navigate", "--url", &url, "--wait", "load"]);
+    assert_eq!(nav["ok"], true, "{nav}");
+
+    let upload_path = fixture.cache.join("upload.txt");
+    std::fs::write(&upload_path, "hello").expect("upload fixture");
+    let upload = run_cdp(&[
+        "browser",
+        "upload",
+        "--selector",
+        "#file",
+        "--file",
+        upload_path.to_str().unwrap(),
+    ]);
+    assert_eq!(upload["ok"], true, "{upload}");
+    let count = run_cdp(&[
+        "browser",
+        "eval",
+        "--eval",
+        "document.getElementById('file').files.length",
+    ]);
+    assert_eq!(count["result"], 1, "{count}");
+
+    let shot_path = fixture.cache.join("live-shot.png");
+    let shot = run_cdp(&[
+        "browser",
+        "screenshot",
+        "--output",
+        shot_path.to_str().unwrap(),
+        "--full-page",
+    ]);
+    assert_eq!(shot["ok"], true, "{shot}");
+    assert!(
+        std::fs::metadata(&shot_path)
+            .map(|meta| meta.len() > 0)
+            .unwrap_or(false),
+        "{shot}"
+    );
+    let _ = std::fs::remove_file(&shot_path);
+
+    let inline = run_cdp(&["browser", "screenshot", "--base64"]);
+    assert_eq!(inline["ok"], true, "{inline}");
+    assert!(
+        inline["base64"]
+            .as_str()
+            .is_some_and(|data| !data.is_empty()),
+        "{inline}"
+    );
+    let jpeg_path = fixture.cache.join("live-shot.jpg");
+    let jpeg = run_cdp(&[
+        "browser",
+        "screenshot",
+        "--format",
+        "jpeg",
+        "--quality",
+        "60",
+        "--output",
+        jpeg_path.to_str().unwrap(),
+    ]);
+    assert_eq!(jpeg["ok"], true, "{jpeg}");
+    assert_eq!(jpeg["format"], "jpg", "{jpeg}");
+    let _ = std::fs::remove_file(&jpeg_path);
+
+    let eval = run_cdp(&["browser", "eval", "--eval", "1+1"]);
+    assert_eq!(eval["result"], 2, "{eval}");
+    let promise = run_cdp(&[
+        "browser",
+        "eval",
+        "--eval",
+        "Promise.resolve(3)",
+        "--await-promise",
+    ]);
+    assert_eq!(promise["result"], 3, "{promise}");
+
+    // The explicit dialog command goes through the raw CDP rescue path.
+    // With no dialog open Chrome may accept it as a no-op or report a clean
+    // error; either way it must be a well-formed response.
+    let dialog = run_cdp(&["browser", "dialog", "--accept"]);
+    assert!(dialog.get("ok").is_some(), "{dialog}");
+    if dialog["ok"] == false {
+        assert_eq!(dialog["error"]["code"], "execution_failed", "{dialog}");
+    }
+
+    let before = run_cdp(&["browser", "tabs"]);
+    let before_count = before["tabs"].as_array().expect("tabs").len();
+    let opened = run_cdp(&["browser", "tab-new", "--url", &url]);
+    assert_eq!(opened["ok"], true, "{opened}");
+    let new_target = opened["target_id"].as_str().expect("target id").to_string();
+    let after = run_cdp(&["browser", "tabs"]);
+    assert_eq!(
+        after["tabs"].as_array().expect("tabs").len(),
+        before_count + 1,
+        "{after}"
+    );
+    let closed = run_cdp(&["browser", "tab-close", "--target", &new_target]);
+    assert_eq!(closed["closed"], true, "{closed}");
+}
+
+/// Best-effort cleanup for a managed browser started by the test.
+struct ManagedQuit {
+    session: String,
+    cache: std::path::PathBuf,
+}
+
+impl Drop for ManagedQuit {
+    fn drop(&mut self) {
+        let mut command = Command::new(bin());
+        command
+            .args([
+                "--cdp",
+                "browser",
+                "quit",
+                "--session",
+                &self.session,
+                "--purge",
+            ])
+            .env("XDG_CACHE_HOME", &self.cache)
+            .env("XDG_CONFIG_HOME", &self.cache)
+            .env("XDG_STATE_HOME", &self.cache)
+            .env_remove("COMPUTER_USE_CONFIRM_CMD");
+        let _ = command.output();
+    }
+}
+
+/// Start a managed Chromium, see it in `sessions`, and quit it.
+#[test]
+fn managed_launch_sessions_and_quit() {
+    skip_without_chrome!();
+    let fixture = fixture();
+    let _guard = fixture.lock.lock().expect("test lock");
+    let chrome = chrome_or_skip().expect("chrome");
+
+    let missing = run_cdp(&[
+        "browser",
+        "launch",
+        "--browser",
+        "/definitely/missing/chrome",
+    ]);
+    assert_eq!(missing["error"]["code"], "invalid_arguments", "{missing}");
+
+    let launched = run_cdp(&[
+        "browser",
+        "launch",
+        "--headless",
+        "--browser",
+        chrome.to_str().unwrap(),
+        "--url",
+        &base_url(),
+    ]);
+    assert_eq!(launched["ok"], true, "{launched}");
+    let session = launched["session"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let _quit = ManagedQuit {
+        session: session.clone(),
+        cache: fixture.cache.clone(),
+    };
+
+    let sessions = run_cdp(&["browser", "sessions"]);
+    assert_eq!(sessions["ok"], true, "{sessions}");
+    assert!(
+        sessions["sessions"]
+            .as_array()
+            .expect("sessions")
+            .iter()
+            .any(|entry| entry["session"] == session.as_str()),
+        "{sessions}"
+    );
+
+    let quit = run_cdp(&["browser", "quit", "--session", &session, "--purge"]);
+    assert_eq!(quit["ok"], true, "{quit}");
+    assert_eq!(quit["session"], session.as_str(), "{quit}");
+
+    // A session that was never started is a no-op, not an error.
+    let unknown = run_cdp(&["browser", "quit", "--session", "no-such-session"]);
+    assert_eq!(unknown["ok"], true, "{unknown}");
+    assert_eq!(unknown["killed"], false, "{unknown}");
+}
+
+/// Navigation history, reload, the wait forms, and activate.
+#[test]
+fn navigation_history_reload_waits_and_activate() {
+    skip_without_chrome!();
+    let fixture = fixture();
+    let _guard = fixture.lock.lock().expect("test lock");
+    let url = base_url();
+    let nav = run_cdp(&["browser", "navigate", "--url", &url, "--wait", "load"]);
+    assert_eq!(nav["ok"], true, "{nav}");
+    let target = nav["target_id"].as_str().expect("target id").to_string();
+
+    let selector_wait = run_cdp(&["browser", "wait", "--wait", "selector:#out"]);
+    assert_eq!(selector_wait["ok"], true, "{selector_wait}");
+
+    let clicked = run_cdp(&["browser", "click", "--selector", "#next", "--wait", "load"]);
+    assert_eq!(clicked["ok"], true, "{clicked}");
+
+    let url_wait = run_cdp(&["browser", "wait", "--wait", "url:*next*"]);
+    assert_eq!(url_wait["ok"], true, "{url_wait}");
+
+    let idle = run_cdp(&[
+        "browser",
+        "wait",
+        "--wait",
+        "networkidle",
+        "--timeout-ms",
+        "5000",
+    ]);
+    assert_eq!(idle["ok"], true, "{idle}");
+
+    let back = run_cdp(&["browser", "back"]);
+    assert_eq!(back["ok"], true, "{back}");
+    let forward = run_cdp(&["browser", "forward"]);
+    assert_eq!(forward["ok"], true, "{forward}");
+    let reload = run_cdp(&["browser", "reload", "--wait", "domcontentloaded"]);
+    assert_eq!(reload["ok"], true, "{reload}");
+    let activate = run_cdp(&["browser", "activate", "--target", &target]);
+    assert_eq!(activate["ok"], true, "{activate}");
+}
+
+/// Selector misses, stale refs, batch failures, and a blocked current page.
+#[test]
+fn selector_ref_and_batch_errors_are_reported() {
+    skip_without_chrome!();
+    let fixture = fixture();
+    let _guard = fixture.lock.lock().expect("test lock");
+    let url = base_url();
+    let nav = run_cdp(&["browser", "navigate", "--url", &url, "--wait", "load"]);
+    assert_eq!(nav["ok"], true, "{nav}");
+
+    let missing = run_cdp(&[
+        "browser",
+        "click",
+        "--selector",
+        "#does-not-exist",
+        "--wait",
+        "none",
+    ]);
+    assert_eq!(missing["error"]["code"], "element_not_found", "{missing}");
+
+    let stale = run_cdp(&["browser", "press", "--ref", "e999", "--keys", "a"]);
+    assert_eq!(stale["error"]["code"], "stale_element", "{stale}");
+
+    let steps = r##"[{"action":"browser_click","selector":"#does-not-exist","wait":"none"},{"action":"browser_eval","script":"1"}]"##;
+    let batch = run_cdp(&["browser", "batch", steps]);
+    assert_eq!(batch["ok"], true, "{batch}");
+    assert_eq!(batch["failed"], 1, "{batch}");
+    assert_eq!(batch["stopped_at"], 0, "{batch}");
+    assert_eq!(batch["count"], 1, "{batch}");
+
+    let policy = fixture.cache.join("block-current.toml");
+    std::fs::write(
+        &policy,
+        "version = 1\n[browser]\nblocked_urls = [\"http://127.0.0.1:*/*\"]\n",
+    )
+    .expect("policy file");
+    let blocked = run_cdp(&[
+        "--policy",
+        policy.to_str().unwrap(),
+        "browser",
+        "click",
+        "--selector",
+        "#hello",
+        "--wait",
+        "none",
+    ]);
+    assert_eq!(blocked["error"]["code"], "blocked_url", "{blocked}");
+}
+
+/// Snapshot refs reach every element command, not just click and type.
+#[test]
+fn snapshot_refs_reach_element_commands() {
+    skip_without_chrome!();
+    let fixture = fixture();
+    let _guard = fixture.lock.lock().expect("test lock");
+    let url = base_url();
+    let nav = run_cdp(&["browser", "navigate", "--url", &url, "--wait", "load"]);
+    assert_eq!(nav["ok"], true, "{nav}");
+
+    // The snapshot cache is keyed by --session; every later command must use
+    // the same one for --ref to resolve.
+    let snapshot = run_cdp(&["--session", "live-refs", "browser", "snapshot"]);
+    assert_eq!(snapshot["ok"], true, "{snapshot}");
+    let tree = snapshot["text"].as_str().expect("snapshot text");
+    let hello = ref_for(tree, "Say hello");
+    let name = ref_for(tree, "Name");
+    let country = ref_for(tree, "Country");
+    let agree = ref_for(tree, "Agree");
+    let file = ref_for(tree, "File");
+
+    let pressed = run_cdp(&[
+        "--session",
+        "live-refs",
+        "browser",
+        "press",
+        "--ref",
+        &hello,
+        "--keys",
+        "Enter",
+    ]);
+    assert_eq!(pressed["ok"], true, "{pressed}");
+    let typed = run_cdp(&[
+        "--session",
+        "live-refs",
+        "browser",
+        "type",
+        "--ref",
+        &name,
+        "--text",
+        "hello",
+    ]);
+    assert_eq!(typed["ok"], true, "{typed}");
+    let hovered = run_cdp(&[
+        "--session",
+        "live-refs",
+        "browser",
+        "hover",
+        "--ref",
+        &hello,
+    ]);
+    assert_eq!(hovered["ok"], true, "{hovered}");
+    let scrolled = run_cdp(&[
+        "--session",
+        "live-refs",
+        "browser",
+        "scroll",
+        "--ref",
+        &hello,
+        "--dy",
+        "10",
+    ]);
+    assert_eq!(scrolled["ok"], true, "{scrolled}");
+    let selected = run_cdp(&[
+        "--session",
+        "live-refs",
+        "browser",
+        "select",
+        "--ref",
+        &country,
+        "--value",
+        "br",
+    ]);
+    assert_eq!(selected["ok"], true, "{selected}");
+    let checked = run_cdp(&[
+        "--session",
+        "live-refs",
+        "browser",
+        "check",
+        "--ref",
+        &agree,
+    ]);
+    assert_eq!(checked["ok"], true, "{checked}");
+
+    let upload_path = fixture.cache.join("upload-ref.txt");
+    std::fs::write(&upload_path, "x").expect("upload fixture");
+    let uploaded = run_cdp(&[
+        "--session",
+        "live-refs",
+        "browser",
+        "upload",
+        "--ref",
+        &file,
+        "--file",
+        upload_path.to_str().unwrap(),
+    ]);
+    assert_eq!(uploaded["ok"], true, "{uploaded}");
 }
 
 fn ref_for(text: &str, needle: &str) -> String {

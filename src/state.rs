@@ -219,6 +219,25 @@ mod tests {
     use crate::test_backend::StubBackend;
 
     #[test]
+    fn recovered_state_is_well_formed_metadata() {
+        let value = recovered_state();
+        assert_eq!(value["platform"], platform_name());
+        assert!(value["tree"].is_null());
+        assert!(value["displays"].as_array().unwrap().is_empty());
+        assert!(value["note"].as_str().unwrap().contains("recovered"));
+    }
+
+    #[test]
+    fn metadata_state_omits_the_tree() {
+        let backend = StubBackend::default();
+        let value = collect_state_metadata(&backend);
+        assert_eq!(value["frontmost_app"], "Finder");
+        assert!(value["tree"].is_null());
+        assert!(value["revision"].is_null());
+        assert!(value["displays"][0]["name"].is_string());
+    }
+
+    #[test]
     fn state_shape_from_a_stub_backend() {
         let backend = StubBackend::default();
         let value = collect_state(&backend);

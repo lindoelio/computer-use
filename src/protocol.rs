@@ -59,7 +59,7 @@ pub const APPLE_EVENT_TIMEOUT_SECS: u64 = 30;
 /// {"action":"click","x":10,"y":20}
 /// ```
 #[derive(Debug, Clone, PartialEq, SerializeDerive, Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case")]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
     /// Capture the screen or a region.
     Screenshot {
@@ -6275,6 +6275,509 @@ mod tests {
         );
         assert!(response.ok, "{:?}", response.to_value());
         assert_eq!(response.to_value()["condition"], "value");
+    }
+
+    fn wait_with(app_running: Option<&str>, title: Option<&str>) -> Action {
+        Action::Wait {
+            ms: None,
+            seconds: None,
+            element: None,
+            element_state: None,
+            text: None,
+            value: None,
+            within_element: None,
+            window_state: None,
+            tree_change: false,
+            app_running: app_running.map(str::to_string),
+            title: title.map(str::to_string),
+            ignore_case: true,
+            timeout_ms: Some(200),
+            poll_ms: Some(25),
+        }
+    }
+
+    #[test]
+    fn wait_app_running_matches_name_bundle_and_path() {
+        let backend = StubBackend::default();
+        for needle in ["Notes", "com.apple.Notes", "/Applications/Notes.app"] {
+            let response =
+                dispatch_with_context(&backend, wait_with(Some(needle), None), &ctx("Notes"));
+            assert!(response.ok, "{needle}: {:?}", response.to_value());
+            assert_eq!(response.to_value()["condition"], "app_running");
+            assert_eq!(response.to_value()["observed"]["name"], "Notes");
+        }
+        let missing = dispatch_with_context(
+            &backend,
+            wait_with(Some("no-such-app-xyz"), None),
+            &ctx("Notes"),
+        );
+        assert_eq!(missing.to_value()["error"]["code"], "timeout");
+        assert!(missing.to_value()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no-such-app-xyz"));
+    }
+
+    #[test]
+    fn wait_title_matches_the_target_window() {
+        let backend = StubBackend::default();
+        // The Notes fixture window is titled "Shopping".
+        let found = dispatch_with_context(&backend, wait_with(None, Some("shop")), &ctx("Notes"));
+        assert!(found.ok, "{:?}", found.to_value());
+        assert_eq!(found.to_value()["condition"], "title");
+        assert_eq!(found.to_value()["observed"]["title"], "Shopping");
+
+        let missing =
+            dispatch_with_context(&backend, wait_with(None, Some("nothing")), &ctx("Notes"));
+        assert_eq!(missing.to_value()["error"]["code"], "timeout");
+    }
+
+    #[test]
+    fn window_set_reports_the_new_frame() {
+        let backend = StubBackend::default();
+        let response = dispatch_with_context(
+            &backend,
+            Action::WindowSet {
+                x: Some(10),
+                y: None,
+                width: Some(200),
+                height: None,
+            },
+            &ctx("Notes"),
+        );
+        assert!(response.ok, "{:?}", response.to_value());
+        assert_eq!(response.to_value()["action"], "window_set");
+        let calls = backend.window_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert!(calls[0].contains("x=10"), "{}", calls[0]);
+        assert!(calls[0].contains("width=200"), "{}", calls[0]);
+    }
+
+    #[test]
+    fn image_coordinates_cover_double_triple_drag_and_regions() {
+        let cache = crate::cache::CacheEnv::acquire();
+        assert!(cache.dir().is_dir());
+        let map = sample_map();
+        cache::store_screenshot_map(Some("p5-map-more"), &map).unwrap();
+        let backend = StubBackend::default();
+        let context = CallContext {
+            coord: Some("image".into()),
+            session: Some("p5-map-more".into()),
+            ..CallContext::default()
+        };
+
+        let double = dispatch_with_context(
+            &backend,
+            Action::DoubleClick {
+                x: Some(100),
+                y: Some(50),
+                button: MouseButton::Left,
+            },
+            &context,
+        );
+        assert!(double.ok, "{:?}", double.to_value());
+        assert_eq!(double.to_value()["x"], 176);
+
+        let triple = dispatch_with_context(
+            &backend,
+            Action::TripleClick {
+                x: Some(100),
+                y: Some(50),
+                button: MouseButton::Left,
+            },
+            &context,
+        );
+        assert!(triple.ok, "{:?}", triple.to_value());
+
+        let drag = dispatch_with_context(
+            &backend,
+            Action::Drag {
+                path: vec![Point { x: 100, y: 50 }, Point { x: 110, y: 60 }],
+                button: MouseButton::Left,
+            },
+            &context,
+        );
+        assert!(drag.ok, "{:?}", drag.to_value());
+
+        let mapped = remap_region(&context, Region::new(10, 10, 20, 20).unwrap()).unwrap();
+        assert!(mapped.width >= 1 && mapped.height >= 1);
+        let outside = remap_region(&context, Region::new(1400, 10, 100, 10).unwrap()).unwrap_err();
+        assert_eq!(outside.code(), "invalid_arguments");
+        assert!(outside.to_string().contains("outside the screenshot"));
+    }
+
+    #[test]
+    fn image_coordinates_cover_click_mouse_scroll_screenshot_and_zoom() {
+        let cache = crate::cache::CacheEnv::acquire();
+        let map = sample_map();
+        cache::store_screenshot_map(Some("p5-map-arms"), &map).unwrap();
+        let backend = StubBackend::default();
+        let context = CallContext {
+            coord: Some("image".into()),
+            session: Some("p5-map-arms".into()),
+            ..CallContext::default()
+        };
+        let shot = cache.dir().join("arms.png");
+
+        let click = dispatch_with_context(
+            &backend,
+            Action::Click {
+                x: Some(100),
+                y: Some(50),
+                button: MouseButton::Left,
+                double: false,
+                count: 1,
+            },
+            &context,
+        );
+        assert!(click.ok, "{:?}", click.to_value());
+        assert_eq!(click.to_value()["x"], 176);
+
+        let down = dispatch_with_context(
+            &backend,
+            Action::MouseDown {
+                x: 100,
+                y: 50,
+                button: MouseButton::Left,
+            },
+            &context,
+        );
+        assert!(down.ok, "{:?}", down.to_value());
+        let up = dispatch_with_context(
+            &backend,
+            Action::MouseUp {
+                x: 100,
+                y: 50,
+                button: MouseButton::Left,
+            },
+            &context,
+        );
+        assert!(up.ok, "{:?}", up.to_value());
+
+        let scroll = dispatch_with_context(
+            &backend,
+            Action::Scroll {
+                x: Some(100),
+                y: Some(50),
+                dx: Some(0),
+                dy: Some(10),
+                direction: None,
+                amount: None,
+            },
+            &context,
+        );
+        assert!(scroll.ok, "{:?}", scroll.to_value());
+
+        let region = Region::new(10, 10, 20, 20).unwrap();
+        // A capture stores its own map, so restore the sample map before each
+        // region-remapping action.
+        cache::store_screenshot_map(Some("p5-map-arms"), &map).unwrap();
+        let screenshot = dispatch_with_context(
+            &backend,
+            Action::Screenshot {
+                output: Some(shot.display().to_string()),
+                region: Some(region),
+                format: None,
+                max_width: None,
+                canvas: None,
+                base64: false,
+                marks: false,
+            },
+            &context,
+        );
+        assert!(screenshot.ok, "{:?}", screenshot.to_value());
+        cache::store_screenshot_map(Some("p5-map-arms"), &map).unwrap();
+        let zoom = dispatch_with_context(
+            &backend,
+            Action::Zoom {
+                output: Some(shot.display().to_string()),
+                region,
+                format: None,
+                max_width: None,
+                canvas: None,
+                base64: false,
+            },
+            &context,
+        );
+        assert!(zoom.ok, "{:?}", zoom.to_value());
+
+        // An action with no coordinates passes through unchanged.
+        let key = dispatch_with_context(
+            &backend,
+            Action::Key {
+                keys: "cmd+s".into(),
+            },
+            &context,
+        );
+        assert!(key.ok, "{:?}", key.to_value());
+        let _ = std::fs::remove_dir_all(cache.dir());
+    }
+
+    #[test]
+    fn clipboard_get_reports_an_image() {
+        let cache = crate::cache::CacheEnv::acquire();
+        let backend = StubBackend::default();
+        *backend.clipboard_image.lock().unwrap() = Some(vec![10, 20, 30, 255]);
+        let response = dispatch_with_context(&backend, Action::ClipboardGet, &ctx("Notes"));
+        assert!(response.ok, "{:?}", response.to_value());
+        let value = response.to_value();
+        assert_eq!(value["kind"], "image");
+        assert!(value["path"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("clipboard.png"));
+        assert_eq!(value["width"], 1);
+        let _ = std::fs::remove_dir_all(cache.dir());
+    }
+
+    #[test]
+    fn batch_steps_overlay_context_keys() {
+        let backend = StubBackend::default();
+        let response = dispatch_with_context(
+            &backend,
+            Action::Batch {
+                actions: vec![json!({
+                    "action": "move",
+                    "x": 1,
+                    "y": 2,
+                    "app": "Notes",
+                    "window": "0",
+                    "element": 3,
+                    "diff": true,
+                    "full": true,
+                    "coord": "screen"
+                })],
+                stop_on_error: true,
+            },
+            &ctx("Notes"),
+        );
+        assert!(response.ok, "{:?}", response.to_value());
+        assert_eq!(response.to_value()["results"][0]["ok"], true);
+    }
+
+    #[test]
+    fn round_screen_rejects_non_finite_and_out_of_range() {
+        assert_eq!(round_screen(1.6).unwrap(), 2);
+        assert_eq!(
+            round_screen(f64::NAN).unwrap_err().code(),
+            "invalid_arguments"
+        );
+        assert_eq!(
+            round_screen(f64::INFINITY).unwrap_err().code(),
+            "invalid_arguments"
+        );
+        assert_eq!(
+            round_screen(f64::from(i32::MAX) + 1.0).unwrap_err().code(),
+            "invalid_arguments"
+        );
+    }
+
+    #[test]
+    fn ocr_action_reports_blocks() {
+        let backend = StubBackend {
+            capture_pixels: Some((400, 300)),
+            ..StubBackend::default()
+        };
+        *backend.ocr_blocks.lock().unwrap() = Some(vec![OcrBlock {
+            text: "hello".into(),
+            x: 10,
+            y: 10,
+            width: 20,
+            height: 10,
+            confidence: 0.8,
+        }]);
+        let response = dispatch_with_context(
+            &backend,
+            Action::Ocr {
+                force: false,
+                image: None,
+            },
+            &ctx("Notes"),
+        );
+        assert!(response.ok, "{:?}", response.to_value());
+        let value = response.to_value();
+        assert_eq!(value["action"], "ocr");
+        assert_eq!(value["blocks"][0]["text"], "hello");
+        assert!(value["blocks"][0]["screen"]["x"].is_number(), "{value}");
+    }
+
+    #[test]
+    fn clipboard_set_image_decodes_a_png() {
+        let (allow, dir) = allow_confirm_hook();
+        let backend = StubBackend::default();
+        let mut context = ctx("Notes");
+        context.confirm_cmd = Some(allow);
+        let fixture = format!(
+            "{}/tests/fixtures/ocr/hello.png",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let response = dispatch_with_context(
+            &backend,
+            Action::ClipboardSet {
+                text: None,
+                image: Some(fixture.clone()),
+            },
+            &context,
+        );
+        assert!(response.ok, "{:?}", response.to_value());
+        let value = response.to_value();
+        assert_eq!(value["kind"], "image");
+        assert_eq!(value["width"], 960);
+        assert_eq!(value["height"], 240);
+
+        let missing = dispatch_with_context(
+            &backend,
+            Action::ClipboardSet {
+                text: None,
+                image: Some("/definitely/missing.png".into()),
+            },
+            &context,
+        );
+        assert_eq!(missing.to_value()["error"]["code"], "invalid_arguments");
+
+        let corrupt = dir.join("corrupt.png");
+        std::fs::write(&corrupt, b"not a png").unwrap();
+        let undecodable = dispatch_with_context(
+            &backend,
+            Action::ClipboardSet {
+                text: None,
+                image: Some(corrupt.display().to_string()),
+            },
+            &context,
+        );
+        assert_eq!(undecodable.to_value()["error"]["code"], "invalid_arguments");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_title_requires_a_hook() {
+        let error = confirm_title(&ctx("Notes"), "press", "sensitive control title").unwrap_err();
+        assert_eq!(error.code(), "confirm_required");
+
+        let (allow, dir) = allow_confirm_hook();
+        let mut context = ctx("Notes");
+        context.confirm_cmd = Some(allow);
+        confirm_title(&context, "press", "sensitive control title").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn synthetic_tier_is_refused_without_the_feature() {
+        if crate::tier::skylight_compiled() {
+            // With the feature the stub backend would record the synthetic
+            // request instead of posting; that path is covered elsewhere.
+            return;
+        }
+        let backend = StubBackend::default();
+        let mut context = ctx("Notes");
+        context.tier = Some("synthetic".into());
+        let response = dispatch_with_context(
+            &backend,
+            Action::Click {
+                x: Some(1),
+                y: Some(1),
+                button: MouseButton::Left,
+                double: false,
+                count: 1,
+            },
+            &context,
+        );
+        assert_eq!(response.to_value()["error"]["code"], "unsupported");
+        assert!(response.to_value()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("skylight"));
+    }
+
+    #[test]
+    fn unknown_fields_are_rejected_on_actions_with_fields() {
+        // A typo such as `timeout` instead of `timeout_ms` must not be
+        // silently ignored and fall back to the default.
+        let error = parse_request(json!({
+            "action": "wait",
+            "ms": 1,
+            "timeout": 5000
+        }))
+        .unwrap_err();
+        assert_eq!(error.code(), "invalid_arguments");
+        assert!(error.to_string().contains("unknown field"), "{error}");
+    }
+
+    #[test]
+    fn parse_request_context_carries_every_flag() {
+        let request = parse_request(json!({
+            "action": "displays",
+            "app": "Notes",
+            "window": "0",
+            "element": 3,
+            "diff": true,
+            "full": true,
+            "state_diff": true,
+            "include_screenshot": true,
+            "coord": "image",
+            "session": "s1",
+            "tier": "ax",
+            "adapter": "native",
+            "display": "1",
+            "require_visible": true,
+            "allow_foreground": true,
+            "require_background": true,
+            "no_overlay": true,
+            "cdp": true,
+            "cdp_url": "ws://127.0.0.1:1",
+            "browser_blocked_urls": ["https://accounts.example.com/*"],
+            "on_dialog": "accept",
+            "agent_overlay": "on"
+        }))
+        .unwrap();
+        assert!(matches!(request.action, Action::Displays));
+        let context = request.context;
+        assert_eq!(context.app.as_deref(), Some("Notes"));
+        assert_eq!(context.window.as_deref(), Some("0"));
+        assert_eq!(context.element, Some(3));
+        assert!(context.diff && context.full);
+        assert!(context.return_state && context.state_diff);
+        assert!(context.include_screenshot);
+        assert_eq!(context.coord.as_deref(), Some("image"));
+        assert_eq!(context.session.as_deref(), Some("s1"));
+        assert_eq!(context.tier.as_deref(), Some("ax"));
+        assert_eq!(context.adapter.as_deref(), Some("native"));
+        assert_eq!(context.display.as_deref(), Some("1"));
+        assert!(context.require_visible);
+        assert!(context.allow_foreground && context.require_background);
+        assert!(context.no_overlay && context.cdp);
+        assert_eq!(context.cdp_url.as_deref(), Some("ws://127.0.0.1:1"));
+        assert_eq!(
+            context.browser_blocked_urls,
+            vec!["https://accounts.example.com/*"]
+        );
+        assert_eq!(context.on_dialog.as_deref(), Some("accept"));
+        assert_eq!(context.agent_overlay.as_deref(), Some("on"));
+    }
+
+    #[test]
+    fn post_state_warns_when_the_tree_fails() {
+        let backend = StubBackend {
+            fail_accessibility: true,
+            ..StubBackend::default()
+        };
+        let mut context = ctx("Notes");
+        context.return_state = true;
+        let response = dispatch_with_context(&backend, Action::Move { x: 5, y: 5 }, &context);
+        assert!(response.ok, "{:?}", response.to_value());
+        let value = response.to_value();
+        let warnings = value["warnings"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })
+            .unwrap_or_default();
+        assert!(warnings.contains("tree snapshot failed"), "{value}");
+        assert!(value["state"]["tree"].is_null(), "{value}");
     }
 
     #[test]

@@ -250,3 +250,47 @@ fn hold_key(object: &serde_json::Map<String, Value>) -> Result<Action, ComputerE
         ms: ms as u64,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scroll_directions_and_errors() {
+        for (direction, expected) in [
+            ("up", ScrollDirection::Up),
+            ("down", ScrollDirection::Down),
+            ("left", ScrollDirection::Left),
+            ("right", ScrollDirection::Right),
+        ] {
+            let action = translate(&serde_json::json!({
+                "action": "scroll",
+                "scroll_direction": direction,
+                "scroll_amount": 3,
+                "coordinate": [10, 20]
+            }))
+            .unwrap();
+            match action {
+                Action::Scroll {
+                    direction: Some(got),
+                    ..
+                } => assert_eq!(got, expected),
+                other => panic!("{other:?}"),
+            }
+        }
+        let missing = translate(&serde_json::json!({"action": "scroll"})).unwrap_err();
+        assert_eq!(missing.code(), "invalid_arguments");
+        let unknown = translate(&serde_json::json!({
+            "action": "scroll",
+            "scroll_direction": "sideways"
+        }))
+        .unwrap_err();
+        assert!(unknown.to_string().contains("sideways"), "{unknown}");
+    }
+
+    #[test]
+    fn unknown_action_types_are_rejected() {
+        let error = translate(&serde_json::json!({"action": "teleport"})).unwrap_err();
+        assert_eq!(error.code(), "invalid_arguments");
+    }
+}

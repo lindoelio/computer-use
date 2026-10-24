@@ -54,6 +54,12 @@ Excluded today, grouped by reason:
 - **Compiled out of test builds**: `backend/macos/{overlay,focus}.rs`.
 - **Signed-bundle identity**: `backend/macos/doctor.rs` (codesign, AppKit
   bundle metadata, the TCC responsible-app chain).
+- **Platform-overridden defaults**: `backend/mod.rs` on macOS. Every platform
+  method is implemented by `MacOsDesktopBackend`, so the trait's default bodies
+  cannot execute there; the Linux and Windows runners measure their own.
+- **macOS module wrappers**: `backend/macos/mod.rs`. `capture_window`,
+  `marks_for_tree`, `secure_ocr_frames`, `inspect_accessibility`, and
+  `element_action` need Accessibility or Screen Recording TCC.
 - **Linux session**: `backend/linux/*` needs an X server, an AT-SPI bus, or a
   portal daemon.
 - **Windows desktop**: `backend/windows/*` needs an interactive desktop for
@@ -69,34 +75,32 @@ Excluded today, grouped by reason:
 ## Where the number stands
 
 Measured on macOS with `--all-targets --all-features` (this includes the live
-CDP suite, which needs Chrome on `PATH`):
+CDP suite and the in-process Vision test; both need their real engine):
 
 | | Value |
 | --- | --- |
-| Whole crate (all files) | ~69% |
-| Measurable set (allowlist applied) | 82.09% |
-| Target | 90.0% |
-| Gap | **~1,700 lines** |
+| Whole crate (all files) | ~75.6% |
+| Measurable set (allowlist applied) | **91.37%** |
+| Enforced floor | 90.0% |
+| Target | 95.0% |
+| Gap | **~790 lines** |
 
-The gap is dominated by code that is reachable but not yet exercised:
+The remaining gap is small clusters (3–20 lines each) of error and edge paths:
 
-1. `src/browser/cdp.rs` (~800), `src/browser/actions.rs` (~270),
-   `src/browser/keys.rs` (~80), `src/browser/mod.rs` (~60) — the live CDP
-   suite covers attach mode and a handful of commands. Extending
-   `tests/cdp_live.rs` with managed `browser launch`/`quit`, `select`,
-   `check`, `upload`, `dialog`, `hover`, `press`, `scroll`, `tab-new/close`,
-   `screenshot`, and `eval` is the single largest lever, and it also lets
-   `browser/launch.rs` be removed from the allowlist.
-2. `src/protocol.rs` (~1,000 production lines) — dispatcher branches and
-   helpers that no unit test reaches.
-3. `src/main.rs` (~260) — CLI flag combinations and error paths beyond the
-   surface sweep in `tests/cli.rs`.
-4. `src/policy.rs` (~220) — the remaining built-in-deny exemption paths (the
-   registry is process-global, so those need a serialized test).
-5. `src/backend/mod.rs` (~190) — trait defaults that the platform backend
-   overrides; unreachable on the macOS runner, reachable on Linux and Windows.
-6. `src/vision/ocr.rs` (~95), `src/cache.rs` (~90), `src/element.rs` (~65),
-   and the small adapters/state/types gaps (~200).
+1. `src/protocol.rs` (~540): dispatcher error arms, artifact/output helpers, the
+   sensitive-press path, and a few context-parsing branches.
+2. `src/browser/cdp.rs` (~290): attach/discovery fallbacks, `sysctl` argv
+   parsing, the raw dialog rescue, and batch error shaping.
+3. `src/browser/actions.rs` (~124): element error mapping, key dispatch
+   variants, and dialog error paths.
+4. `src/main.rs` (~105): flag conversions and the serve/emit loop.
+5. `src/policy.rs` (~107), `src/cache.rs` (~74), `src/adapters/*` (~69),
+   `src/isolation.rs` (~37), `src/browser/snapshot.rs` (~35),
+   `src/overlay.rs` (~34), `src/doctor.rs` (~33), `src/target.rs` (~31),
+   `src/vision/marks.rs` (~30).
+
+The first two entries account for ~60% of what is left and are the next
+target; the rest is a long tail of one-branch tests.
 
 ## Why Linux and Windows report instead of enforce
 

@@ -1513,9 +1513,17 @@ pub fn split_command(input: &str) -> Result<(String, Vec<String>), ComputerError
     let mut any = false;
     for ch in input.chars() {
         match quote {
+            // Closing the quote does not end the token; a following character
+            // can still join it, and whitespace flushes it.
             Some(mark) if ch == mark => quote = None,
-            Some(_) => current.push(ch),
-            None if ch == '"' || ch == '\'' => quote = Some(ch),
+            Some(_) => {
+                current.push(ch);
+                any = true;
+            }
+            None if ch == '"' || ch == '\'' => {
+                quote = Some(ch);
+                any = true;
+            }
             None if ch.is_whitespace() => {
                 if any {
                     tokens.push(std::mem::take(&mut current));
@@ -2239,6 +2247,144 @@ mod tests {
             error.to_string().contains(&admin.display().to_string()),
             "{error}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn allow_rules_match_bundle_path_and_name() {
+        let dir = temp_dir("allow-matrix");
+        let user = dir.join("user.toml");
+        std::fs::write(
+            &user,
+            "version = 1\ndefault = \"deny\"\n[[allow]]\nbundle_id = \"com.example.Bundle\"\n[[allow]]\npath = \"/opt/App/bin/app\"\n[[allow]]\nname = \"NamedApp\"\n",
+        )
+        .unwrap();
+        let policy = load_paths(Some(&user), None).unwrap();
+        assert!(matches!(
+            app_verdict(&policy, &subject_bundle("com.example.Bundle")),
+            Decision::Allow { source: "user" }
+        ));
+        let by_path = Subject {
+            path: Some("/opt/App/bin/app".into()),
+            ..Subject::default()
+        };
+        assert!(matches!(
+            app_verdict(&policy, &by_path),
+            Decision::Allow { source: "user" }
+        ));
+        let by_name = Subject {
+            name: Some("namedapp".into()),
+            ..Subject::default()
+        };
+        assert!(matches!(
+            app_verdict(&policy, &by_name),
+            Decision::Allow { source: "user" }
+        ));
+        assert!(matches!(
+            app_verdict(&policy, &subject_bundle("com.example.Other")),
+            Decision::Deny { .. }
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn constrained_path_allow_mismatch_is_explained() {
+        let dir = temp_dir("allow-constrained");
+        let user = dir.join("user.toml");
+        std::fs::write(
+            &user,
+            "version = 1\ndefault = \"deny\"\n[[allow]]\nbundle_id = \"com.example.Constrained\"\npath = \"/opt/Constrained/app\"\n",
+        )
+        .unwrap();
+        let policy = load_paths(Some(&user), None).unwrap();
+        let mismatch = Subject {
+            bundle_id: Some("com.example.Constrained".into()),
+            path: Some("/usr/local/bin/app".into()),
+            ..Subject::default()
+        };
+        match app_verdict(&policy, &mismatch) {
+            Decision::Deny { message, .. } => {
+                assert!(message.contains("allow.path does not match"), "{message}")
+            }
+            other => panic!("{other:?}"),
+        }
+        let matching = Subject {
+            bundle_id: Some("com.example.Constrained".into()),
+            path: Some("/opt/Constrained/app".into()),
+            ..Subject::default()
+        };
+        assert!(matches!(
+            app_verdict(&policy, &matching),
+            Decision::Allow { .. }
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn admin_confirm_command_applies_when_the_user_has_none() {
+        let dir = temp_dir("admin-confirm");
+        let admin = dir.join("admin.toml");
+        std::fs::write(
+            &admin,
+            "version = 1\n[confirm]\ncommand = \"/usr/local/bin/admin-confirm\"\n",
+        )
+        .unwrap();
+        let policy = load_paths(None, Some(&admin)).unwrap();
+        assert_eq!(
+            confirm_program(&policy, None).as_deref(),
+            Some("/usr/local/bin/admin-confirm")
+        );
+        assert_eq!(
+            confirm_program(&policy, Some("/bin/flag")).as_deref(),
+            Some("/bin/flag")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sensitive_combo_tokens_and_reasons() {
+        let combos = [
+            SensitiveCombo::Quit,
+            SensitiveCombo::LogOut,
+            SensitiveCombo::LockScreen,
+            SensitiveCombo::ForceQuit,
+            SensitiveCombo::EmptyTrash,
+        ];
+        let mut tokens = std::collections::BTreeSet::new();
+        for combo in combos {
+            assert!(!combo.as_str().is_empty());
+            assert!(!combo.reason().is_empty());
+            assert!(tokens.insert(combo.as_str()), "duplicate token");
+        }
+    }
+
+    #[test]
+    fn split_command_handles_quotes_and_empty_input() {
+        let (program, args) =
+            split_command("\"/usr/local/bin/my hook\" --flag 'a b' \"c d\"").unwrap();
+        assert_eq!(program, "/usr/local/bin/my hook");
+        assert_eq!(args, vec!["--flag", "a b", "c d"]);
+        assert!(split_command("   ").is_err());
+        assert_eq!(
+            split_command("/bin/one").unwrap(),
+            ("/bin/one".into(), Vec::new())
+        );
+    }
+
+    #[test]
+    fn security_and_toml_errors_name_the_line() {
+        let dir = temp_dir("security-errors");
+        let bad = dir.join("bad.toml");
+        std::fs::write(
+            &bad,
+            "version = 1\n[security]\nunreadable_focus = \"maybe\"\n",
+        )
+        .unwrap();
+        let error = load_paths(Some(&bad), None).unwrap_err();
+        assert!(error.to_string().contains("unreadable_focus"), "{error}");
+        std::fs::write(&bad, "version = 1\nnope = [\n").unwrap();
+        let error = load_paths(Some(&bad), None).unwrap_err();
+        assert!(error.to_string().contains("line "), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -226,7 +226,7 @@ Windows and Linux do not verify this way; their scroll responses keep their exis
 
 ## JSON actions
 
-The `Action` enum in `src/protocol.rs` is the protocol. `id` is echoed on the response. Unknown fields that belong to the action are rejected. Global flags (`app`, `window`, `element`, `diff`, `full`, `return_state`, `include_screenshot`, `coord`, `session`, `tier`, `adapter`, `display`, `require_visible`, `policy`, `confirm_cmd`, `allow_foreground`, `require_background`, `no_overlay`, `cdp`, `cdp_url`) are siblings of `action` and stripped before the action is decoded.
+The `Action` enum in `src/protocol.rs` is the protocol. `id` is echoed on the response. Unknown fields that belong to the action are rejected. Global flags (`app`, `window`, `element`, `diff`, `full`, `return_state`, `include_screenshot`, `coord`, `session`, `tier`, `adapter`, `display`, `require_visible`, `allow_foreground`, `require_background`, `no_overlay`, `cdp`, `cdp_url`) are siblings of `action` and stripped before the action is decoded. `--policy` and `--confirm-cmd` are CLI-only. Unknown fields on an action that has fields are rejected (`invalid_arguments`), so a typo cannot silently fall back to a default.
 
 | `action` | Fields | Notes |
 | --- | --- | --- |

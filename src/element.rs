@@ -796,6 +796,77 @@ mod tests {
     use super::*;
     use crate::tree::NodeFrame;
 
+    #[test]
+    fn frame_center_and_press_route_cover_each_branch() {
+        assert_eq!(frame_center(None), None);
+        assert_eq!(
+            frame_center(Some(SavedFrame {
+                x: 10,
+                y: 20,
+                width: 100,
+                height: 50,
+            })),
+            Some((60, 45))
+        );
+
+        assert_eq!(
+            press_route(MouseButton::Left, 1, &["AXPress".into()], None).unwrap(),
+            vec![Step::Press { count: 1 }]
+        );
+        assert!(press_route(MouseButton::Left, 1, &[], None).is_err());
+        assert_eq!(
+            press_route(MouseButton::Right, 1, &["AXShowMenu".into()], None).unwrap(),
+            vec![Step::Perform {
+                name: "AXShowMenu".into()
+            }]
+        );
+        assert_eq!(
+            press_route(MouseButton::Right, 2, &[], Some((5, 6))).unwrap(),
+            vec![Step::CenterClick {
+                x: 5,
+                y: 6,
+                button: MouseButton::Right,
+                count: 2
+            }]
+        );
+        assert!(press_route(MouseButton::Middle, 1, &[], None).is_err());
+        assert!(press_route(MouseButton::Left, 0, &["AXPress".into()], None).is_err());
+    }
+
+    #[test]
+    fn activate_outcome_carries_press_count_only_for_press() {
+        let request = ElementRequest {
+            op: ElementOp::Press {
+                count: 2,
+                button: MouseButton::Left,
+            },
+            index: 4,
+            require_visible: false,
+            app: None,
+            window: None,
+            session: None,
+            tier: None,
+            allow_foreground: false,
+            require_background: false,
+            no_overlay: true,
+        };
+        let outcome = activate_outcome(&request, 9, vec!["w".into()], true);
+        assert_eq!(outcome.action, "press");
+        assert_eq!(outcome.element, 4);
+        assert_eq!(outcome.revision, 9);
+        assert_eq!(outcome.tier, "activate");
+        assert!(outcome.cursor_moved);
+        assert_eq!(outcome.focus_restored, Some(true));
+        assert_eq!(outcome.via.as_deref(), Some("activate"));
+        assert_eq!(outcome.count, Some(2));
+
+        let focus = ElementRequest {
+            op: ElementOp::Focus,
+            ..request
+        };
+        assert_eq!(activate_outcome(&focus, 1, Vec::new(), false).count, None);
+    }
+
     fn frame(x: f64, y: f64, width: f64, height: f64) -> NodeFrame {
         NodeFrame {
             x,

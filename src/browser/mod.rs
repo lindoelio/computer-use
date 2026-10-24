@@ -383,3 +383,42 @@ pub fn unsupported() -> ComputerError {
         "browser commands require the `cdp` feature (build with --features cdp)".into(),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wait_spec_parses_every_form() {
+        assert_eq!(WaitSpec::parse("none").unwrap(), WaitSpec::None);
+        assert_eq!(WaitSpec::parse(" LOAD ").unwrap(), WaitSpec::Load);
+        assert_eq!(WaitSpec::parse("dom").unwrap(), WaitSpec::DomContentLoaded);
+        assert_eq!(
+            WaitSpec::parse("network-idle").unwrap(),
+            WaitSpec::NetworkIdle
+        );
+        assert_eq!(
+            WaitSpec::parse("selector:#out").unwrap(),
+            WaitSpec::Selector("#out".into())
+        );
+        assert_eq!(
+            WaitSpec::parse("url:https://example.com/*").unwrap(),
+            WaitSpec::Url("https://example.com/*".into())
+        );
+        assert!(WaitSpec::parse("selector:").is_err());
+        assert!(WaitSpec::parse("url:  ").is_err());
+        assert!(WaitSpec::parse("whenever").is_err());
+    }
+
+    #[test]
+    fn dialog_mode_and_overlay_parse() {
+        assert_eq!(DialogMode::parse("accept").unwrap(), DialogMode::Accept);
+        assert_eq!(DialogMode::parse("dismiss").unwrap(), DialogMode::Dismiss);
+        assert_eq!(DialogMode::parse("fail").unwrap(), DialogMode::Fail);
+        assert!(DialogMode::parse("maybe").is_err());
+        assert_eq!(AgentOverlay::parse("auto").unwrap(), AgentOverlay::Auto);
+        assert_eq!(AgentOverlay::parse("on").unwrap(), AgentOverlay::On);
+        assert_eq!(AgentOverlay::parse("off").unwrap(), AgentOverlay::Off);
+        assert!(AgentOverlay::parse("sometimes").is_err());
+    }
+}

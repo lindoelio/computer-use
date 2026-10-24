@@ -522,6 +522,23 @@ fn write_private(path: &std::path::Path, value: &impl Serialize) -> Result<(), C
 mod tests {
     use super::*;
 
+    #[test]
+    fn cache_load_and_clear_cover_missing_corrupt_and_present() {
+        let cache = crate::cache::CacheEnv::acquire();
+        let session = Some("snapshot-cache");
+        assert!(load(session, "target").unwrap().is_none());
+        clear(session, "target").unwrap();
+
+        let path = cache_path(session, "target").unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "not json").unwrap();
+        let error = load(session, "target").unwrap_err();
+        assert!(error.to_string().contains("not readable"), "{error}");
+        clear(session, "target").unwrap();
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(cache.dir());
+    }
+
     fn node(index: usize, role: &str, name: &str) -> SnapshotNode {
         SnapshotNode {
             index,

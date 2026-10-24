@@ -269,15 +269,31 @@ fn http_ws_url(base: &str) -> Result<String, ComputerError> {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(ComputerError::Io)?;
-    use std::io::{Read, Write};
+    use std::io::{ErrorKind, Read, Write};
     let request = format!("GET {path} HTTP/1.1\r\nHost: {hostport}\r\nConnection: close\r\n\r\n");
     stream
         .write_all(request.as_bytes())
         .map_err(ComputerError::Io)?;
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .map_err(ComputerError::Io)?;
+    // Read until EOF, a timeout, or a sane cap. Chrome does not always close
+    // the connection promptly, and a read timeout must not discard the body we
+    // already have (it used to surface as an EAGAIN `io_error`).
+    let mut response = Vec::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                response.extend_from_slice(&buffer[..read]);
+                if response.len() > 64 * 1024 {
+                    break;
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+            Err(error) if error.kind() == ErrorKind::TimedOut => break,
+            Err(error) => return Err(ComputerError::Io(error)),
+        }
+    }
+    let response = String::from_utf8_lossy(&response);
     let body = response.split("\r\n\r\n").nth(1).unwrap_or("");
     let value: serde_json::Value = serde_json::from_str(body)
         .map_err(|error| cdp_unavailable(format!("json/version from {base}: {error}")))?;
@@ -376,15 +392,20 @@ fn maybe_rescue_dialog(options: &BrowserOptions, result: &serde_json::Value) {
 
 /// Handle `Page.javascriptDialogOpening` in the background so actions that
 /// trigger an alert/confirm/prompt do not hang.
-fn spawn_dialog_handler(page: &Page, mode: crate::browser::DialogMode) {
+///
+/// The listener is registered before this returns: spawning a task that
+/// subscribes later races the action that opens the dialog, and the dialog
+/// then blocks the load wait until it times out.
+async fn spawn_dialog_handler(page: &Page, mode: crate::browser::DialogMode) {
+    let Ok(mut events) = page
+        .event_listener::<chromiumoxide::cdp::browser_protocol::page::EventJavascriptDialogOpening>(
+        )
+        .await
+    else {
+        return;
+    };
     let dialog_page = page.clone();
     tokio::spawn(async move {
-        let Ok(mut events) = dialog_page
-            .event_listener::<chromiumoxide::cdp::browser_protocol::page::EventJavascriptDialogOpening>()
-            .await
-        else {
-            return;
-        };
         while let Some(_event) = events.next().await {
             let accept = mode == crate::browser::DialogMode::Accept;
             let params =
@@ -498,7 +519,7 @@ where
             install_agent_marker(&browser, &page).await;
         }
         if dialog_mode != crate::browser::DialogMode::Fail {
-            spawn_dialog_handler(&page, dialog_mode);
+            spawn_dialog_handler(&page, dialog_mode).await;
         }
         operation(browser, page).await
     })
@@ -878,12 +899,21 @@ async fn history_move(page: &Page, forward: bool) -> Result<String, ComputerErro
     } else {
         "window.history.back()"
     };
-    evaluate_ignoring_context_loss(page, expression).await?;
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        let url = current_url(page).await;
-        if url != before {
-            return Ok(url);
+        // A navigation can replace the execution context and swallow the
+        // evaluate; retry it until the deadline instead of failing after one
+        // lost call.
+        let _ = evaluate_ignoring_context_loss(page, expression).await;
+        for _ in 0..40 {
+            let url = current_url(page).await;
+            if url != before {
+                return Ok(url);
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
         if Instant::now() >= deadline {
             return Err(ComputerError::ExecutionFailed(if forward {
@@ -892,7 +922,6 @@ async fn history_move(page: &Page, forward: bool) -> Result<String, ComputerErro
                 "no back history entry".into()
             }));
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -992,6 +1021,20 @@ fn element_args(
         (Some(selector), None) => Ok((Some(selector.to_string()), None)),
         (None, Some(ref_id)) => Ok((None, Some(ref_id.to_string()))),
     }
+}
+
+/// `--selector`/`--ref` for a command where focusing an element is optional,
+/// such as `browser press` (a page-level key press has no target element).
+fn optional_element_args(
+    selector: Option<&str>,
+    ref_id: Option<&str>,
+) -> Result<(Option<String>, Option<String>), ComputerError> {
+    if selector.is_some() && ref_id.is_some() {
+        return Err(ComputerError::InvalidArguments(
+            "pass --selector or --ref, not both".into(),
+        ));
+    }
+    Ok((selector.map(str::to_string), ref_id.map(str::to_string)))
 }
 
 /// Dispatch one command.
@@ -1299,7 +1342,8 @@ pub fn dispatch(command: BrowserCommand, options: &BrowserOptions) -> Result<Val
             ref_id,
             keys,
         } => {
-            let (selector, ref_id) = element_args(selector.as_deref(), ref_id.as_deref())?;
+            // A page-level press (`--keys Tab`) has no element to focus.
+            let (selector, ref_id) = optional_element_args(selector.as_deref(), ref_id.as_deref())?;
             let session = options.session.clone();
             let result = run_page(options, target, move |_browser, page| async move {
                 let target_id = page.target_id().as_ref().to_string();

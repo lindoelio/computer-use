@@ -446,6 +446,108 @@ fn wait_without_duration_is_a_json_error() {
     assert_eq!(value["error"]["code"], "invalid_arguments");
 }
 
+/// Every flag-parsing branch reports one JSON object with a stable code.
+#[test]
+fn cli_flag_matrix_reports_clean_errors() {
+    let cases: &[(&[&str], Option<&str>)] = &[
+        (
+            &["--tier", "bogus", "wait", "--ms", "0"],
+            Some("invalid_arguments"),
+        ),
+        (
+            &["--coord", "bogus", "wait", "--ms", "0"],
+            Some("invalid_arguments"),
+        ),
+        (
+            &["--adapter", "bogus", "wait", "--ms", "0"],
+            Some("invalid_arguments"),
+        ),
+        (
+            &["--display", "999", "screenshot", "--output", "/tmp/x.png"],
+            Some("invalid_arguments"),
+        ),
+        (
+            &[
+                "--policy",
+                "/definitely/missing.toml",
+                "tree",
+                "--app",
+                "Finder",
+            ],
+            Some("invalid_arguments"),
+        ),
+        (
+            &["--cdp", "--agent-overlay", "bogus", "browser", "sessions"],
+            Some("invalid_arguments"),
+        ),
+        (&["exec", "not json"], Some("invalid_arguments")),
+        (
+            &["exec", r#"{"action":"definitely_not_an_action"}"#],
+            Some("invalid_arguments"),
+        ),
+        (
+            &["exec", r#"{"action":"wait","ms":1,"timeout":5000}"#],
+            Some("invalid_arguments"),
+        ),
+        // Read-only actions ignore the post-state flags instead of failing.
+        (&["--state", "wait", "--ms", "0"], None),
+        (&["--state-diff", "wait", "--ms", "0"], None),
+        (&["--screenshot", "wait", "--ms", "0"], None),
+    ];
+    for (args, code) in cases {
+        let output = run(args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("panicked at"),
+            "{}: {stderr}",
+            args.join(" ")
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let value: Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|error| panic!("{}: {stdout:?} ({error})", args.join(" ")));
+        assert!(value.get("ok").is_some(), "{}: {value}", args.join(" "));
+        match code {
+            Some(code) => assert_eq!(value["error"]["code"], *code, "{}: {value}", args.join(" ")),
+            None => assert_eq!(value["ok"], true, "{}: {value}", args.join(" ")),
+        }
+    }
+}
+
+/// The CDP gate reports the build state: `unsupported` without the feature,
+/// `cdp_unavailable` when the feature is on but no endpoint answers.
+#[test]
+fn cli_cdp_gate_reports_the_feature_state() {
+    let output = run(&["--cdp", "--cdp-url", "ws://127.0.0.1:1", "browser", "tabs"]);
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let expected = if cfg!(feature = "cdp") {
+        "cdp_unavailable"
+    } else {
+        "unsupported"
+    };
+    assert_eq!(value["error"]["code"], expected, "{value}");
+}
+
+/// A malformed policy file is reported before any action runs.
+#[test]
+fn cli_bad_policy_file_is_a_clean_error() {
+    let dir = TempDir::new("bad-policy");
+    let policy = dir.path().join("policy.toml");
+    std::fs::write(&policy, "version = 1\ndefault = \"sometimes\"\n").unwrap();
+    let output = run(&[
+        "--policy",
+        policy.to_str().unwrap(),
+        "tree",
+        "--app",
+        "Finder",
+    ]);
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_arguments", "{value}");
+    assert!(value["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("line "));
+}
+
 #[test]
 fn serve_wait_roundtrip() {
     assert_json_wait(&["serve"]);
@@ -509,7 +611,20 @@ fn cli_surface_sweep_is_guarded_and_well_formed() {
         &["window", "info"],
         &["window", "state", "--app", "no-such-app-xyz"],
         &["screenshot", "--region", "0,0,2,2", "--output", &shot],
+        &["screenshot", "--app", "Finder", "--output", &shot],
+        &[
+            "screenshot",
+            "--app",
+            "Finder",
+            "--marks",
+            "--output",
+            &shot,
+        ],
         &["zoom", "--region", "0,0,2,2", "--output", &shot],
+        &[
+            "zoom", "--app", "Finder", "--region", "0,0,2,2", "--output", &shot,
+        ],
+        &["session", "end"],
         &["tree", "--app", "Finder"],
         &["ocr", "--app", "Finder"],
         &["ocr", "--image", "/definitely/missing/image.png"],

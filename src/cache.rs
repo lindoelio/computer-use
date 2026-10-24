@@ -600,6 +600,59 @@ mod tests {
     use super::*;
     use crate::tree::SigNode;
 
+    #[test]
+    fn prune_removes_only_empty_session_directories() {
+        let cache = CacheEnv::acquire();
+        let root = sessions_root();
+        fs::create_dir_all(root.join("empty")).unwrap();
+        fs::create_dir_all(root.join("full")).unwrap();
+        fs::write(root.join("full").join("snapshot.json"), "{}").unwrap();
+        fs::write(root.join("loose-file"), "x").unwrap();
+
+        let removed = prune_empty_sessions().unwrap();
+        assert_eq!(removed, vec!["empty"]);
+        assert!(!root.join("empty").exists());
+        assert!(root.join("full").exists());
+        assert!(root.join("loose-file").exists());
+
+        fs::remove_dir_all(&root).unwrap();
+        assert!(prune_empty_sessions().unwrap().is_empty());
+        let _ = fs::remove_dir_all(cache.dir());
+    }
+
+    #[test]
+    fn secret_bytes_are_written_with_mode_600() {
+        let cache = CacheEnv::acquire();
+        let path = cache.dir().join("bytes.bin");
+        write_secret_bytes(&path, b"abc").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"abc");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "mode {mode:o}");
+        }
+        let _ = fs::remove_dir_all(cache.dir());
+    }
+
+    #[test]
+    fn corrupt_snapshots_and_maps_are_reported() {
+        let cache = CacheEnv::acquire();
+        let path = snapshot_path(Some("corrupt"), Some("com.apple.Notes"), 1, 2).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "not json").unwrap();
+        let error = load(Some("corrupt"), Some("com.apple.Notes"), 1, 2).unwrap_err();
+        assert!(error.to_string().contains("not readable"), "{error}");
+
+        let map_path = session_dir(Some("corrupt"))
+            .unwrap()
+            .join("screenshot-map.json");
+        fs::write(&map_path, "not json").unwrap();
+        let error = load_screenshot_map(Some("corrupt")).unwrap_err();
+        assert!(error.to_string().contains("not readable"), "{error}");
+        let _ = fs::remove_dir_all(cache.dir());
+    }
+
     fn sample(pid: i32, window: u32, value: &str) -> Snapshot {
         Snapshot {
             revision: 7,

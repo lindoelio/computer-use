@@ -726,6 +726,33 @@ fn hash_bytes(hash: &mut u64, bytes: &[u8]) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn find_sig_matches_the_root_a_child_and_a_miss() {
+        let mut root = SigNode {
+            index: 0,
+            role: "AXWindow".into(),
+            identity: "w".into(),
+            child_count: 1,
+            value: String::new(),
+            frame: None,
+            secure: false,
+            children: Vec::new(),
+        };
+        root.children.push(SigNode {
+            index: 3,
+            role: "AXButton".into(),
+            identity: "Save".into(),
+            child_count: 0,
+            value: String::new(),
+            frame: None,
+            secure: false,
+            children: Vec::new(),
+        });
+        assert_eq!(find_sig(&root, 0).unwrap().role, "AXWindow");
+        assert_eq!(find_sig(&root, 3).unwrap().identity, "Save");
+        assert!(find_sig(&root, 9).is_none());
+    }
+
     fn frame(x: f64, y: f64, width: f64, height: f64) -> NodeFrame {
         NodeFrame {
             x,

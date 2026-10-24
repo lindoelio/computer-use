@@ -189,3 +189,28 @@ fn wait(object: &Map<String, Value>) -> Result<Action, ComputerError> {
     }
     Ok(Action::wait_sleep(ms.map(|value| value as u64), seconds))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wait_duration_forms_and_errors() {
+        // No duration is a zero sleep.
+        let action = translate(&serde_json::json!({"type": "wait"})).unwrap();
+        assert_eq!(action, Action::wait_sleep(Some(0), None));
+        let with_ms = translate(&serde_json::json!({"type": "wait", "ms": 5})).unwrap();
+        assert_eq!(with_ms, Action::wait_sleep(Some(5), None));
+        let with_seconds = translate(&serde_json::json!({"type": "wait", "seconds": 1.5})).unwrap();
+        assert_eq!(with_seconds, Action::wait_sleep(None, Some(1.5)));
+        let negative = translate(&serde_json::json!({"type": "wait", "ms": -1})).unwrap_err();
+        assert_eq!(negative.code(), "invalid_arguments");
+    }
+
+    #[test]
+    fn unknown_action_types_are_rejected() {
+        let error = translate(&serde_json::json!({"type": "teleport"})).unwrap_err();
+        assert_eq!(error.code(), "invalid_arguments");
+        assert!(error.to_string().contains("teleport"), "{error}");
+    }
+}
