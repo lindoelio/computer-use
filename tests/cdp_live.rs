@@ -124,7 +124,8 @@ fn start_browser() -> Option<Browser> {
         std::env::temp_dir().join(format!("computer-use-cdp-live-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&profile);
     std::fs::create_dir_all(&profile).ok()?;
-    let child = Command::new(&executable)
+    let mut command = Command::new(&executable);
+    command
         .arg("--headless=new")
         .arg("--remote-debugging-port=0")
         .arg(format!("--user-data-dir={}", profile.display()))
@@ -133,11 +134,24 @@ fn start_browser() -> Option<Browser> {
         .arg("--no-default-browser-check")
         .arg("--disable-background-networking")
         .arg("--disable-extensions")
-        .arg("--disable-default-apps")
+        .arg("--disable-default-apps");
+    if cfg!(target_os = "linux") {
+        // The Linux runners have no usable sandbox for an unprivileged
+        // headless Chrome and a small /dev/shm. Without these flags the
+        // browser exits before it writes `DevToolsActivePort`.
+        command
+            .arg("--no-sandbox")
+            .arg("--disable-dev-shm-usage")
+            .arg("--disable-gpu");
+    }
+    // Keep the browser's stderr: when it refuses to start, that output is
+    // the only explanation of why the fixture is missing.
+    let log = std::fs::File::create(profile.join("chrome-stderr.log")).ok()?;
+    let child = command
         .arg("about:blank")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(log))
         .spawn()
         .ok()?;
     let port_file = profile.join("DevToolsActivePort");
@@ -194,7 +208,7 @@ struct Fixture {
     lock: Mutex<()>,
 }
 
-fn fixture() -> &'static Fixture {
+fn fixture() -> Option<&'static Fixture> {
     static FIXTURE: OnceLock<Option<Fixture>> = OnceLock::new();
     FIXTURE
         .get_or_init(|| {
@@ -213,11 +227,53 @@ fn fixture() -> &'static Fixture {
             })
         })
         .as_ref()
-        .expect("fixture")
+}
+
+/// The browser fixture, or the reason the test cannot run.
+///
+/// A browser that is absent is a skip; a browser that is present but refuses
+/// to start is a failure, because `COMPUTER_USE_REQUIRE_LIVE=1` says the live
+/// suite must not be silently skipped.
+macro_rules! fixture_or_skip {
+    () => {
+        match fixture() {
+            Some(fixture) => fixture,
+            None => {
+                if std::env::var("COMPUTER_USE_REQUIRE_LIVE").ok().as_deref() == Some("1") {
+                    panic!("the Chromium fixture did not start: {}", browser_log_tail());
+                }
+                eprintln!("skipping live CDP test: the Chromium fixture did not start");
+                return;
+            }
+        }
+    };
+}
+
+/// The tail of the browser's stderr, for the "it did not start" message.
+fn browser_log_tail() -> String {
+    let dir = std::env::temp_dir().join(format!("computer-use-cdp-live-{}", std::process::id()));
+    let log = dir.join("chrome-stderr.log");
+    match std::fs::read_to_string(log) {
+        Ok(text) => text.lines().rev().take(5).collect::<Vec<_>>().join(" | "),
+        Err(_) => "no browser output".to_string(),
+    }
 }
 
 fn run_cdp(args: &[&str]) -> Value {
-    let fixture = fixture();
+    let value = run_cdp_once(args);
+    let stale = value["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("Session with given id not found"));
+    if stale {
+        // The browser detached the page between two commands; the next
+        // attach gets a fresh session, so one retry is enough.
+        return run_cdp_once(args);
+    }
+    value
+}
+
+fn run_cdp_once(args: &[&str]) -> Value {
+    let fixture = fixture().expect("the Chromium fixture did not start");
     let mut command = Command::new(bin());
     command
         .args(["--cdp", "--cdp-url"])
@@ -238,13 +294,14 @@ fn run_cdp(args: &[&str]) -> Value {
 }
 
 fn base_url() -> String {
-    format!("http://127.0.0.1:{}/", fixture().server_port)
+    let fixture = fixture().expect("the Chromium fixture did not start");
+    format!("http://127.0.0.1:{}/", fixture.server_port)
 }
 
 #[test]
 fn tabs_contract_uses_kind() {
     skip_without_chrome!();
-    let fixture = fixture();
+    let fixture = fixture_or_skip!();
     let _guard = fixture
         .lock
         .lock()
@@ -262,7 +319,7 @@ fn tabs_contract_uses_kind() {
 #[test]
 fn navigate_snapshot_and_click_by_ref() {
     skip_without_chrome!();
-    let fixture = fixture();
+    let fixture = fixture_or_skip!();
     let _guard = fixture
         .lock
         .lock()
@@ -324,7 +381,7 @@ fn navigate_snapshot_and_click_by_ref() {
 #[test]
 fn type_and_secure_field_refusal() {
     skip_without_chrome!();
-    let fixture = fixture();
+    let fixture = fixture_or_skip!();
     let _guard = fixture
         .lock
         .lock()
@@ -385,7 +442,7 @@ fn type_and_secure_field_refusal() {
 #[test]
 fn browser_batch_runs_steps_in_one_call() {
     skip_without_chrome!();
-    let fixture = fixture();
+    let fixture = fixture_or_skip!();
     let _guard = fixture
         .lock
         .lock()
@@ -407,7 +464,7 @@ fn browser_batch_runs_steps_in_one_call() {
 #[test]
 fn agent_marker_is_visible() {
     skip_without_chrome!();
-    let fixture = fixture();
+    let fixture = fixture_or_skip!();
     let _guard = fixture
         .lock
         .lock()
@@ -444,7 +501,7 @@ fn agent_marker_is_visible() {
 #[test]
 fn blocked_url_is_refused_before_connecting() {
     skip_without_chrome!();
-    let fixture = fixture();
+    let fixture = fixture_or_skip!();
     let _guard = fixture
         .lock
         .lock()
@@ -471,7 +528,7 @@ fn blocked_url_is_refused_before_connecting() {
 #[test]
 fn press_hover_scroll_select_and_check() {
     skip_without_chrome!();
-    let fixture = fixture();
+    let fixture = fixture_or_skip!();
     let _guard = fixture
         .lock
         .lock()
@@ -543,7 +600,7 @@ fn press_hover_scroll_select_and_check() {
 #[test]
 fn upload_screenshot_eval_dialog_and_tabs() {
     skip_without_chrome!();
-    let fixture = fixture();
+    let fixture = fixture_or_skip!();
     let _guard = fixture
         .lock
         .lock()
@@ -676,7 +733,7 @@ impl Drop for ManagedQuit {
 #[test]
 fn managed_launch_sessions_and_quit() {
     skip_without_chrome!();
-    let fixture = fixture();
+    let fixture = fixture_or_skip!();
     let _guard = fixture
         .lock
         .lock()
@@ -735,7 +792,7 @@ fn managed_launch_sessions_and_quit() {
 #[test]
 fn navigation_history_reload_waits_and_activate() {
     skip_without_chrome!();
-    let fixture = fixture();
+    let fixture = fixture_or_skip!();
     let _guard = fixture
         .lock
         .lock()
@@ -838,7 +895,7 @@ fn navigation_history_reload_waits_and_activate() {
 #[test]
 fn selector_ref_and_batch_errors_are_reported() {
     skip_without_chrome!();
-    let fixture = fixture();
+    let fixture = fixture_or_skip!();
     let _guard = fixture
         .lock
         .lock()
@@ -890,7 +947,7 @@ fn selector_ref_and_batch_errors_are_reported() {
 #[test]
 fn snapshot_refs_reach_element_commands() {
     skip_without_chrome!();
-    let fixture = fixture();
+    let fixture = fixture_or_skip!();
     let _guard = fixture
         .lock
         .lock()
@@ -1005,7 +1062,7 @@ fn ref_for(text: &str, needle: &str) -> String {
 #[test]
 fn new_tab_ambiguous_targets_and_blocked_rows() {
     skip_without_chrome!();
-    let fixture = fixture();
+    let fixture = fixture_or_skip!();
     let _guard = fixture
         .lock
         .lock()

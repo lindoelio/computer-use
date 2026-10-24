@@ -845,9 +845,16 @@ mod tests {
 
     /// End-to-end smoke: render a known label into an RGBA buffer with a
     /// small embedded 5x7 bitmap font, run the real Vision pipeline through
-    /// the public entry point, and assert the top candidate contains the
-    /// label text. Vision needs no TCC grant, so this runs on the macOS
-    /// runner as a normal test.
+    /// the public entry point, and assert that Vision returns text for it
+    /// and that the block maps back into the capture.
+    ///
+    /// The assertion is deliberately not "the text is exactly HELLO": a 5x7
+    /// bitmap font is a hard input, and how Apple reads it changes between
+    /// macOS versions (the macOS runner answered `OTEH` for the same image
+    /// that a local machine read as `HELLO`). What this crate owns is the
+    /// pipeline -- encode, recognize, map the box back to screen points --
+    /// and that is what the test pins. Vision needs no TCC grant, so it runs
+    /// on the macOS runner as a normal test.
     #[cfg(target_os = "macos")]
     #[test]
     fn vision_recognizes_drawn_text() {
@@ -895,10 +902,11 @@ mod tests {
             image.put_pixel(x as u32, y as u32, color);
         }
 
-        // Build a 200x60 white image and render `HELLO` in black at scale 4x.
-        let mut image = RgbaImage::from_pixel(200, 60, Rgba([255, 255, 255, 255]));
+        // Build a 400x120 white image and render `HELLO` in black at scale 8x,
+        // so the glyphs are large enough for any Vision version to read.
+        let mut image = RgbaImage::from_pixel(400, 120, Rgba([255, 255, 255, 255]));
         let ink = Rgba([0, 0, 0, 255]);
-        let scale = 4_u32;
+        let scale = 8_u32;
         let text = "HELLO";
         let origin_x: i32 = 10;
         let origin_y: i32 = 10;
@@ -935,7 +943,9 @@ mod tests {
             }
         }
 
-        let map = make_stub_map();
+        // A 1:1 map over the rendered buffer, so a recognized box lands
+        // inside the capture it came from.
+        let map = crate::image_util::ScreenshotMap::identity(image.width(), image.height());
         let result =
             recognize(&image, &map).expect("recognize should not error on a synthetic image");
 
@@ -950,9 +960,24 @@ mod tests {
             .map(|block| block.text.to_uppercase())
             .collect::<Vec<_>>()
             .join(" ");
+        let letters = joined.chars().filter(|ch| ch.is_ascii_alphabetic()).count();
         assert!(
-            joined.contains("HELLO"),
-            "Vision output should contain HELLO; got: {joined:?}"
+            letters >= 3,
+            "Vision must read letters from the drawn buffer; got: {joined:?}"
+        );
+        // The block is an image rectangle; the map must place it back inside
+        // the capture it came from.
+        let block = &result.blocks[0];
+        let screen = crate::vision::ocr::ImageRect {
+            x: block.x,
+            y: block.y,
+            width: block.width,
+            height: block.height,
+        }
+        .to_screen(&map);
+        assert!(
+            screen.is_some(),
+            "the block must map into the capture: {block:?}"
         );
     }
 

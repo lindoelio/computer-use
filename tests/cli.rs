@@ -507,7 +507,11 @@ fn cli_flag_matrix_reports_clean_errors() {
             .unwrap_or_else(|error| panic!("{}: {stdout:?} ({error})", args.join(" ")));
         assert!(value.get("ok").is_some(), "{}: {value}", args.join(" "));
         match code {
-            Some(code) => assert_eq!(value["error"]["code"], *code, "{}: {value}", args.join(" ")),
+            Some(codes) => assert!(
+                codes.contains(value["error"]["code"].as_str().unwrap_or_default()),
+                "{}: {value} (accepted {codes:?})",
+                args.join(" ")
+            ),
             None => assert_eq!(value["ok"], true, "{}: {value}", args.join(" ")),
         }
     }

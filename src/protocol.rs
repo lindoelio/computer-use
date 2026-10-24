@@ -2052,6 +2052,22 @@ struct Prepared {
     source: &'static str,
 }
 
+/// True when the action only exists on macOS.
+///
+/// The check runs before the policy gate: a confirm hook cannot make
+/// `osascript` or the `shortcuts` binary exist on another platform, so
+/// asking for a hook there would be a dead end.
+fn platform_unsupported(action: &Action) -> Option<ComputerError> {
+    if cfg!(target_os = "macos") {
+        return None;
+    }
+    match action {
+        Action::AppleEvent { .. } => Some(unsupported_error("apple-event")),
+        Action::ShortcutsRun { .. } => Some(unsupported_error("shortcuts_run")),
+        _ => None,
+    }
+}
+
 fn early_stop(warning: Option<String>, subject: policy::Subject, response: Response) -> Prepared {
     Prepared {
         stop: Some(response),
@@ -2138,6 +2154,15 @@ fn prepare_action(
             PolicyClass::Script => policy::PolicyAction::Script,
         },
     };
+    if let Some(error) = platform_unsupported(action) {
+        return Prepared {
+            stop: Some(Response::from_error(error)),
+            warning,
+            subject,
+            decision: "unsupported",
+            source: "builtin",
+        };
+    }
     let decision = policy::decide(&loaded, &subject, &policy_action);
     if let policy::Decision::Deny { message, source } = &decision {
         return Prepared {
@@ -10711,6 +10736,43 @@ mod tests {
     }
 
     #[test]
+    fn macos_only_scripts_answer_unsupported_off_macos() {
+        let backend = StubBackend::default();
+        // No confirm hook: the platform gate has to answer first, or the
+        // action would ask for a hook that cannot make it work here.
+        for action in [
+            Action::AppleEvent {
+                app: Some("Notes".into()),
+                script: "return 1".into(),
+                language: None,
+            },
+            Action::ShortcutsRun {
+                name: "Open URL".into(),
+            },
+        ] {
+            let response = dispatch_with_context(&backend, action, &CallContext::default());
+            if cfg!(target_os = "macos") {
+                // On macOS the script runs, so the policy asks for a hook.
+                assert_eq!(
+                    response.to_value()["error"]["code"],
+                    "confirm_required",
+                    "{response:?}"
+                );
+            } else {
+                assert_eq!(
+                    response.to_value()["error"]["code"],
+                    "unsupported",
+                    "{response:?}"
+                );
+                assert!(response.to_value()["error"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains(std::env::consts::OS));
+            }
+        }
+    }
+
+    #[test]
     fn menu_dock_apple_event_shortcuts_and_spaces_errors() {
         let backend = StubBackend::default();
         let missing_app = [
@@ -10745,6 +10807,13 @@ mod tests {
             confirm_cmd: Some(allow.clone()),
             ..CallContext::default()
         };
+        // Off macOS the action does not exist, so it answers `unsupported`
+        // before the confirm hook is asked for.
+        let script_code = if cfg!(target_os = "macos") {
+            "invalid_arguments"
+        } else {
+            "unsupported"
+        };
         let missing_script_app = dispatch_with_context(
             &backend,
             Action::AppleEvent {
@@ -10756,7 +10825,8 @@ mod tests {
         );
         assert_eq!(
             missing_script_app.to_value()["error"]["code"],
-            "invalid_arguments"
+            script_code,
+            "{missing_script_app:?}"
         );
         let empty_script = dispatch_with_context(
             &backend,
@@ -10784,7 +10854,11 @@ mod tests {
             Action::ShortcutsRun { name: "  ".into() },
             &script_context,
         );
-        assert_eq!(empty_name.to_value()["error"]["code"], "invalid_arguments");
+        assert_eq!(
+            empty_name.to_value()["error"]["code"],
+            script_code,
+            "{empty_name:?}"
+        );
 
         let spaces = dispatch_with_context(
             &backend,
