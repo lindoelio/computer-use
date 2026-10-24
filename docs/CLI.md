@@ -785,6 +785,12 @@ newest `browser launch` session is used. `browser launch` is the reliable
 path on Chrome 136+, which ignores `--remote-debugging-port` on the default
 data directory.
 
+On Linux, `browser launch` starts Chrome with the sandbox disabled when the
+process runs as root or when `COMPUTER_USE_CHROME_NO_SANDBOX=1` is set:
+Chrome's sandbox needs user namespaces that a root shell and a container
+often deny, and without them the browser exits before it opens its debug
+port. Every other platform keeps the sandbox on.
+
 Per-subcommand flags:
 
 ```

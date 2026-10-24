@@ -449,22 +449,24 @@ fn wait_without_duration_is_a_json_error() {
 /// Every flag-parsing branch reports one JSON object with a stable code.
 #[test]
 fn cli_flag_matrix_reports_clean_errors() {
-    let cases: &[(&[&str], Option<&str>)] = &[
+    let cases: &[(&[&str], Option<&[&str]>)] = &[
         (
             &["--tier", "bogus", "wait", "--ms", "0"],
-            Some("invalid_arguments"),
+            Some(&["invalid_arguments"]),
         ),
         (
             &["--coord", "bogus", "wait", "--ms", "0"],
-            Some("invalid_arguments"),
+            Some(&["invalid_arguments"]),
         ),
         (
             &["--adapter", "bogus", "wait", "--ms", "0"],
-            Some("invalid_arguments"),
+            Some(&["invalid_arguments"]),
         ),
         (
             &["--display", "999", "screenshot", "--output", "/tmp/x.png"],
-            Some("invalid_arguments"),
+            // A platform that cannot enumerate its monitors fails before it
+            // can reject the id; both answers are correct there.
+            Some(&["invalid_arguments", "execution_failed"]),
         ),
         (
             &[
@@ -474,20 +476,20 @@ fn cli_flag_matrix_reports_clean_errors() {
                 "--app",
                 "Finder",
             ],
-            Some("invalid_arguments"),
+            Some(&["invalid_arguments"]),
         ),
         (
             &["--cdp", "--agent-overlay", "bogus", "browser", "sessions"],
-            Some("invalid_arguments"),
+            Some(&["invalid_arguments"]),
         ),
-        (&["exec", "not json"], Some("invalid_arguments")),
+        (&["exec", "not json"], Some(&["invalid_arguments"])),
         (
             &["exec", r#"{"action":"definitely_not_an_action"}"#],
-            Some("invalid_arguments"),
+            Some(&["invalid_arguments"]),
         ),
         (
             &["exec", r#"{"action":"wait","ms":1,"timeout":5000}"#],
-            Some("invalid_arguments"),
+            Some(&["invalid_arguments"]),
         ),
         // Read-only actions ignore the post-state flags instead of failing.
         (&["--state", "wait", "--ms", "0"], None),
@@ -508,7 +510,7 @@ fn cli_flag_matrix_reports_clean_errors() {
         assert!(value.get("ok").is_some(), "{}: {value}", args.join(" "));
         match code {
             Some(codes) => assert!(
-                codes.contains(value["error"]["code"].as_str().unwrap_or_default()),
+                codes.contains(&value["error"]["code"].as_str().unwrap_or_default()),
                 "{}: {value} (accepted {codes:?})",
                 args.join(" ")
             ),

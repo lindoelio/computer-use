@@ -7414,6 +7414,9 @@ mod tests {
         );
     }
 
+    // `apple-event` and `shortcuts run` only exist on macOS: off it
+    // they answer `unsupported` before the action reaches a backend.
+    #[cfg(target_os = "macos")]
     #[test]
     fn script_actions_require_confirmation_by_default() {
         let backend = StubBackend::default();
@@ -8644,6 +8647,9 @@ mod tests {
         assert_eq!(response.to_value()["error"]["code"], "execution_failed");
     }
 
+    // `apple-event` and `shortcuts run` only exist on macOS: off it
+    // they answer `unsupported` before the action reaches a backend.
+    #[cfg(target_os = "macos")]
     #[test]
     fn p9_apple_event_records_only_length_and_language() {
         let backend = StubBackend::default();
@@ -8675,6 +8681,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // `apple-event` and `shortcuts run` only exist on macOS: off it
+    // they answer `unsupported` before the action reaches a backend.
+    #[cfg(target_os = "macos")]
     #[test]
     fn p9_apple_event_records_language_javascript() {
         let backend = StubBackend::default();
@@ -8695,6 +8704,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // `apple-event` and `shortcuts run` only exist on macOS: off it
+    // they answer `unsupported` before the action reaches a backend.
+    #[cfg(target_os = "macos")]
     #[test]
     fn p9_apple_event_failure_surfaces_execution_failed() {
         let backend = StubBackend {
@@ -10839,7 +10851,8 @@ mod tests {
         );
         assert_eq!(
             empty_script.to_value()["error"]["code"],
-            "invalid_arguments"
+            script_code,
+            "{empty_script:?}"
         );
 
         let empty_title = dispatch_with_context(

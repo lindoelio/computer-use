@@ -10,13 +10,18 @@ reports it on Linux and Windows.
 rustup component add llvm-tools-preview
 cargo install cargo-llvm-cov          # or: brew install cargo-llvm-cov
 export COMPUTER_USE_REQUIRE_LIVE=1    # the live CDP suite is part of the 95%
+cargo llvm-cov clean                   # drop profile data from another build
 cargo llvm-cov --all-targets --all-features --json --output-path cov.json
 python3 scripts/coverage-gate.py cov.json --os macos
 ```
 
 `cov.json` is not committed. Without `COMPUTER_USE_REQUIRE_LIVE=1` the live
 CDP tests skip and the measured set falls below the floor; CI installs Chrome
-and sets the variable for the same reason. `--mode report` prints the numbers
+and sets the variable for the same reason. `cargo llvm-cov clean` is not
+optional: profile data left in the target directory by a build with a
+different feature set is merged into the report, and the `cfg(feature)`
+blocks of both variants are then counted, which inflates the denominator and
+makes the number meaningless. `--mode report` prints the numbers
 without failing, which is what the Linux and Windows jobs do for now.
 
 ## Policy
@@ -80,7 +85,7 @@ CDP suite and the in-process Vision test; both need their real engine):
 | | Value |
 | --- | --- |
 | Whole crate (all files) | ~80.1% |
-| Measurable set (allowlist applied) | **95.47%** |
+| Measurable set (allowlist applied) | **95.28%** |
 | Enforced floor | 95.0% |
 | Target | 95.0% |
 | Gap | **0 lines** |

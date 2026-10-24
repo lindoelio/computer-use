@@ -212,6 +212,28 @@ fn search_path(name: &str) -> Option<PathBuf> {
     None
 }
 
+/// Chrome flags for a container or a root shell.
+///
+/// Chrome's sandbox needs user namespaces it cannot always get: as root the
+/// sandbox is refused outright, and a container often denies the namespace
+/// the sandbox needs. Chrome then exits before it writes
+/// `DevToolsActivePort`, and `browser launch` reports that as a missing
+/// port file. `COMPUTER_USE_CHROME_NO_SANDBOX=1` asks for the same profile
+/// explicitly.
+fn container_flags() -> Vec<&'static str> {
+    #[cfg(target_os = "linux")]
+    {
+        let as_root = unsafe { libc::geteuid() == 0 };
+        let asked = std::env::var("COMPUTER_USE_CHROME_NO_SANDBOX")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if as_root || asked {
+            return vec!["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"];
+        }
+    }
+    Vec::new()
+}
+
 /// Launch a managed Chromium. Returns the session record as JSON.
 pub fn launch(
     browser: Option<&str>,
@@ -250,6 +272,9 @@ pub fn launch(
         .stderr(Stdio::null());
     if headless {
         command.arg("--headless=new");
+    }
+    for flag in container_flags() {
+        command.arg(flag);
     }
     command.arg(url.unwrap_or("about:blank"));
     let child = command.spawn().map_err(|error| {

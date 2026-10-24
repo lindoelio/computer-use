@@ -50,6 +50,9 @@ jobs:
           # This job installs Chrome, so a missing browser must fail the build
           # instead of silently skipping every live test.
           COMPUTER_USE_REQUIRE_LIVE: "1"
+          # The Linux runner denies the user namespaces Chrome's sandbox needs,
+          # so the browser exits before it writes `DevToolsActivePort`.
+          COMPUTER_USE_CHROME_NO_SANDBOX: "1"
         run: cargo test --features cdp --test cdp_live -- --test-threads=1
 
   test:
@@ -233,7 +236,14 @@ jobs:
           # Chrome is installed above; a missing browser would silently drop
           # the live-CDP lines from the measurement.
           COMPUTER_USE_REQUIRE_LIVE: "1"
-        run: cargo llvm-cov --all-targets --all-features --json --output-path cov.json
+        run: |
+          set -euo pipefail
+          # A cached target directory can hold profile data from a build with
+          # a different feature set. Merging it counts the `cfg(feature)`
+          # blocks of both variants and inflates the denominator, so the
+          # measurement always starts from an empty profile set.
+          cargo llvm-cov clean
+          cargo llvm-cov --all-targets --all-features --json --output-path cov.json
       - name: Enforce the floor
         if: matrix.enforce == '1'
         shell: bash

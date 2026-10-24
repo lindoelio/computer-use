@@ -68,6 +68,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- `browser launch` could not start Chrome on Linux when the sandbox was
+  unavailable (a root shell or a container that denies user namespaces): the
+  browser exited before it wrote `DevToolsActivePort`. It now starts with
+  `--no-sandbox`, `--disable-dev-shm-usage`, and `--disable-gpu` when the
+  process runs as root or when `COMPUTER_USE_CHROME_NO_SANDBOX=1` asks for
+  that profile. Every other platform keeps the sandbox on.
 - `shortcuts run` and `apple-event` answered `confirm_required` on Linux and
   Windows: the policy gate asked for a confirm hook before the platform gate
   could say the action does not exist there. A hook cannot make `osascript` or
@@ -81,7 +87,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The live CDP suite grew from 6 to 13 tests: press/hover/scroll/select/check, upload, screenshot (file, base64, jpeg), eval (plain and promise), dialogs, tab lifecycle, new-tab navigation, history/back/forward/reload, the wait forms, activate, snapshot refs for every element command, selector/ref/batch errors, a blocked current page and blocked tab rows, ambiguous target resolution, and managed `browser launch`/`sessions`/`quit`. The fixture lock tolerates a poisoned mutex, so one failed assertion no longer cascades into every other live test.
 - The macOS Vision test is no longer `#[ignore]`; it runs in the normal suite (Vision needs no TCC). It asserts the pipeline (Vision returns text for a drawn buffer and the box maps back into the capture) instead of the exact word: a 5x7 bitmap font is a hard input and how Apple reads it changed between macOS versions (the runner answered `OTEH` for the image a local machine read as `HELLO`).
 - The live CDP fixture starts Chrome with `--no-sandbox`, `--disable-dev-shm-usage`, and `--disable-gpu` on Linux, where the runner has no usable sandbox and a small `/dev/shm`; it also keeps the browser's stderr and reports it when the fixture does not start, instead of failing with an opaque `fixture` panic. A command that hits a detached CDP session (`Session with given id not found`) is retried once.
-- `scripts/coverage-gate.py` and `coverage-allowlist.json` gate line coverage from a `cargo llvm-cov --json` report. Only the codebase under test counts (`roots: ["src"]`): Cargo's `target/` build output, dependencies, and any other generated path are ignored and printed, never folded into the total, and there is no basename fallback. The `coverage` CI job enforces a **95% floor** on macOS (95.47% measured, 95% target, no gap) and reports the number on Linux and Windows, and a fixture step checks the ignore rule. `docs/COVERAGE.md` lists every exclusion with its reason.
+- `scripts/coverage-gate.py` and `coverage-allowlist.json` gate line coverage from a `cargo llvm-cov --json` report. Only the codebase under test counts (`roots: ["src"]`): Cargo's `target/` build output, dependencies, and any other generated path are ignored and printed, never folded into the total, and there is no basename fallback. The `coverage` CI job enforces a **95% floor** on macOS (95.28% measured, 95% target, no gap) and reports the number on Linux and Windows, and a fixture step checks the ignore rule. `docs/COVERAGE.md` lists every exclusion with its reason.
 - `tests/cli.rs` sweeps the whole command surface with the cross-process pause marker set, so every mutating command is exercised — and refused — without posting input; a second sweep decodes every browser action through `exec`.
 - Unit tests cover the `DesktopBackend` trait defaults through a minimal backend, the policy `[security]`/`[audit]`/`[window]`/`[builtin_deny]` merge and error paths, the wait state parsers and condition descriptions, and the wait observation/snippet behavior.
 - The 95% floor is reached with branch tests for the context helpers, the CDP discovery/HTTP/marker paths, adapter validation, clipboard/OCR/window guards, cache pruning and owner records, doctor assembly and integrity labels, image compositing/scale bounds, target selectors, marks labels, and the serialization defaults.
