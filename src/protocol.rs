@@ -1362,15 +1362,10 @@ fn build_request(value: Value, adapter: Option<&str>) -> Result<Request, Compute
     let Some(name) = adapter else {
         return parse_request(value);
     };
-    if !value.is_object() {
-        return Err(ComputerError::InvalidArguments(
-            "request must be a JSON object".into(),
-        ));
-    }
     let mut value = value;
     let object = value
         .as_object_mut()
-        .expect("object check above guarantees a map");
+        .expect("effective_adapter only names an adapter for an object");
     let id = object.remove("id");
     let mut context = take_context(object)?;
     context.coord = Some("image".into());
@@ -4428,22 +4423,8 @@ fn wait_args(action: &Action) -> WaitArgs<'_> {
             timeout_ms: *timeout_ms,
             poll_ms: *poll_ms,
         },
-        _ => WaitArgs {
-            ms: None,
-            seconds: None,
-            element: None,
-            element_state: None,
-            text: None,
-            value: None,
-            within_element: None,
-            window_state: None,
-            tree_change: false,
-            app_running: None,
-            title: None,
-            ignore_case: false,
-            timeout_ms: None,
-            poll_ms: None,
-        },
+        // `wait_action` is only reached for Wait and Verify.
+        _ => unreachable!("wait_args is only called for wait and verify"),
     }
 }
 
@@ -5008,49 +4989,30 @@ fn latest_prepared_ocr_capture(
     backend: &dyn DesktopBackend,
     context: &CallContext,
 ) -> Result<OcrPreparedCapture, ComputerError> {
-    let targeted = context.app.is_some() || context.window.is_some();
-    if targeted {
-        if let Some(error) = backend.display_block() {
-            return Err(error);
-        }
-        let target = resolve_screenshot_window(backend, context)?;
-        let captured = backend.capture_window(&target)?;
-        let prepared = image_util::prepare_shot(
-            captured.frame.image(),
-            image_util::ShotFit {
-                scale: captured.frame.scale(),
-                origin_x: captured.origin_x,
-                origin_y: captured.origin_y,
-                logical_width: captured.logical_width,
-                logical_height: captured.logical_height,
-                max_width: image_util::DEFAULT_SCREENSHOT_MAX_WIDTH,
-                canvas: None,
-            },
-        )?;
-        Ok(OcrPreparedCapture {
-            image: prepared.image,
-            map: prepared.map,
-        })
-    } else {
-        // Full screen capture for OCR (rare, but allowed by the protocol).
-        let raw = backend.capture_screen(None)?;
-        let prepared = image_util::prepare_shot(
-            raw.frame.image(),
-            image_util::ShotFit {
-                scale: raw.frame.scale(),
-                origin_x: raw.origin_x,
-                origin_y: raw.origin_y,
-                logical_width: raw.logical_width,
-                logical_height: raw.logical_height,
-                max_width: image_util::DEFAULT_SCREENSHOT_MAX_WIDTH,
-                canvas: None,
-            },
-        )?;
-        Ok(OcrPreparedCapture {
-            image: prepared.image,
-            map: prepared.map,
-        })
+    // `ocr_action` rejects an untargeted request, so this always captures a
+    // window. Keeping one path here means the prepared map matches what the
+    // screenshot command would have produced for the same target.
+    if let Some(error) = backend.display_block() {
+        return Err(error);
     }
+    let target = resolve_screenshot_window(backend, context)?;
+    let captured = backend.capture_window(&target)?;
+    let prepared = image_util::prepare_shot(
+        captured.frame.image(),
+        image_util::ShotFit {
+            scale: captured.frame.scale(),
+            origin_x: captured.origin_x,
+            origin_y: captured.origin_y,
+            logical_width: captured.logical_width,
+            logical_height: captured.logical_height,
+            max_width: image_util::DEFAULT_SCREENSHOT_MAX_WIDTH,
+            canvas: None,
+        },
+    )?;
+    Ok(OcrPreparedCapture {
+        image: prepared.image,
+        map: prepared.map,
+    })
 }
 
 /// Draw tree index marks on `image`. Returns the count of marks applied.
@@ -10185,7 +10147,1089 @@ mod tests {
         assert_eq!(value["via"], json!("ax_scrollbar"));
         assert_eq!(value["before"], json!(0.5));
         assert!(near(value["after"].as_f64().unwrap_or_default(), 0.4));
+
         assert_eq!(value["dx"], json!(-2));
+    }
+
+    #[test]
+    fn context_helpers_reject_wrong_types() {
+        let cases = [
+            (json!([]), "request must be a JSON object"),
+            (
+                json!({"action": "move", "app": true}),
+                "app must be a string or number",
+            ),
+            (
+                json!({"action": "move", "diff": "yes"}),
+                "diff must be a boolean",
+            ),
+            (
+                json!({"action": "move", "browser_blocked_urls": [1]}),
+                "entries must be strings",
+            ),
+            (
+                json!({"action": "move", "browser_blocked_urls": "x"}),
+                "must be a list of strings",
+            ),
+            (
+                json!({"action": "move", "element": true}),
+                "element must be an integer",
+            ),
+            (
+                json!({"action": "move", "element": "x"}),
+                "element must be an integer",
+            ),
+            (
+                json!({"action": "move", "element": -1}),
+                "element is out of range",
+            ),
+            (
+                json!({"action": "move", "element": 99999999999u64}),
+                "element is out of range",
+            ),
+        ];
+        for (value, needle) in cases {
+            let error = parse_request(value).unwrap_err();
+            assert!(
+                error.to_string().contains(needle),
+                "expected {needle:?} in {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn drag_path_accepts_a_string_and_rejects_other_shapes() {
+        let string = parse_request(json!({"action": "drag", "path": "1,2,3,4"})).unwrap();
+        match string.action {
+            Action::Drag { path, .. } => assert_eq!(path.len(), 2),
+            other => panic!("{other:?}"),
+        }
+        let array = parse_request(json!({
+            "action": "drag",
+            "points": [{"x": 1, "y": 2}, {"x": 3, "y": 4}]
+        }))
+        .unwrap();
+        match array.action {
+            Action::Drag { path, .. } => assert_eq!(path[1], Point { x: 3, y: 4 }),
+            other => panic!("{other:?}"),
+        }
+        let error = parse_request(json!({"action": "drag", "path": 5})).unwrap_err();
+        assert!(error.to_string().contains("path must be"), "{error}");
+    }
+
+    #[test]
+    fn line_options_apply_every_cli_flag_and_the_request_wins() {
+        let response = handle_request_line_opts(
+            r#"{"action":"wait","ms":0,"id":7}"#,
+            LineOptions {
+                adapter: Some("native"),
+                policy: Some("/tmp/policy.toml"),
+                confirm_cmd: Some("/tmp/confirm"),
+                tier: Some("event"),
+                allow_foreground: true,
+                require_background: true,
+                no_overlay: true,
+                cdp: true,
+                cdp_url: Some("ws://127.0.0.1:1"),
+                on_dialog: Some("accept"),
+                agent_overlay: Some("on"),
+            },
+        );
+        assert!(response.ok, "{:?}", response.to_value());
+        assert_eq!(response.to_value()["id"], 7);
+
+        // A request field wins over the same CLI flag, so a conflicting CLI
+        // tier cannot change an already-decided request.
+        let response = handle_request_line_opts(
+            r#"{"action":"wait","ms":0,"tier":"event","cdp_url":"ws://request","on_dialog":"dismiss","agent_overlay":"off"}"#,
+            LineOptions {
+                tier: Some("synthetic"),
+                cdp_url: Some("ws://cli"),
+                on_dialog: Some("accept"),
+                agent_overlay: Some("on"),
+                ..LineOptions::default()
+            },
+        );
+        assert!(response.ok, "{:?}", response.to_value());
+    }
+
+    #[test]
+    fn adapter_errors_keep_the_request_id_and_name() {
+        let bad_type =
+            handle_request_line_with(r#"{"action":"displays","adapter":5,"id":3}"#, None);
+        assert_eq!(bad_type.to_value()["error"]["code"], "invalid_arguments");
+        assert_eq!(bad_type.to_value()["id"], 3);
+
+        let unknown = handle_request_line_with(r#"{"action":"displays","adapter":"bogus"}"#, None);
+        assert_eq!(unknown.to_value()["error"]["code"], "invalid_arguments");
+        assert!(unknown.to_value()["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("bogus"));
+
+        // A translation failure is stamped with the adapter that produced it.
+        let translated = handle_request_line_with(r#"{"action":"wait","adapter":"openai"}"#, None);
+        assert_eq!(translated.to_value()["error"]["code"], "invalid_arguments");
+        assert_eq!(translated.to_value()["adapter"], "openai");
+    }
+
+    #[test]
+    fn batch_rejects_non_objects_and_nested_batches() {
+        let backend = StubBackend::default();
+        let not_object = dispatch_with_context(
+            &backend,
+            Action::Batch {
+                actions: vec![json!(5)],
+                stop_on_error: true,
+            },
+            &CallContext::default(),
+        );
+        assert_eq!(not_object.to_value()["results"][0]["ok"], false);
+        assert!(not_object.to_value()["results"][0]["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("batch step must be a JSON object"));
+
+        let nested = dispatch_with_context(
+            &backend,
+            Action::Batch {
+                actions: vec![json!({"action": "batch", "actions": []})],
+                stop_on_error: true,
+            },
+            &CallContext::default(),
+        );
+        assert_eq!(nested.to_value()["results"][0]["ok"], false);
+        assert!(nested.to_value()["results"][0]["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("nested batch"));
+    }
+
+    #[test]
+    fn batch_overlay_context_accepts_every_key() {
+        let backend = StubBackend::default();
+        let response = dispatch_with_context(
+            &backend,
+            Action::Batch {
+                actions: vec![json!({
+                    "action": "move",
+                    "x": 1,
+                    "y": 2,
+                    "app": "Notes",
+                    "window": "0",
+                    "element": 3,
+                    "diff": true,
+                    "full": true,
+                    "coord": "screen",
+                    "session": "batch-context",
+                    "tier": "event",
+                    "adapter": "native",
+                    "display": "1",
+                    "require_visible": true,
+                    "allow_foreground": true,
+                    "require_background": true,
+                    "no_overlay": true,
+                    "return_state": true,
+                    "state_diff": true,
+                    "include_screenshot": true,
+                    "id": 9,
+                    "stop_on_error": false
+                })],
+                stop_on_error: true,
+            },
+            &CallContext::default(),
+        );
+        assert!(response.ok, "{:?}", response.to_value());
+        assert_eq!(response.to_value()["results"][0]["ok"], true);
+    }
+
+    #[test]
+    fn click_type_scroll_drag_and_clipboard_validate_input() {
+        let backend = StubBackend::default();
+        let element_context = CallContext {
+            element: Some(3),
+            ..CallContext::default()
+        };
+
+        let both = dispatch_with_context(
+            &backend,
+            Action::Click {
+                x: Some(1),
+                y: Some(2),
+                button: MouseButton::Left,
+                double: false,
+                count: 1,
+            },
+            &element_context,
+        );
+        assert_eq!(both.to_value()["error"]["code"], "invalid_arguments");
+
+        let none = dispatch_with_context(
+            &backend,
+            Action::Click {
+                x: None,
+                y: None,
+                button: MouseButton::Left,
+                double: false,
+                count: 1,
+            },
+            &CallContext::default(),
+        );
+        assert_eq!(none.to_value()["error"]["code"], "invalid_arguments");
+
+        let half = dispatch_with_context(
+            &backend,
+            Action::Click {
+                x: Some(1),
+                y: None,
+                button: MouseButton::Left,
+                double: false,
+                count: 1,
+            },
+            &CallContext::default(),
+        );
+        assert_eq!(half.to_value()["error"]["code"], "invalid_arguments");
+
+        for (double, count) in [(false, 0), (false, 4), (true, 3)] {
+            let response = dispatch_with_context(
+                &backend,
+                Action::Click {
+                    x: Some(1),
+                    y: Some(1),
+                    button: MouseButton::Left,
+                    double,
+                    count,
+                },
+                &CallContext::default(),
+            );
+            assert_eq!(
+                response.to_value()["error"]["code"],
+                "invalid_arguments",
+                "{double} {count}"
+            );
+        }
+        let doubled = dispatch_with_context(
+            &backend,
+            Action::Click {
+                x: Some(1),
+                y: Some(1),
+                button: MouseButton::Left,
+                double: true,
+                count: 1,
+            },
+            &CallContext::default(),
+        );
+        assert!(doubled.ok, "{:?}", doubled.to_value());
+        assert_eq!(doubled.to_value()["count"], 2);
+
+        let empty = dispatch_with_context(
+            &backend,
+            Action::Type {
+                text: String::new(),
+            },
+            &CallContext::default(),
+        );
+        assert_eq!(empty.to_value()["error"]["code"], "invalid_arguments");
+        let nul = dispatch_with_context(
+            &backend,
+            Action::Type {
+                text: "a\0b".into(),
+            },
+            &CallContext::default(),
+        );
+        assert_eq!(nul.to_value()["error"]["code"], "invalid_arguments");
+
+        let half_point = dispatch_with_context(
+            &backend,
+            Action::Scroll {
+                x: Some(1),
+                y: None,
+                dx: Some(0),
+                dy: Some(1),
+                direction: None,
+                amount: None,
+            },
+            &CallContext::default(),
+        );
+        assert_eq!(half_point.to_value()["error"]["code"], "invalid_arguments");
+        let both_forms = dispatch_with_context(
+            &backend,
+            Action::Scroll {
+                x: None,
+                y: None,
+                dx: Some(1),
+                dy: None,
+                direction: Some(ScrollDirection::Down),
+                amount: None,
+            },
+            &CallContext::default(),
+        );
+        assert_eq!(both_forms.to_value()["error"]["code"], "invalid_arguments");
+        let amount_only = dispatch_with_context(
+            &backend,
+            Action::Scroll {
+                x: None,
+                y: None,
+                dx: None,
+                dy: None,
+                direction: None,
+                amount: Some(2),
+            },
+            &CallContext::default(),
+        );
+        assert_eq!(amount_only.to_value()["error"]["code"], "invalid_arguments");
+        let no_delta = dispatch_with_context(
+            &backend,
+            Action::Scroll {
+                x: None,
+                y: None,
+                dx: None,
+                dy: None,
+                direction: None,
+                amount: None,
+            },
+            &CallContext::default(),
+        );
+        assert_eq!(no_delta.to_value()["error"]["code"], "invalid_arguments");
+
+        let short_drag = dispatch_with_context(
+            &backend,
+            Action::Drag {
+                path: vec![Point { x: 1, y: 2 }],
+                button: MouseButton::Left,
+            },
+            &CallContext::default(),
+        );
+        assert_eq!(short_drag.to_value()["error"]["code"], "invalid_arguments");
+
+        let long_hold = dispatch_with_context(
+            &backend,
+            Action::HoldKey {
+                keys: "shift".into(),
+                ms: crate::tier::MAX_HOLD_MS + 1,
+            },
+            &CallContext::default(),
+        );
+        assert_eq!(long_hold.to_value()["error"]["code"], "invalid_arguments");
+        let many_hold = dispatch_with_context(
+            &backend,
+            Action::HoldKey {
+                keys: "shift alt".into(),
+                ms: 10,
+            },
+            &CallContext::default(),
+        );
+        assert_eq!(many_hold.to_value()["error"]["code"], "invalid_arguments");
+
+        let neither = dispatch_with_context(
+            &backend,
+            Action::ClipboardSet {
+                text: None,
+                image: None,
+            },
+            &CallContext::default(),
+        );
+        assert_eq!(neither.to_value()["error"]["code"], "invalid_arguments");
+        let both_clipboard = dispatch_with_context(
+            &backend,
+            Action::ClipboardSet {
+                text: Some("x".into()),
+                image: Some("/tmp/x.png".into()),
+            },
+            &CallContext::default(),
+        );
+        assert_eq!(
+            both_clipboard.to_value()["error"]["code"],
+            "invalid_arguments"
+        );
+    }
+
+    #[test]
+    fn wait_element_states_and_scoped_text() {
+        let visible = StubBackend::default();
+        visible
+            .element_views
+            .lock()
+            .unwrap()
+            .push_back(Some(view("AXButton")));
+        let response = dispatch_with_context(
+            &visible,
+            wait_action_with(Some(1), Some("visible"), None, None, None),
+            &ctx("Notes"),
+        );
+        assert!(response.ok, "{:?}", response.to_value());
+        assert_eq!(response.to_value()["condition"], "element");
+
+        let enabled = StubBackend::default();
+        enabled
+            .element_views
+            .lock()
+            .unwrap()
+            .push_back(Some(view("AXButton")));
+        let response = dispatch_with_context(
+            &enabled,
+            wait_action_with(Some(1), Some("enabled"), None, None, None),
+            &ctx("Notes"),
+        );
+        assert!(response.ok, "{:?}", response.to_value());
+
+        let exists = StubBackend::default();
+        exists
+            .element_views
+            .lock()
+            .unwrap()
+            .push_back(Some(view("AXButton")));
+        let response = dispatch_with_context(
+            &exists,
+            wait_action_with(Some(1), None, None, None, None),
+            &ctx("Notes"),
+        );
+        assert!(response.ok, "{:?}", response.to_value());
+
+        let gone = StubBackend::default();
+        gone.element_views.lock().unwrap().push_back(None);
+        let response = dispatch_with_context(
+            &gone,
+            wait_action_with(Some(1), Some("gone"), None, None, None),
+            &ctx("Notes"),
+        );
+        assert!(response.ok, "{:?}", response.to_value());
+
+        let scoped = StubBackend::default();
+        scoped
+            .element_views
+            .lock()
+            .unwrap()
+            .push_back(Some(view("AXTextField")));
+        let response = dispatch_with_context(
+            &scoped,
+            wait_action_with(None, None, Some("ready"), None, Some(2)),
+            &ctx("Notes"),
+        );
+        assert!(response.ok, "{:?}", response.to_value());
+        assert_eq!(response.to_value()["condition"], "text");
+    }
+
+    #[test]
+    fn window_wait_reports_the_row_and_the_selector() {
+        let backend = StubBackend::default();
+        let wait_window = |state: &str| Action::Wait {
+            ms: None,
+            seconds: None,
+            element: None,
+            element_state: None,
+            text: None,
+            value: None,
+            within_element: None,
+            window_state: Some(state.to_string()),
+            tree_change: false,
+            app_running: None,
+            title: None,
+            ignore_case: false,
+            timeout_ms: Some(150),
+            poll_ms: Some(25),
+        };
+        let exists = dispatch_with_context(&backend, wait_window("exists"), &ctx("Notes"));
+        assert!(exists.ok, "{:?}", exists.to_value());
+        assert_eq!(exists.to_value()["observed"]["id"], 100);
+
+        // Widget is an accessory app with no windows, so `gone` matches.
+        let gone = dispatch_with_context(&backend, wait_window("gone"), &ctx("Widget"));
+        assert!(gone.ok, "{:?}", gone.to_value());
+        assert!(gone.to_value()["observed"].is_null());
+
+        let mut context = ctx("Notes");
+        context.window = Some("1".into());
+        let info = dispatch_with_context(&backend, Action::WindowInfo, &context);
+        assert!(info.ok, "{:?}", info.to_value());
+        assert_eq!(info.to_value()["window"]["title"], "Welcome");
+
+        context.window = Some("99".into());
+        let missing = dispatch_with_context(&backend, Action::WindowInfo, &context);
+        assert_eq!(missing.to_value()["error"]["code"], "window_not_found");
+        assert_eq!(
+            missing.to_value()["error"]["message"],
+            "window not found: 99"
+        );
+    }
+
+    #[test]
+    fn screenshot_creates_parent_dirs_and_targets_a_window() {
+        let cache = crate::cache::CacheEnv::acquire();
+        let backend = StubBackend::default();
+        let path = cache.dir().join("nested").join("deep").join("shot.png");
+        let response = dispatch_with_context(
+            &backend,
+            Action::Screenshot {
+                output: Some(path.display().to_string()),
+                region: None,
+                format: None,
+                max_width: None,
+                canvas: None,
+                base64: false,
+                marks: false,
+            },
+            &ctx("Notes"),
+        );
+        assert!(response.ok, "{:?}", response.to_value());
+        assert!(path.is_file());
+        let value = response.to_value();
+        assert_eq!(value["width"], 800);
+        assert_eq!(value["height"], 600);
+
+        let both = dispatch_with_context(
+            &backend,
+            Action::Screenshot {
+                output: Some(path.display().to_string()),
+                region: Some(Region::new(1, 1, 2, 2).unwrap()),
+                format: None,
+                max_width: None,
+                canvas: None,
+                base64: false,
+                marks: false,
+            },
+            &ctx("Notes"),
+        );
+        assert_eq!(both.to_value()["error"]["code"], "invalid_arguments");
+
+        let zoom = dispatch_with_context(
+            &backend,
+            Action::Zoom {
+                output: Some(path.display().to_string()),
+                region: Region::new(10, 10, 20, 20).unwrap(),
+                format: None,
+                max_width: None,
+                canvas: None,
+                base64: false,
+            },
+            &ctx("Notes"),
+        );
+        assert!(zoom.ok, "{:?}", zoom.to_value());
+        assert_eq!(zoom.to_value()["width"], 40);
+        assert_eq!(zoom.to_value()["height"], 40);
+        let _ = std::fs::remove_dir_all(cache.dir());
+    }
+
+    #[test]
+    fn menu_dock_apple_event_shortcuts_and_spaces_errors() {
+        let backend = StubBackend::default();
+        let missing_app = [
+            Action::MenuList {
+                app: None,
+                depth: None,
+            },
+            Action::MenuClick {
+                app: None,
+                path: "View > Sidebar".into(),
+            },
+        ];
+        for action in missing_app {
+            let response = dispatch_with_context(&backend, action, &CallContext::default());
+            assert_eq!(response.to_value()["error"]["code"], "invalid_arguments");
+        }
+
+        let empty_path = dispatch_with_context(
+            &backend,
+            Action::MenuClick {
+                app: Some("Notes".into()),
+                path: "   ".into(),
+            },
+            &CallContext::default(),
+        );
+        assert_eq!(empty_path.to_value()["error"]["code"], "invalid_arguments");
+
+        // A script action is confirm-gated before the app check; allow it so
+        // the missing/empty argument is what surfaces.
+        let (allow, dir) = allow_confirm_hook();
+        let script_context = CallContext {
+            confirm_cmd: Some(allow.clone()),
+            ..CallContext::default()
+        };
+        let missing_script_app = dispatch_with_context(
+            &backend,
+            Action::AppleEvent {
+                app: None,
+                script: "return 1".into(),
+                language: None,
+            },
+            &script_context,
+        );
+        assert_eq!(
+            missing_script_app.to_value()["error"]["code"],
+            "invalid_arguments"
+        );
+        let empty_script = dispatch_with_context(
+            &backend,
+            Action::AppleEvent {
+                app: Some("Notes".into()),
+                script: String::new(),
+                language: None,
+            },
+            &script_context,
+        );
+        assert_eq!(
+            empty_script.to_value()["error"]["code"],
+            "invalid_arguments"
+        );
+
+        let empty_title = dispatch_with_context(
+            &backend,
+            Action::DockClick { title: "  ".into() },
+            &CallContext::default(),
+        );
+        assert_eq!(empty_title.to_value()["error"]["code"], "invalid_arguments");
+
+        let empty_name = dispatch_with_context(
+            &backend,
+            Action::ShortcutsRun { name: "  ".into() },
+            &script_context,
+        );
+        assert_eq!(empty_name.to_value()["error"]["code"], "invalid_arguments");
+
+        let spaces = dispatch_with_context(
+            &backend,
+            Action::SpacesMove { to_space: 2 },
+            &CallContext::default(),
+        );
+        assert_eq!(spaces.to_value()["error"]["code"], "unsupported");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let cursor =
+            dispatch_with_context(&backend, Action::CursorPosition, &CallContext::default());
+        assert!(cursor.ok, "{:?}", cursor.to_value());
+        assert_eq!(cursor.to_value()["action"], "cursor_position");
+    }
+
+    #[test]
+    fn secure_key_press_and_sensitive_element_need_a_hook() {
+        let backend = StubBackend::default();
+        let mut root = crate::tree::UiNode::bare("AXWindow");
+        root.title = Some("Notes".into());
+        let mut field = crate::tree::UiNode::bare("AXTextField");
+        field.secure = true;
+        let mut quit = crate::tree::UiNode::bare("AXButton");
+        quit.title = Some("Delete".into());
+        root.children = vec![field, quit];
+        backend.seed_element(root);
+
+        let mut context = ctx("Notes");
+        context.element = Some(1);
+        let key = dispatch_with_context(&backend, Action::Key { keys: "a".into() }, &context);
+        assert_eq!(key.to_value()["error"]["code"], "policy_denied", "{key:?}");
+
+        context.element = Some(2);
+        let press = dispatch_with_context(
+            &backend,
+            Action::Press {
+                count: 1,
+                button: MouseButton::Left,
+            },
+            &context,
+        );
+        assert_eq!(
+            press.to_value()["error"]["code"],
+            "confirm_required",
+            "{press:?}"
+        );
+
+        // A press with no element still reaches the element guard.
+        let missing = dispatch_with_context(
+            &backend,
+            Action::Press {
+                count: 1,
+                button: MouseButton::Left,
+            },
+            &ctx("Notes"),
+        );
+        assert_eq!(
+            missing.to_value()["error"]["code"],
+            "invalid_arguments",
+            "{missing:?}"
+        );
+
+        // A peek miss is not a denial.
+        context.element = Some(99);
+        let peek_miss = dispatch_with_context(
+            &backend,
+            Action::Press {
+                count: 1,
+                button: MouseButton::Left,
+            },
+            &context,
+        );
+        assert_ne!(
+            peek_miss.to_value()["error"]["code"],
+            "confirm_required",
+            "{peek_miss:?}"
+        );
+
+        context.element = Some(1);
+        let bad_value = dispatch_with_context(
+            &backend,
+            Action::SetValue {
+                value: "a\0b".into(),
+            },
+            &context,
+        );
+        assert_eq!(
+            bad_value.to_value()["error"]["code"],
+            "invalid_arguments",
+            "{bad_value:?}"
+        );
+    }
+
+    #[test]
+    fn click_reports_a_failed_hit_test_and_confirms_a_sensitive_title() {
+        let failed = StubBackend {
+            fail_hit: true,
+            ..StubBackend::default()
+        };
+        let response = dispatch_with_context(
+            &failed,
+            Action::Click {
+                x: Some(1),
+                y: Some(1),
+                button: MouseButton::Left,
+                double: false,
+                count: 1,
+            },
+            &CallContext::default(),
+        );
+        assert!(response.ok, "{:?}", response.to_value());
+        let warnings = response.to_value()["warnings"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })
+            .unwrap_or_default();
+        assert!(warnings.contains("hit test failed"), "{warnings}");
+
+        let sensitive = StubBackend::default();
+        *sensitive.hit.lock().unwrap() = Some(crate::element::HitInfo {
+            role: "AXButton".into(),
+            title: Some("Delete".into()),
+        });
+        let response = dispatch_with_context(
+            &sensitive,
+            Action::Click {
+                x: Some(1),
+                y: Some(1),
+                button: MouseButton::Left,
+                double: false,
+                count: 1,
+            },
+            &CallContext::default(),
+        );
+        assert_eq!(response.to_value()["error"]["code"], "confirm_required");
+    }
+
+    #[test]
+    fn type_and_input_failure_arms() {
+        let backend = StubBackend::default();
+        let context = CallContext {
+            element: Some(3),
+            ..CallContext::default()
+        };
+        let element = dispatch_with_context(&backend, Action::Type { text: "hi".into() }, &context);
+        assert!(element.to_value().get("ok").is_some(), "{element:?}");
+
+        let failing = StubBackend::default();
+        *failing.fail_tiers.lock().unwrap() = vec![
+            "event".into(),
+            "activate".into(),
+            "ax".into(),
+            "synthetic".into(),
+        ];
+        for action in [
+            Action::Move { x: 1, y: 1 },
+            Action::Key {
+                keys: "cmd+s".into(),
+            },
+            Action::Scroll {
+                x: None,
+                y: None,
+                dx: Some(0),
+                dy: Some(1),
+                direction: None,
+                amount: None,
+            },
+            Action::Drag {
+                path: vec![Point { x: 1, y: 1 }, Point { x: 2, y: 2 }],
+                button: MouseButton::Left,
+            },
+            Action::HoldKey {
+                keys: "shift".into(),
+                ms: 10,
+            },
+            Action::MouseDown {
+                x: 1,
+                y: 1,
+                button: MouseButton::Left,
+            },
+            Action::MouseUp {
+                x: 1,
+                y: 1,
+                button: MouseButton::Left,
+            },
+        ] {
+            let response = dispatch_with_context(&failing, action, &CallContext::default());
+            assert_eq!(
+                response.to_value()["error"]["code"],
+                "execution_failed",
+                "{response:?}"
+            );
+        }
+
+        // Guard branches that preflight normally hides.
+        assert!(click(
+            &backend,
+            &CallContext::default(),
+            Some(1),
+            Some(1),
+            MouseButton::Left,
+            false,
+            0
+        )
+        .to_value()["error"]["code"]
+            .as_str()
+            .is_some());
+        assert!(drag(
+            &backend,
+            &CallContext::default(),
+            vec![Point { x: 1, y: 1 }],
+            MouseButton::Left
+        )
+        .to_value()["error"]["code"]
+            .as_str()
+            .is_some());
+        assert!(one_hold("shift", crate::tier::MAX_HOLD_MS + 1).is_err());
+        assert!(one_hold("shift alt", 10).is_err());
+    }
+
+    #[test]
+    fn clipboard_text_wait_errors_and_window_guards() {
+        let backend = StubBackend::default();
+        let (allow, dir) = allow_confirm_hook();
+        let clipboard_context = CallContext {
+            confirm_cmd: Some(allow),
+            ..CallContext::default()
+        };
+        let text = dispatch_with_context(
+            &backend,
+            Action::ClipboardSet {
+                text: Some("hello".into()),
+                image: None,
+            },
+            &clipboard_context,
+        );
+        assert!(text.ok, "{:?}", text.to_value());
+        assert_eq!(text.to_value()["chars"], 5);
+
+        let failing = StubBackend {
+            fail_accessibility: true,
+            ..StubBackend::default()
+        };
+        let wait = dispatch_with_context(
+            &failing,
+            wait_action_with(None, None, Some("x"), None, None),
+            &ctx("Notes"),
+        );
+        assert!(!wait.ok, "{:?}", wait.to_value());
+
+        let unknown_display = dispatch_with_context(
+            &backend,
+            Action::WindowMove {
+                x: None,
+                y: None,
+                to_display: Some(999),
+            },
+            &ctx("Notes"),
+        );
+        assert_eq!(
+            unknown_display.to_value()["error"]["code"],
+            "invalid_arguments"
+        );
+        let missing_y = dispatch_with_context(
+            &backend,
+            Action::WindowMove {
+                x: Some(1),
+                y: None,
+                to_display: None,
+            },
+            &ctx("Notes"),
+        );
+        assert_eq!(missing_y.to_value()["error"]["code"], "invalid_arguments");
+        let empty_set = dispatch_with_context(
+            &backend,
+            Action::WindowSet {
+                x: None,
+                y: None,
+                width: None,
+                height: None,
+            },
+            &ctx("Notes"),
+        );
+        assert_eq!(empty_set.to_value()["error"]["code"], "invalid_arguments");
+
+        let window_only = CallContext {
+            window: Some("0".into()),
+            ..CallContext::default()
+        };
+        let info = dispatch_with_context(&backend, Action::WindowInfo, &window_only);
+        assert!(info.ok, "{:?}", info.to_value());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wait_title_without_an_app_uses_the_frontmost_window() {
+        let backend = StubBackend::default();
+        let response = dispatch_with_context(
+            &backend,
+            wait_with(None, Some("desk")),
+            &CallContext::default(),
+        );
+        assert!(response.ok, "{:?}", response.to_value());
+        assert_eq!(response.to_value()["condition"], "title");
+    }
+
+    #[test]
+    fn ocr_rejects_missing_targets_and_reports_display_blocks() {
+        let backend = StubBackend::default();
+        let no_target = dispatch_with_context(
+            &backend,
+            Action::Ocr {
+                force: false,
+                image: None,
+            },
+            &CallContext::default(),
+        );
+        assert_eq!(no_target.to_value()["error"]["code"], "invalid_arguments");
+
+        let blocked = StubBackend {
+            block_display: true,
+            ..StubBackend::default()
+        };
+        let blocked_response = dispatch_with_context(
+            &blocked,
+            Action::Ocr {
+                force: false,
+                image: None,
+            },
+            &ctx("Notes"),
+        );
+        assert_eq!(
+            blocked_response.to_value()["error"]["code"],
+            "display_unavailable"
+        );
+
+        let outside = StubBackend {
+            capture_pixels: Some((400, 300)),
+            ..StubBackend::default()
+        };
+        *outside.ocr_blocks.lock().unwrap() = Some(vec![OcrBlock {
+            text: "far".into(),
+            x: 99_999,
+            y: 99_999,
+            width: 1,
+            height: 1,
+            confidence: 0.1,
+        }]);
+        let response = dispatch_with_context(
+            &outside,
+            Action::Ocr {
+                force: false,
+                image: None,
+            },
+            &ctx("Notes"),
+        );
+        assert!(response.ok, "{:?}", response.to_value());
+        assert!(response.to_value()["blocks"][0]["screen"].is_null());
+
+        let image_path = format!(
+            "{}/tests/fixtures/ocr/hello.png",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let image_response = dispatch_with_context(
+            &outside,
+            Action::Ocr {
+                force: false,
+                image: Some(image_path),
+            },
+            &CallContext::default(),
+        );
+        assert!(image_response.ok, "{:?}", image_response.to_value());
+        assert!(image_response.to_value()["blocks"][0]["screen"].is_null());
+    }
+
+    #[test]
+    fn selector_and_policy_helpers_cover_path_pid_and_missing_app() {
+        assert_eq!(
+            subject_from_selector(&crate::target::AppSelector::Path(std::path::PathBuf::from(
+                "/x"
+            )))
+            .path
+            .as_deref(),
+            Some("/x")
+        );
+        assert_eq!(
+            subject_from_selector(&crate::target::AppSelector::Pid(42)).pid,
+            Some(42)
+        );
+        let backend = StubBackend::default();
+        let missing = dispatch_with_context(&backend, Action::PolicyCheck, &CallContext::default());
+        assert_eq!(missing.to_value()["error"]["code"], "invalid_arguments");
+        let unknown = dispatch_with_context(&backend, Action::PolicyCheck, &ctx("no-such-app-xyz"));
+        assert!(unknown.ok, "{:?}", unknown.to_value());
+        assert_eq!(unknown.to_value()["decision"], "allow");
+    }
+
+    #[test]
+    fn default_valued_fields_are_skipped_when_serialized() {
+        let click = Action::Click {
+            x: Some(1),
+            y: Some(2),
+            button: MouseButton::Left,
+            double: false,
+            count: 1,
+        };
+        let value = serde_json::to_value(click).unwrap();
+        assert!(value.get("double").is_none(), "{value}");
+        assert!(value.get("count").is_none(), "{value}");
+
+        let screenshot = Action::Screenshot {
+            output: None,
+            region: None,
+            format: None,
+            max_width: None,
+            canvas: None,
+            base64: false,
+            marks: false,
+        };
+        let value = serde_json::to_value(screenshot).unwrap();
+        assert!(value.get("base64").is_none(), "{value}");
+        assert!(value.get("marks").is_none(), "{value}");
+
+        let scroll = Action::BrowserScroll {
+            selector: None,
+            ref_id: None,
+            target_id: None,
+            dx: 0.0,
+            dy: 1.5,
+        };
+        let value = serde_json::to_value(scroll).unwrap();
+        assert!(value.get("dx").is_none(), "{value}");
+        assert_eq!(value["dy"], 1.5);
+
+        let batch = Action::BrowserBatch {
+            actions: Vec::new(),
+            stop_on_error: true,
+        };
+        let value = serde_json::to_value(batch).unwrap();
+        assert!(value.get("stop_on_error").is_none(), "{value}");
     }
 }
 

@@ -156,6 +156,31 @@ mod tests {
     }
 
     #[test]
+    fn run_executes_a_harmless_script() {
+        let outcome = run("return 1", AppleEventLanguage::AppleScript).expect("osascript");
+        assert_eq!(outcome.exit_status, 0);
+        assert_eq!(outcome.script_bytes, "return 1".len());
+        assert_eq!(outcome.script_hash.len(), 16);
+        assert_eq!(outcome.stdout, "1");
+        assert!(
+            !outcome.stderr.contains("osascript failed"),
+            "{}",
+            outcome.stderr
+        );
+        assert!(run("   ", AppleEventLanguage::AppleScript).is_err());
+    }
+
+    #[test]
+    fn trim_one_line_trims_and_caps() {
+        assert_eq!(trim_one_line(b"  hi \n"), "hi");
+        assert_eq!(trim_one_line(b""), "");
+        let long = "x".repeat(5000);
+        let trimmed = trim_one_line(long.as_bytes());
+        assert!(trimmed.ends_with("..."), "{trimmed}");
+        assert_eq!(trimmed.chars().count(), 4099);
+    }
+
+    #[test]
     fn osascript_argv_keeps_a_long_script_as_a_single_argv_element() {
         // osascript accepts the script as a single argv entry; the script
         // must NOT be split on whitespace or wrapped in a file path. The

@@ -263,6 +263,11 @@ mod tests {
         );
         assert!(parse_overlay_line(&[0xff, 0xfe, 0x00]).is_err());
         assert!(parse_overlay_line(b"not-json\n").is_err());
+        assert_eq!(parse_overlay_line(b"   "), Err("overlay message is empty"));
+        assert_eq!(
+            parse_overlay_line(b"[]"),
+            Err("overlay message is not a json object")
+        );
         assert!(session_hue("notes") < 360);
         assert_eq!(session_hue("notes"), session_hue("notes"));
     }

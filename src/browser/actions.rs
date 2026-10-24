@@ -15,7 +15,6 @@ use chromiumoxide::cdp::browser_protocol::dom::{
 use chromiumoxide::cdp::browser_protocol::input::{
     DispatchMouseEventParams, DispatchMouseEventType, MouseButton as CdpMouseButton,
 };
-use chromiumoxide::cdp::browser_protocol::page::HandleJavaScriptDialogParams;
 use chromiumoxide::cdp::js_protocol::runtime::{
     CallArgument, CallFunctionOnParams, EvaluateParams, RemoteObjectId,
 };
@@ -76,15 +75,6 @@ pub async fn resolve(
         backend_node_id: backend,
         object_id,
     })
-}
-
-/// Resolve the element and read its backend node id.
-pub async fn resolve_backend(
-    page: &Page,
-    selector: Option<&str>,
-    backend_node_id: Option<i64>,
-) -> Result<ElementHandle, ComputerError> {
-    resolve(page, selector, backend_node_id).await
 }
 
 async fn node_for_selector(page: &Page, selector: &str) -> Result<NodeId, ComputerError> {
@@ -606,34 +596,36 @@ pub async fn read_text(page: &Page, handle: &ElementHandle) -> Result<String, Co
     Ok(value.as_str().unwrap_or_default().to_string())
 }
 
-/// Accept or dismiss the open JavaScript dialog.
-pub async fn dialog(
-    page: &Page,
-    accept: bool,
-    prompt_text: Option<&str>,
-) -> Result<(), ComputerError> {
-    let mut builder = HandleJavaScriptDialogParams::builder().accept(accept);
-    if let Some(text) = prompt_text {
-        builder = builder.prompt_text(text.to_string());
-    }
-    let params = builder.build().map_err(ComputerError::InvalidArguments)?;
-    page.execute(params)
-        .await
-        .map_err(|error| map_action_error(error, "handleJavaScriptDialog"))?;
-    Ok(())
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Read a property from the element (`disabled`, `checked`, `value`, ...).
-pub async fn property(
-    page: &Page,
-    handle: &ElementHandle,
-    name: &str,
-) -> Result<Value, ComputerError> {
-    call_on(
-        page,
-        handle,
-        "function (name) { return this[name]; }",
-        vec![json!(name)],
-    )
-    .await
+    #[test]
+    fn map_action_error_splits_not_found_from_execution() {
+        let not_found = map_action_error(
+            chromiumoxide::error::CdpError::msg("No node with given id"),
+            "resolve",
+        );
+        assert_eq!(not_found.code(), "element_not_found");
+        assert!(not_found.to_string().contains("resolve"));
+
+        let generic = map_action_error(chromiumoxide::error::CdpError::msg("boom"), "evaluate");
+        assert_eq!(generic.code(), "execution_failed");
+        assert!(generic.to_string().contains("evaluate: boom"));
+    }
+
+    #[test]
+    fn button_maps_cover_every_variant() {
+        let cases = [
+            (MouseButton::Left, CdpMouseButton::Left, 1),
+            (MouseButton::Right, CdpMouseButton::Right, 2),
+            (MouseButton::Middle, CdpMouseButton::Middle, 4),
+            (MouseButton::Back, CdpMouseButton::Back, 8),
+            (MouseButton::Forward, CdpMouseButton::Forward, 16),
+        ];
+        for (button, cdp, mask) in cases {
+            assert_eq!(cdp_button(button), cdp, "{button:?}");
+            assert_eq!(buttons_mask(button), mask, "{button:?}");
+        }
+    }
 }

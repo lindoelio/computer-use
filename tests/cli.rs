@@ -1358,3 +1358,96 @@ fn scroll_negative_amount_with_background_tier_parses() {
         "--require-background",
     ]);
 }
+
+/// Modes that answer before a desktop action: `--json` with a subcommand,
+/// no arguments, a non-native adapter, and the synthetic tier.
+#[test]
+fn special_modes_report_clean_errors_or_run() {
+    let output = run(&["--json", "displays"]);
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_arguments", "{value}");
+
+    let output = run(&[]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Usage"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let output = run(&["--adapter", "openai", "displays"]);
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_arguments", "{value}");
+    assert!(value["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("exec"));
+
+    // The synthetic tier is only consulted for actions that plan input; a
+    // sleep-only wait still succeeds.
+    let output = run(&["--synthetic-focus", "wait", "--ms", "0"]);
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["ok"], true, "{value}");
+}
+
+#[test]
+fn browser_batch_rejects_bad_json_and_shapes() {
+    for (args, needle) in [
+        (vec!["--cdp", "browser", "batch", "not json"], "needs JSON"),
+        (
+            vec!["--cdp", "browser", "batch", r#"{"nope":1}"#],
+            "needs a JSON array",
+        ),
+        (
+            vec!["--cdp", "browser", "batch", r#"[{"action":"bogus"}]"#],
+            "actions are invalid",
+        ),
+    ] {
+        let output = run(&args);
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["error"]["code"], "invalid_arguments", "{value}");
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(needle),
+            "{needle}: {value}"
+        );
+    }
+}
+
+#[test]
+fn serve_skips_blank_lines_and_reports_invalid_utf8() {
+    let mut child = command(&["serve"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn serve");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(b"\n\n")
+        .expect("write");
+    let output = child.wait_with_output().expect("serve output");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty(), "{:?}", output.stdout);
+
+    let mut child = command(&["serve"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn serve");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(&[0xff, b'\n'])
+        .expect("write");
+    let output = child.wait_with_output().expect("serve output");
+    assert_eq!(output.status.code(), Some(1));
+    let value: Value = serde_json::from_slice(&output.stdout).expect("one JSON response");
+    assert_eq!(value["error"]["code"], "io_error", "{value}");
+}

@@ -245,7 +245,10 @@ fn base_url() -> String {
 fn tabs_contract_uses_kind() {
     skip_without_chrome!();
     let fixture = fixture();
-    let _guard = fixture.lock.lock().expect("test lock");
+    let _guard = fixture
+        .lock
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let response = run_cdp(&["browser", "tabs"]);
     assert_eq!(response["ok"], true, "{response}");
     let tabs = response["tabs"].as_array().expect("tabs array");
@@ -260,7 +263,10 @@ fn tabs_contract_uses_kind() {
 fn navigate_snapshot_and_click_by_ref() {
     skip_without_chrome!();
     let fixture = fixture();
-    let _guard = fixture.lock.lock().expect("test lock");
+    let _guard = fixture
+        .lock
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let url = base_url();
     let navigate = run_cdp(&[
         "--session",
@@ -319,7 +325,10 @@ fn navigate_snapshot_and_click_by_ref() {
 fn type_and_secure_field_refusal() {
     skip_without_chrome!();
     let fixture = fixture();
-    let _guard = fixture.lock.lock().expect("test lock");
+    let _guard = fixture
+        .lock
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let url = base_url();
     let navigate = run_cdp(&[
         "--session",
@@ -377,7 +386,10 @@ fn type_and_secure_field_refusal() {
 fn browser_batch_runs_steps_in_one_call() {
     skip_without_chrome!();
     let fixture = fixture();
-    let _guard = fixture.lock.lock().expect("test lock");
+    let _guard = fixture
+        .lock
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let url = base_url();
     let steps = format!(
         r##"[{{"action":"browser_navigate","url":{url:?},"wait":"load"}},{{"action":"browser_click","selector":"#hello","wait":"none"}},{{"action":"browser_text","selector":"#out"}}]"##
@@ -396,7 +408,10 @@ fn browser_batch_runs_steps_in_one_call() {
 fn agent_marker_is_visible() {
     skip_without_chrome!();
     let fixture = fixture();
-    let _guard = fixture.lock.lock().expect("test lock");
+    let _guard = fixture
+        .lock
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let url = base_url();
     let response = run_cdp(&["browser", "navigate", "--url", &url, "--wait", "load"]);
     assert_eq!(response["ok"], true, "{response}");
@@ -430,7 +445,10 @@ fn agent_marker_is_visible() {
 fn blocked_url_is_refused_before_connecting() {
     skip_without_chrome!();
     let fixture = fixture();
-    let _guard = fixture.lock.lock().expect("test lock");
+    let _guard = fixture
+        .lock
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let policy = fixture.cache.join("live-policy.toml");
     std::fs::write(
         &policy,
@@ -454,7 +472,10 @@ fn blocked_url_is_refused_before_connecting() {
 fn press_hover_scroll_select_and_check() {
     skip_without_chrome!();
     let fixture = fixture();
-    let _guard = fixture.lock.lock().expect("test lock");
+    let _guard = fixture
+        .lock
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let url = base_url();
     let nav = run_cdp(&["browser", "navigate", "--url", &url, "--wait", "load"]);
     assert_eq!(nav["ok"], true, "{nav}");
@@ -523,7 +544,10 @@ fn press_hover_scroll_select_and_check() {
 fn upload_screenshot_eval_dialog_and_tabs() {
     skip_without_chrome!();
     let fixture = fixture();
-    let _guard = fixture.lock.lock().expect("test lock");
+    let _guard = fixture
+        .lock
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let url = base_url();
     let nav = run_cdp(&["browser", "navigate", "--url", &url, "--wait", "load"]);
     assert_eq!(nav["ok"], true, "{nav}");
@@ -653,7 +677,10 @@ impl Drop for ManagedQuit {
 fn managed_launch_sessions_and_quit() {
     skip_without_chrome!();
     let fixture = fixture();
-    let _guard = fixture.lock.lock().expect("test lock");
+    let _guard = fixture
+        .lock
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let chrome = chrome_or_skip().expect("chrome");
 
     let missing = run_cdp(&[
@@ -709,24 +736,77 @@ fn managed_launch_sessions_and_quit() {
 fn navigation_history_reload_waits_and_activate() {
     skip_without_chrome!();
     let fixture = fixture();
-    let _guard = fixture.lock.lock().expect("test lock");
+    let _guard = fixture
+        .lock
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let url = base_url();
-    let nav = run_cdp(&["browser", "navigate", "--url", &url, "--wait", "load"]);
+    // A fresh tab gives this test its own history, independent of whatever
+    // page the other tests left behind in the shared browser.
+    let nav = run_cdp(&[
+        "browser",
+        "navigate",
+        "--url",
+        &url,
+        "--new-tab",
+        "--wait",
+        "load",
+    ]);
     assert_eq!(nav["ok"], true, "{nav}");
     let target = nav["target_id"].as_str().expect("target id").to_string();
 
-    let selector_wait = run_cdp(&["browser", "wait", "--wait", "selector:#out"]);
+    let selector_wait = run_cdp(&[
+        "browser",
+        "wait",
+        "--target",
+        &target,
+        "--wait",
+        "selector:#out",
+    ]);
     assert_eq!(selector_wait["ok"], true, "{selector_wait}");
 
-    let clicked = run_cdp(&["browser", "click", "--selector", "#next", "--wait", "load"]);
+    // A same-page click with a load wait exercises that arm without relying on
+    // a click-created history entry.
+    let clicked = run_cdp(&[
+        "browser",
+        "click",
+        "--target",
+        &target,
+        "--selector",
+        "#hello",
+        "--wait",
+        "load",
+    ]);
     assert_eq!(clicked["ok"], true, "{clicked}");
 
-    let url_wait = run_cdp(&["browser", "wait", "--wait", "url:*next*"]);
+    // Navigate explicitly so the history entry is deterministic under load.
+    let next = run_cdp(&[
+        "browser",
+        "navigate",
+        "--target",
+        &target,
+        "--url",
+        &format!("{url}next.html"),
+        "--wait",
+        "load",
+    ]);
+    assert_eq!(next["ok"], true, "{next}");
+
+    let url_wait = run_cdp(&[
+        "browser",
+        "wait",
+        "--target",
+        &target,
+        "--wait",
+        "url:*next*",
+    ]);
     assert_eq!(url_wait["ok"], true, "{url_wait}");
 
     let idle = run_cdp(&[
         "browser",
         "wait",
+        "--target",
+        &target,
         "--wait",
         "networkidle",
         "--timeout-ms",
@@ -734,14 +814,24 @@ fn navigation_history_reload_waits_and_activate() {
     ]);
     assert_eq!(idle["ok"], true, "{idle}");
 
-    let back = run_cdp(&["browser", "back"]);
+    let back = run_cdp(&["browser", "back", "--target", &target]);
     assert_eq!(back["ok"], true, "{back}");
-    let forward = run_cdp(&["browser", "forward"]);
+    let forward = run_cdp(&["browser", "forward", "--target", &target]);
     assert_eq!(forward["ok"], true, "{forward}");
-    let reload = run_cdp(&["browser", "reload", "--wait", "domcontentloaded"]);
+    let reload = run_cdp(&[
+        "browser",
+        "reload",
+        "--target",
+        &target,
+        "--wait",
+        "domcontentloaded",
+    ]);
     assert_eq!(reload["ok"], true, "{reload}");
     let activate = run_cdp(&["browser", "activate", "--target", &target]);
     assert_eq!(activate["ok"], true, "{activate}");
+
+    let closed = run_cdp(&["browser", "tab-close", "--target", &target]);
+    assert_eq!(closed["closed"], true, "{closed}");
 }
 
 /// Selector misses, stale refs, batch failures, and a blocked current page.
@@ -749,7 +839,10 @@ fn navigation_history_reload_waits_and_activate() {
 fn selector_ref_and_batch_errors_are_reported() {
     skip_without_chrome!();
     let fixture = fixture();
-    let _guard = fixture.lock.lock().expect("test lock");
+    let _guard = fixture
+        .lock
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let url = base_url();
     let nav = run_cdp(&["browser", "navigate", "--url", &url, "--wait", "load"]);
     assert_eq!(nav["ok"], true, "{nav}");
@@ -798,7 +891,10 @@ fn selector_ref_and_batch_errors_are_reported() {
 fn snapshot_refs_reach_element_commands() {
     skip_without_chrome!();
     let fixture = fixture();
-    let _guard = fixture.lock.lock().expect("test lock");
+    let _guard = fixture
+        .lock
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let url = base_url();
     let nav = run_cdp(&["browser", "navigate", "--url", &url, "--wait", "load"]);
     assert_eq!(nav["ok"], true, "{nav}");
@@ -902,4 +998,78 @@ fn ref_for(text: &str, needle: &str) -> String {
         .and_then(|tail| tail.split_whitespace().next())
         .expect("ref id")
         .to_string()
+}
+
+/// New-tab navigation, ambiguous target resolution, blocked tab rows, and a
+/// blocked activate.
+#[test]
+fn new_tab_ambiguous_targets_and_blocked_rows() {
+    skip_without_chrome!();
+    let fixture = fixture();
+    let _guard = fixture
+        .lock
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let url = base_url();
+    let nav = run_cdp(&[
+        "browser",
+        "navigate",
+        "--url",
+        &url,
+        "--new-tab",
+        "--wait",
+        "load",
+    ]);
+    assert_eq!(nav["ok"], true, "{nav}");
+    let target = nav["target_id"].as_str().expect("target id").to_string();
+
+    let second = run_cdp(&["browser", "tab-new", "--url", &url]);
+    assert_eq!(second["ok"], true, "{second}");
+    let second_target = second["target_id"]
+        .as_str()
+        .expect("second target")
+        .to_string();
+
+    // With more than one page and no --target, the command refuses to guess.
+    let ambiguous = run_cdp(&["browser", "snapshot"]);
+    assert_eq!(
+        ambiguous["error"]["code"], "invalid_arguments",
+        "{ambiguous}"
+    );
+    assert!(ambiguous["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("multiple page targets"));
+
+    let policy = fixture.cache.join("blocked-tabs.toml");
+    std::fs::write(
+        &policy,
+        "version = 1\n[browser]\nblocked_urls = [\"http://127.0.0.1:*/*\"]\n",
+    )
+    .expect("policy file");
+    let tabs = run_cdp(&["--policy", policy.to_str().unwrap(), "browser", "tabs"]);
+    assert_eq!(tabs["ok"], true, "{tabs}");
+    assert!(
+        tabs["tabs"]
+            .as_array()
+            .expect("tabs")
+            .iter()
+            .any(|tab| tab["blocked"] == true
+                && tab["url"] == "<blocked>"
+                && tab["title"].is_null()),
+        "{tabs}"
+    );
+
+    let activate = run_cdp(&[
+        "--policy",
+        policy.to_str().unwrap(),
+        "browser",
+        "activate",
+        "--target",
+        &target,
+    ]);
+    assert_eq!(activate["error"]["code"], "blocked_url", "{activate}");
+
+    let _ = run_cdp(&["browser", "tab-close", "--target", &second_target]);
+    let _ = run_cdp(&["browser", "tab-close", "--target", &target]);
 }

@@ -613,6 +613,140 @@ mod tests {
     use super::*;
 
     #[test]
+    fn assemble_covers_notes_fixes_and_optional_fields() {
+        let input = DoctorInput {
+            accessibility: Some(false),
+            required: &["accessibility", "bogus"],
+            input_monitor: Some(false),
+            recommend_bundle: true,
+            prompt_ignored: true,
+            open_settings_ignored: true,
+            team_id: Some("TEAM".into()),
+            notarized: Some(true),
+            responsible: Some(crate::target::ResponsibleApp {
+                name: "Terminal".into(),
+                bundle_id: Some("com.apple.Terminal".into()),
+                pid: 10,
+                path: None,
+            }),
+            session: Some("x11".into()),
+            atspi_bus: Some(true),
+            portal: Some(false),
+            uiaccess: Some(true),
+            integrity: Some("medium".into()),
+            ..DoctorInput::default()
+        };
+        let report = assemble(input);
+        assert!(!report.permissions_ok);
+        assert!(report.missing.contains(&"accessibility".to_string()));
+        assert!(report.missing.contains(&"bogus".to_string()));
+        let note = report.note.clone().unwrap_or_default();
+        assert!(note.contains("user-input pause unavailable"), "{note}");
+        assert!(note.contains("--prompt has no effect"), "{note}");
+        assert!(note.contains("--open-settings has no effect"), "{note}");
+        assert!(report.text.contains("team_id: TEAM"), "{}", report.text);
+        assert!(report.text.contains("notarized: yes"), "{}", report.text);
+        assert!(
+            report.text.contains("responsible: Terminal"),
+            "{}",
+            report.text
+        );
+        assert!(report.text.contains("session: x11"), "{}", report.text);
+        assert!(
+            report.text.contains("atspi_bus: present"),
+            "{}",
+            report.text
+        );
+        assert!(report.text.contains("portal: absent"), "{}", report.text);
+        assert!(report.text.contains("uiaccess: yes"), "{}", report.text);
+        assert!(report.text.contains("integrity: medium"), "{}", report.text);
+        // The unknown permission id takes the generic Settings pane.
+        assert!(report.fix[1].url.contains("preference.security"));
+        assert_eq!(settings_url_to_open(&report, false), None);
+        assert!(settings_url_to_open(&report, true).is_some());
+    }
+
+    #[test]
+    fn assemble_covers_every_enable_target_source() {
+        let none_missing = assemble(DoctorInput {
+            open_settings: true,
+            required: &[],
+            ..DoctorInput::default()
+        });
+        assert!(none_missing.permissions_ok);
+        assert!(none_missing
+            .note
+            .unwrap_or_default()
+            .contains("no missing permission pane"));
+
+        let bundled = assemble(DoctorInput {
+            bundled: true,
+            required: &["accessibility"],
+            ..DoctorInput::default()
+        });
+        assert_eq!(bundled.fix[0].target, HELPER_APP_NAME);
+
+        let responsible = assemble(DoctorInput {
+            responsible: Some(crate::target::ResponsibleApp {
+                name: "App".into(),
+                bundle_id: None,
+                pid: 1,
+                path: None,
+            }),
+            required: &["accessibility"],
+            ..DoctorInput::default()
+        });
+        assert_eq!(responsible.fix[0].target, "App");
+
+        let path = assemble(DoctorInput {
+            path: Some("/usr/local/bin/computer-use".into()),
+            required: &["accessibility"],
+            ..DoctorInput::default()
+        });
+        assert_eq!(path.fix[0].target, "/usr/local/bin/computer-use");
+
+        let fallback = assemble(DoctorInput {
+            required: &["accessibility"],
+            ..DoctorInput::default()
+        });
+        assert_eq!(fallback.fix[0].target, "computer-use");
+    }
+
+    #[test]
+    fn integrity_and_atspi_helpers() {
+        assert_eq!(integrity_from_sid("S-1-16-20480"), Some("protected"));
+        assert_eq!(integrity_from_sid("S-1-16-16384"), Some("system"));
+        assert_eq!(integrity_from_sid("S-1-16-12288"), Some("high"));
+        assert_eq!(integrity_from_sid("S-1-16-8192"), Some("medium"));
+        assert_eq!(integrity_from_sid("S-1-16-4096"), Some("low"));
+        assert_eq!(integrity_from_sid("S-1-16-1"), Some("untrusted"));
+        assert_eq!(integrity_from_sid("S-1-16-4096x"), None);
+        assert_eq!(integrity_from_sid("nope"), None);
+
+        for (text, expected) in [
+            ("Protected Process Mandatory Level", "protected"),
+            ("System Mandatory Level", "system"),
+            ("High Mandatory Level", "high"),
+            ("Medium Mandatory Level", "medium"),
+            ("Low Mandatory Level", "low"),
+            ("Untrusted Mandatory Level", "untrusted"),
+        ] {
+            assert_eq!(integrity_from_whoami(text), Some(expected), "{text}");
+        }
+        assert_eq!(integrity_from_whoami("nothing"), None);
+
+        assert!(atspi_bus_present(Some("unix:path=/x"), None));
+        assert!(!atspi_bus_present(None, None));
+        let dir = std::env::temp_dir().join(format!("cu-atspi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("at-spi")).unwrap();
+        assert!(!atspi_bus_present(None, Some(&dir)));
+        std::fs::write(dir.join("at-spi").join("bus"), "x").unwrap();
+        assert!(atspi_bus_present(None, Some(&dir)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn push_note_appends_and_ignores_blank_text() {
         let mut report = crate::target::DoctorReport::blank();
         push_note(&mut report, "   ");

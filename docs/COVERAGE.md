@@ -24,9 +24,9 @@ exclusion list:
 | Key | Meaning |
 | --- | --- |
 | `roots` | Paths that count. **`src/` only**: that is the codebase under test. |
-| `target` | The goal for measurable code, **90%**. The gate prints the gap. |
-| `threshold` | The enforced regression floor. Raise it as tests land, then make it equal to `target`. |
-| `per_file_threshold` | Per-file floor. `0` while the target is still being worked toward. |
+| `target` | The goal for measurable code, **95%**. |
+| `threshold` | The enforced regression floor, **95%**. |
+| `per_file_threshold` | Per-file floor. `0`; the remaining tail is documented below instead of hidden. |
 
 ### Only the codebase counts
 
@@ -67,9 +67,6 @@ Excluded today, grouped by reason:
 - **Real hardware paths**: `backend/{capture,input,held,clipboard}.rs` post
   input, capture a display, or touch the system pasteboard; the stub backend
   covers the dispatch instead.
-- **Managed Chromium**: `browser/launch.rs` spawns its own browser, and the
-  live CDP suite starts its own. Remove the entry when a live test drives
-  `browser launch`.
 - **Test scaffolding**: `test_backend.rs`.
 
 ## Where the number stands
@@ -79,28 +76,29 @@ CDP suite and the in-process Vision test; both need their real engine):
 
 | | Value |
 | --- | --- |
-| Whole crate (all files) | ~75.6% |
-| Measurable set (allowlist applied) | **91.37%** |
-| Enforced floor | 90.0% |
+| Whole crate (all files) | ~80.1% |
+| Measurable set (allowlist applied) | **95.47%** |
+| Enforced floor | 95.0% |
 | Target | 95.0% |
-| Gap | **~790 lines** |
+| Gap | **0 lines** |
 
-The remaining gap is small clusters (3–20 lines each) of error and edge paths:
+The floor is the target: the gate fails below 95.0%. The remaining uncovered
+lines are the honest tail, not a hidden exclusion:
 
-1. `src/protocol.rs` (~540): dispatcher error arms, artifact/output helpers, the
-   sensitive-press path, and a few context-parsing branches.
-2. `src/browser/cdp.rs` (~290): attach/discovery fallbacks, `sysctl` argv
-   parsing, the raw dialog rescue, and batch error shaping.
-3. `src/browser/actions.rs` (~124): element error mapping, key dispatch
-   variants, and dialog error paths.
-4. `src/main.rs` (~105): flag conversions and the serve/emit loop.
-5. `src/policy.rs` (~107), `src/cache.rs` (~74), `src/adapters/*` (~69),
-   `src/isolation.rs` (~37), `src/browser/snapshot.rs` (~35),
-   `src/overlay.rs` (~34), `src/doctor.rs` (~33), `src/target.rs` (~31),
-   `src/vision/marks.rs` (~30).
+- `src/protocol.rs` (~285): platform-only arms, panic recovery, and a few
+  error branches that preflight makes unreachable through the dispatcher.
+- `src/browser/cdp.rs` (~162): raw-CDP timeout/close branches, attach races,
+  and the dialog rescue's socket failures.
+- `src/browser/launch.rs` (~61): browser-executable discovery fallbacks that
+  need a browser the runner does not have installed.
+- `src/browser/actions.rs` (~82), `src/main.rs` (~56), `src/policy.rs` (~51):
+  UI-only event paths and flag conversions.
+- The rest is a long tail in `overlay.rs`, `state.rs`, `cache.rs`, `element.rs`,
+  `tree.rs`, and the platform helpers.
 
-The first two entries account for ~60% of what is left and are the next
-target; the rest is a long tail of one-branch tests.
+`per_file_threshold` stays `0` on purpose: a small module can be almost all
+error handling (`shortcuts.rs` is 50%) without moving the total. The per-file
+table in the gate output is the place to look when adding a new file.
 
 ## Why Linux and Windows report instead of enforce
 

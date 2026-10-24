@@ -289,6 +289,49 @@ mod tests {
     }
 
     #[test]
+    fn validation_arms_name_the_bad_field() {
+        for (value, needle) in [
+            (serde_json::json!({}), "action is required"),
+            (
+                serde_json::json!({"action": "wait"}),
+                "duration is required",
+            ),
+            (
+                serde_json::json!({"action": "mouse_move"}),
+                "coordinate is required",
+            ),
+            (serde_json::json!({"action": "zoom"}), "region is required"),
+            (
+                serde_json::json!({"action": "zoom", "region": [1, 2, 3]}),
+                "region must be [x1, y1, x2, y2]",
+            ),
+            (
+                serde_json::json!({"action": "zoom", "region": [10, 10, 5, 20]}),
+                "positive width and height",
+            ),
+            (
+                serde_json::json!({"action": "left_click_drag"}),
+                "start_coordinate is required",
+            ),
+            (
+                serde_json::json!({"action": "hold_key", "text": "a"}),
+                "duration is required",
+            ),
+            (
+                serde_json::json!({"action": "hold_key", "text": "a", "duration": -1}),
+                "non-negative",
+            ),
+            (
+                serde_json::json!({"action": "hold_key", "text": "a", "duration": 31}),
+                "at most 30 seconds",
+            ),
+        ] {
+            let error = translate(&value).unwrap_err();
+            assert!(error.to_string().contains(needle), "{needle}: {error}");
+        }
+    }
+
+    #[test]
     fn unknown_action_types_are_rejected() {
         let error = translate(&serde_json::json!({"action": "teleport"})).unwrap_err();
         assert_eq!(error.code(), "invalid_arguments");

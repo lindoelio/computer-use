@@ -414,6 +414,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn region_string_form_and_edge_limit() {
+        let region: Region = serde_json::from_str("\"1,2,3,4\"").unwrap();
+        assert_eq!(region, Region::new(1, 2, 3, 4).unwrap());
+        let too_wide = format!("\"0,0,{},4\"", MAX_REGION_EDGE + 1);
+        assert!(serde_json::from_str::<Region>(&too_wide).is_err());
+        assert!(parse_region("1,2,0,4").is_err());
+        assert!(region_inside(Region::new(-1, 0, 2, 2).unwrap(), 10, 10).is_err());
+    }
+
+    #[test]
+    fn path_errors_name_the_bad_coordinate() {
+        assert!(parse_path("1").is_err());
+        let x = parse_path("a,2,3,4").unwrap_err().to_string();
+        assert!(x.contains("path x is not an integer"), "{x}");
+        let y = parse_path("1,b,3,4").unwrap_err().to_string();
+        assert!(y.contains("path y is not an integer"), "{y}");
+    }
+
+    #[test]
+    fn names_and_extensions_cover_every_variant() {
+        for (button, name) in [
+            (MouseButton::Left, "left"),
+            (MouseButton::Right, "right"),
+            (MouseButton::Middle, "middle"),
+            (MouseButton::Back, "back"),
+            (MouseButton::Forward, "forward"),
+        ] {
+            assert_eq!(button.as_str(), name);
+        }
+        for (modifier, name) in [
+            (Modifier::Command, "command"),
+            (Modifier::Control, "control"),
+            (Modifier::Shift, "shift"),
+            (Modifier::Alt, "alt"),
+            (Modifier::Meta, "meta"),
+        ] {
+            assert_eq!(modifier.as_str(), name);
+        }
+        assert_eq!(ImageFormat::Png.as_str(), "png");
+        assert_eq!(ImageFormat::Jpeg.as_str(), "jpeg");
+        assert_eq!(ImageFormat::Png.extension(), "png");
+        assert_eq!(ImageFormat::Jpeg.extension(), "jpg");
+    }
+
+    #[test]
     fn region_object_visitor_reports_missing_and_invalid_fields() {
         let missing_height = serde_json::from_str::<Region>(r#"{"x":1,"y":2,"width":3}"#);
         assert!(missing_height.is_err());

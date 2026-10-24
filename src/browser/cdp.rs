@@ -899,7 +899,7 @@ async fn history_move(page: &Page, forward: bool) -> Result<String, ComputerErro
     } else {
         "window.history.back()"
     };
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         // A navigation can replace the execution context and swallow the
         // evaluate; retry it until the deadline instead of failing after one
@@ -908,6 +908,9 @@ async fn history_move(page: &Page, forward: bool) -> Result<String, ComputerErro
         for _ in 0..40 {
             let url = current_url(page).await;
             if url != before {
+                // Let the new document settle before the caller asks for the
+                // opposite direction; a forward issued mid-load is ignored.
+                let _ = wait_for(page, &WaitSpec::Load, Duration::from_secs(10)).await;
                 return Ok(url);
             }
             if Instant::now() >= deadline {
@@ -1659,6 +1662,245 @@ mod tests {
             normalize_url("http://127.0.0.1:9222/").unwrap(),
             "http://127.0.0.1:9222"
         );
+        assert_eq!(
+            normalize_url(" wss://example.test/devtools/browser/x ").unwrap(),
+            "wss://example.test/devtools/browser/x"
+        );
         assert!(normalize_url("ftp://x").is_err());
+        assert!(normalize_url("ws://").is_err());
+    }
+
+    #[test]
+    fn parse_debug_port_covers_every_spelling() {
+        assert_eq!(parse_debug_port("--remote-debugging-port=0"), Some(0));
+        assert_eq!(
+            parse_debug_port("--remote-debugging-port=bad --remote-debugging-port=9224"),
+            Some(9224)
+        );
+        assert_eq!(parse_debug_port("--remote-debugging-port"), None);
+        assert_eq!(parse_debug_port("--remote-debugging-port bad"), None);
+        assert_eq!(parse_debug_port("nothing here"), None);
+    }
+
+    #[test]
+    fn discover_debug_port_reports_a_clean_error() {
+        let self_pid = i32::try_from(std::process::id()).expect("pid fits i32");
+        let error = discover_debug_port(self_pid).unwrap_err();
+        assert!(
+            error.to_string().contains("no --remote-debugging-port"),
+            "{error}"
+        );
+        // A pid that cannot be inspected takes the failure branch.
+        assert!(discover_debug_port(-1).is_err());
+    }
+
+    fn serve_once(response: &'static [u8]) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut request = [0u8; 2048];
+                let _ = stream.read(&mut request);
+                let _ = stream.write_all(response);
+            }
+        });
+        format!("http://{address}")
+    }
+
+    #[test]
+    fn http_ws_url_reads_json_version() {
+        let base = serve_once(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"webSocketDebuggerUrl\":\"ws://127.0.0.1:1/devtools/browser/x\"}",
+        );
+        assert_eq!(
+            http_ws_url(&base).unwrap(),
+            "ws://127.0.0.1:1/devtools/browser/x"
+        );
+
+        let no_url = serve_once(b"HTTP/1.1 200 OK\r\n\r\n{}");
+        assert!(http_ws_url(&no_url)
+            .unwrap_err()
+            .to_string()
+            .contains("no websocket url"));
+
+        let bad_json = serve_once(b"HTTP/1.1 200 OK\r\n\r\nnot json");
+        assert!(http_ws_url(&bad_json).is_err());
+
+        assert!(http_ws_url("ftp://127.0.0.1:1").is_err());
+    }
+
+    #[test]
+    fn http_ws_url_stops_at_the_read_cap() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut request = [0u8; 2048];
+                let _ = std::io::Read::read(&mut stream, &mut request);
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n{\"pad\":\"");
+                let _ = stream.write_all(&vec![b'x'; 70 * 1024]);
+                let _ = stream.write_all(b"\"}");
+            }
+        });
+        // The cap cuts the body before the closing quote, so the JSON is
+        // incomplete; what matters is that the read loop terminates.
+        assert!(http_ws_url(&format!("http://{address}")).is_err());
+    }
+
+    fn write_session_record(record: &serde_json::Value) {
+        let dir = crate::cache::cache_dir().join("browser-sessions");
+        std::fs::create_dir_all(&dir).expect("sessions dir");
+        std::fs::write(dir.join("unit.json"), record.to_string()).expect("record");
+    }
+
+    fn managed_record(ws_url: Option<&str>) -> serde_json::Value {
+        json!({
+            "session": "unit",
+            "pid": std::process::id(),
+            "port": 1,
+            "cdp_url": "http://127.0.0.1:1",
+            "ws_url": ws_url,
+            "profile": "/tmp/unit-profile",
+            "browser": "/tmp/chrome",
+            "created_unix_ms": 1
+        })
+    }
+
+    #[test]
+    fn pick_websocket_url_prefers_flags_then_managed_sessions() {
+        let _cache = crate::cache::CacheEnv::acquire();
+        let explicit = BrowserOptions {
+            debug_url: Some(" http://127.0.0.1:9/ ".into()),
+            ..BrowserOptions::default()
+        };
+        assert_eq!(pick_websocket_url(&explicit).unwrap(), "http://127.0.0.1:9");
+
+        // No record: a clean error instead of a guessed port.
+        assert!(pick_websocket_url(&BrowserOptions::default()).is_err());
+
+        write_session_record(&managed_record(Some("ws://127.0.0.1:1/devtools/browser/x")));
+        assert_eq!(
+            pick_websocket_url(&BrowserOptions::default()).unwrap(),
+            "http://127.0.0.1:1"
+        );
+        assert!(endpoint_is_managed(&BrowserOptions::default()));
+        assert!(!endpoint_is_managed(&explicit));
+
+        let _ = std::fs::remove_dir_all(crate::cache::cache_dir().join("browser-sessions"));
+    }
+
+    #[test]
+    fn raw_browser_ws_url_covers_ws_http_and_no_endpoint() {
+        let _cache = crate::cache::CacheEnv::acquire();
+        let direct = BrowserOptions {
+            debug_url: Some("ws://127.0.0.1:1/devtools/browser/x".into()),
+            ..BrowserOptions::default()
+        };
+        assert_eq!(
+            raw_browser_ws_url(&direct).unwrap(),
+            "ws://127.0.0.1:1/devtools/browser/x"
+        );
+
+        assert!(raw_browser_ws_url(&BrowserOptions::default()).is_err());
+
+        write_session_record(&managed_record(Some("ws://127.0.0.1:2/devtools/browser/y")));
+        assert_eq!(
+            raw_browser_ws_url(&BrowserOptions::default()).unwrap(),
+            "ws://127.0.0.1:2/devtools/browser/y"
+        );
+
+        // A record without a ws url falls back to the http endpoint.
+        write_session_record(&managed_record(None));
+        let base = serve_once(
+            b"HTTP/1.1 200 OK\r\n\r\n{\"webSocketDebuggerUrl\":\"ws://127.0.0.1:3/devtools/browser/z\"}",
+        );
+        let port = base.rsplit(':').next().unwrap();
+        write_session_record(&json!({
+            "session": "unit",
+            "pid": std::process::id(),
+            "port": port.parse::<u16>().unwrap(),
+            "cdp_url": base,
+            "ws_url": null,
+            "profile": "/tmp/unit-profile",
+            "browser": "/tmp/chrome",
+            "created_unix_ms": 1
+        }));
+        assert_eq!(
+            raw_browser_ws_url(&BrowserOptions::default()).unwrap(),
+            "ws://127.0.0.1:3/devtools/browser/z"
+        );
+        let _ = std::fs::remove_dir_all(crate::cache::cache_dir().join("browser-sessions"));
+    }
+
+    #[test]
+    fn marker_enabled_honors_the_flag_and_managed_sessions() {
+        let _cache = crate::cache::CacheEnv::acquire();
+        let auto = BrowserOptions::default();
+        assert!(!marker_enabled(&auto));
+        write_session_record(&managed_record(Some("ws://127.0.0.1:1/devtools/browser/x")));
+        assert!(marker_enabled(&auto));
+        assert!(marker_enabled(&BrowserOptions {
+            agent_overlay: crate::browser::AgentOverlay::On,
+            ..BrowserOptions::default()
+        }));
+        assert!(!marker_enabled(&BrowserOptions {
+            agent_overlay: crate::browser::AgentOverlay::Off,
+            ..BrowserOptions::default()
+        }));
+        let _ = std::fs::remove_dir_all(crate::cache::cache_dir().join("browser-sessions"));
+    }
+
+    #[test]
+    fn element_argument_helpers_reject_conflicts() {
+        assert!(element_args(None, None).is_err());
+        assert!(element_args(Some("#a"), Some("e1")).is_err());
+        assert_eq!(
+            element_args(Some("#a"), None).unwrap(),
+            (Some("#a".into()), None)
+        );
+        assert_eq!(
+            element_args(None, Some("e1")).unwrap(),
+            (None, Some("e1".into()))
+        );
+        assert_eq!(optional_element_args(None, None).unwrap(), (None, None));
+        assert!(optional_element_args(Some("#a"), Some("e1")).is_err());
+    }
+
+    #[test]
+    fn describe_wait_names_every_form() {
+        assert_eq!(describe_wait(&WaitSpec::None), "none");
+        assert_eq!(describe_wait(&WaitSpec::Load), "load");
+        assert_eq!(
+            describe_wait(&WaitSpec::DomContentLoaded),
+            "domcontentloaded"
+        );
+        assert_eq!(describe_wait(&WaitSpec::NetworkIdle), "networkidle");
+        assert_eq!(
+            describe_wait(&WaitSpec::Selector("#out".into())),
+            "selector:#out"
+        );
+        assert_eq!(
+            describe_wait(&WaitSpec::Url("https://x/*".into())),
+            "url:https://x/*"
+        );
+    }
+
+    #[test]
+    fn escape_selector_quotes_json() {
+        assert_eq!(escape_selector("#a\"b"), "\"#a\\\"b\"");
+    }
+
+    #[test]
+    fn small_pure_helpers() {
+        assert!(same_document_url("https://x/", "https://x"));
+        assert!(!same_document_url("https://x/a", "https://x/b"));
+        assert_eq!(stable_hash("a"), stable_hash("a"));
+        assert_ne!(stable_hash("a"), stable_hash("b"));
+        assert_eq!(stable_hash("a").len(), 16);
+        let error = unsupported();
+        assert_eq!(error.code(), "unsupported");
+        assert!(error.to_string().contains("cdp"));
     }
 }

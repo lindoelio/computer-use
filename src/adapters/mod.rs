@@ -101,7 +101,7 @@ pub fn translate(adapter: &str, value: &Value) -> Result<Action, ComputerError> 
 mod tests {
     use super::*;
     use crate::error::ComputerError;
-    use serde_json::Value;
+    use serde_json::{json, Value};
     use std::fs;
     use std::path::Path;
 
@@ -145,6 +145,37 @@ mod tests {
                 assert_eq!(action, expected, "{}", path.display());
             }
         }
+    }
+
+    #[test]
+    fn helper_errors_name_the_field() {
+        assert!(as_object(&json!(5)).is_err());
+        let object = json!({"n": 1.4, "s": "ok", "empty": ""})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert_eq!(require_i32(&object, "n").unwrap(), 1);
+        assert!(require_i32(&object, "missing")
+            .unwrap_err()
+            .to_string()
+            .contains("required"));
+        assert!(optional_i32(&object, "missing").unwrap().is_none());
+        assert!(optional_i32(&object, "s").is_err());
+        assert_eq!(require_string(&object, "s").unwrap(), "ok");
+        assert!(require_string(&object, "empty")
+            .unwrap_err()
+            .to_string()
+            .contains("must not be empty"));
+        assert!(require_string(&object, "n").is_err());
+        assert!(require_string(&object, "missing").is_err());
+
+        assert!(coordinate_pair(&json!(5), "p").is_err());
+        assert!(coordinate_pair(&json!([1]), "p").is_err());
+        assert!(coordinate_pair(&json!([1, 2, 3]), "p").is_err());
+        assert_eq!(coordinate_pair(&json!([1, 2]), "p").unwrap(), (1, 2));
+        assert!(number_i32(&json!("x"), "n").is_err());
+        assert!(number_i32(&json!(1e99), "n").is_err());
+        assert!(translate("bogus", &json!({})).is_err());
     }
 
     #[test]

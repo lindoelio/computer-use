@@ -2503,3 +2503,139 @@ fn strip_ansi(input: &str) -> String {
     }
     out.trim().to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_conversions_cover_every_variant() {
+        assert_eq!(
+            AppleEventLanguage::from(CliAppleEventLanguage::AppleScript),
+            AppleEventLanguage::AppleScript
+        );
+        assert_eq!(
+            AppleEventLanguage::from(CliAppleEventLanguage::JavaScript),
+            AppleEventLanguage::JavaScript
+        );
+        assert_eq!(CliTier::Ax.as_str(), "ax");
+        assert_eq!(CliTier::Event.as_str(), "event");
+        assert_eq!(CliTier::Synthetic.as_str(), "synthetic");
+        assert_eq!(CliTier::Activate.as_str(), "activate");
+        assert_eq!(ImageFormat::from(CliFormat::Png), ImageFormat::Png);
+        assert_eq!(ImageFormat::from(CliFormat::Jpeg), ImageFormat::Jpeg);
+        assert_eq!(MouseButton::from(CliButton::Left), MouseButton::Left);
+        assert_eq!(MouseButton::from(CliButton::Right), MouseButton::Right);
+        assert_eq!(MouseButton::from(CliButton::Middle), MouseButton::Middle);
+        assert_eq!(MouseButton::from(CliButton::Back), MouseButton::Back);
+        assert_eq!(MouseButton::from(CliButton::Forward), MouseButton::Forward);
+        assert_eq!(ScrollDirection::from(CliDirection::Up), ScrollDirection::Up);
+        assert_eq!(
+            ScrollDirection::from(CliDirection::Down),
+            ScrollDirection::Down
+        );
+        assert_eq!(
+            ScrollDirection::from(CliDirection::Left),
+            ScrollDirection::Left
+        );
+        assert_eq!(
+            ScrollDirection::from(CliDirection::Right),
+            ScrollDirection::Right
+        );
+    }
+
+    #[test]
+    fn strip_ansi_removes_csi_sequences_and_trims() {
+        assert_eq!(strip_ansi("\u{1b}[31mred\u{1b}[0m"), "red");
+        assert_eq!(strip_ansi("plain"), "plain");
+        assert_eq!(strip_ansi("\u{1b}[1;2Hx\u{1b}[0m "), "x");
+        assert_eq!(strip_ansi("\u{1b}"), "");
+    }
+
+    #[test]
+    fn adapter_rejection_names_the_modes() {
+        assert!(reject_non_native_adapter(None).is_none());
+        assert!(reject_non_native_adapter(Some("native")).is_none());
+        let openai = reject_non_native_adapter(Some("openai")).expect("rejected");
+        assert_eq!(openai.to_value()["error"]["code"], "invalid_arguments");
+        assert!(openai.to_value()["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("exec"));
+        let other = reject_non_native_adapter(Some("bogus")).expect("rejected");
+        assert!(other.to_value()["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("bogus"));
+    }
+
+    #[test]
+    fn command_action_validates_launch_activate_quit_and_policy() {
+        let cases = [
+            (
+                CliCommand::Launch {
+                    app: Some("Notes".into()),
+                },
+                Some("Terminal"),
+                "disagree",
+            ),
+            (CliCommand::Launch { app: None }, None, "requires an app"),
+            (CliCommand::Activate, None, "requires --app"),
+            (CliCommand::Quit { force: false }, None, "requires --app"),
+            (
+                CliCommand::Policy {
+                    command: PolicyCommand::Check,
+                },
+                None,
+                "requires --app",
+            ),
+        ];
+        for (command, app, needle) in cases {
+            let context = CallContext {
+                app: app.map(str::to_string),
+                ..CallContext::default()
+            };
+            let error = command_action(&command, context).unwrap_err();
+            assert_eq!(error.to_value()["error"]["code"], "invalid_arguments");
+            assert!(
+                error.to_value()["error"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains(needle),
+                "{needle}: {:?}",
+                error.to_value()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_output_paths_are_rejected() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = PathBuf::from(OsString::from_vec(vec![0xff]));
+        let screenshot = CliCommand::Screenshot {
+            output: Some(path.clone()),
+            region: None,
+            format: None,
+            max_width: None,
+            canvas: None,
+            base64: false,
+            marks: false,
+        };
+        let error = command_action(&screenshot, CallContext::default()).unwrap_err();
+        assert_eq!(error.to_value()["error"]["code"], "invalid_arguments");
+
+        let zoom = CliCommand::Zoom {
+            region: "1,2,3,4".into(),
+            output: Some(path),
+            format: None,
+            max_width: None,
+            canvas: None,
+            base64: false,
+        };
+        let error = command_action(&zoom, CallContext::default()).unwrap_err();
+        assert_eq!(error.to_value()["error"]["code"], "invalid_arguments");
+    }
+}

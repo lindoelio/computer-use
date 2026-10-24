@@ -303,16 +303,24 @@ pub fn exec_prepared(_command: &[String]) -> Result<std::convert::Infallible, Co
 // ---------------------------------------------------------------------------
 
 /// `target_os` as the short name this crate uses everywhere else.
+#[cfg(target_os = "macos")]
 pub const fn platform() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "macos"
-    } else if cfg!(target_os = "linux") {
-        "linux"
-    } else if cfg!(target_os = "windows") {
-        "windows"
-    } else {
-        "unknown"
-    }
+    "macos"
+}
+
+#[cfg(target_os = "linux")]
+pub const fn platform() -> &'static str {
+    "linux"
+}
+
+#[cfg(target_os = "windows")]
+pub const fn platform() -> &'static str {
+    "windows"
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+pub const fn platform() -> &'static str {
+    "unknown"
 }
 
 /// True when this platform has a supported `--display virtual` recipe.
@@ -433,11 +441,10 @@ pub fn infeasible() -> Value {
 /// The JSON body of `computer-use isolation`.
 pub fn matrix() -> Value {
     let probe = probe();
-    let cg_status = if cfg!(target_os = "macos") {
-        probe.status()
-    } else {
-        "unsupported"
-    };
+    #[cfg(target_os = "macos")]
+    let cg_status = probe.status();
+    #[cfg(not(target_os = "macos"))]
+    let cg_status = "unsupported";
     json!({
         "platform": platform(),
         "display_filter": true,
@@ -712,6 +719,37 @@ mod tests {
             );
         }
         assert_eq!(matrix["infeasible"], infeasible);
+    }
+
+    #[test]
+    fn probe_status_and_platform_helpers() {
+        let available = VirtualDisplayProbe {
+            descriptor_create: true,
+            display_create: true,
+            action: "probe only",
+            note: String::new(),
+        };
+        assert!(available.available());
+        assert_eq!(available.status(), "experimental");
+        let missing = VirtualDisplayProbe {
+            descriptor_create: false,
+            display_create: true,
+            action: "none",
+            note: String::new(),
+        };
+        assert!(!missing.available());
+        assert_eq!(missing.status(), "unsupported");
+        assert!(!platform().is_empty());
+        assert_eq!(
+            virtual_display_compiled(),
+            cfg!(feature = "virtual-display")
+        );
+        assert_eq!(virtual_supported(), cfg!(target_os = "linux"));
+        #[cfg(not(target_os = "linux"))]
+        {
+            let error = exec_prepared(&["true".into()]).unwrap_err();
+            assert_eq!(error.code(), "unsupported");
+        }
     }
 
     #[test]

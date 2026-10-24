@@ -208,6 +208,49 @@ mod tests {
     }
 
     #[test]
+    fn validation_arms_name_the_bad_field() {
+        for (value, needle) in [
+            (
+                serde_json::json!({"type": "click", "button": "sideways", "x": 1, "y": 1}),
+                "unknown click button",
+            ),
+            (serde_json::json!({"type": "drag"}), "path must be an array"),
+            (
+                serde_json::json!({"type": "drag", "path": []}),
+                "at least 2 points",
+            ),
+            (
+                serde_json::json!({"type": "drag", "path": [1, 2]}),
+                "points must be objects",
+            ),
+            (
+                serde_json::json!({"type": "scroll"}),
+                "scroll_x or scroll_y is required",
+            ),
+            (serde_json::json!({"type": "keypress"}), "keys is required"),
+            (
+                serde_json::json!({"type": "keypress", "keys": []}),
+                "keys must not be empty",
+            ),
+            (
+                serde_json::json!({"type": "keypress", "keys": "a"}),
+                "keys must be an array",
+            ),
+            (
+                serde_json::json!({"type": "keypress", "keys": [1]}),
+                "array of strings",
+            ),
+            (
+                serde_json::json!({"type": "keypress", "keys": [""]}),
+                "empty string",
+            ),
+        ] {
+            let error = translate(&value).unwrap_err();
+            assert!(error.to_string().contains(needle), "{needle}: {error}");
+        }
+    }
+
+    #[test]
     fn unknown_action_types_are_rejected() {
         let error = translate(&serde_json::json!({"type": "teleport"})).unwrap_err();
         assert_eq!(error.code(), "invalid_arguments");

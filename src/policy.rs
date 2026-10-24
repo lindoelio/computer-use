@@ -2593,4 +2593,214 @@ exempt = ["app.crynta.terax", "  ", "app.crynta.terax"]
         assert!(!event_is_synthetic(1));
         assert!(event_is_synthetic(SYNTHETIC_EVENT_USER_DATA));
     }
+
+    #[test]
+    fn exemptions_cover_empty_bundle_and_display_names() {
+        assert!(!is_exempt("   "));
+        let guard = push_test_exemptions(&["com.apple.Terminal".into()]);
+        assert!(!is_exempt("   "));
+        assert!(bundle_denial("com.apple.Terminal").is_none());
+        drop(guard);
+
+        let _display = push_test_exemptions(&["Terminal".into()]);
+        assert!(!denied_display_name("Terminal"));
+        let _trimmed = push_test_exemptions(&["Foo".into()]);
+        assert!(exempts_identity(None, None, Some("Foo.app")));
+    }
+
+    #[test]
+    fn selector_path_denial_and_app_bundle_component() {
+        let selector = AppSelector::Path(PathBuf::from(
+            "/Applications/Terminal.app/Contents/MacOS/Terminal",
+        ));
+        let denial = selector_denial(&selector).expect("denied");
+        assert_eq!(denial.source, "path");
+
+        let helper = Path::new("/Applications/Terminal.app/Contents/MacOS/helper");
+        let message = path_denial(helper).expect("app bundle component is denied");
+        assert!(message.contains("Terminal.app"), "{message}");
+    }
+
+    #[test]
+    fn default_deny_scopes_cover_admin_user_and_unscoped() {
+        let dir = temp_dir("deny-scopes");
+        let user = dir.join("user.toml");
+        std::fs::write(&user, "version = 1\ndefault = \"deny\"\n").unwrap();
+        let user_policy = load_paths(Some(&user), None).unwrap();
+        match decide(&user_policy, &Subject::default(), &PolicyAction::Mutate) {
+            Decision::Deny { source, message } => {
+                assert_eq!(source, "user");
+                assert!(message.contains("no app was named"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let admin = dir.join("admin.toml");
+        std::fs::write(&admin, "version = 1\ndefault = \"deny\"\n").unwrap();
+        let admin_policy = load_paths(None, Some(&admin)).unwrap();
+        match decide(
+            &admin_policy,
+            &subject_bundle("com.apple.Notes"),
+            &PolicyAction::Mutate,
+        ) {
+            Decision::Deny { source, message } => {
+                assert_eq!(source, "admin");
+                assert!(message.contains("default is deny"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+        match decide(&admin_policy, &Subject::default(), &PolicyAction::Mutate) {
+            Decision::Deny { source, .. } => assert_eq!(source, "admin"),
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn name_only_display_is_denied_after_the_bundle_check() {
+        let dir = temp_dir("name-only");
+        let user = dir.join("user.toml");
+        std::fs::write(&user, "version = 1\ndefault = \"allow\"\n").unwrap();
+        let policy = load_paths(Some(&user), None).unwrap();
+        let target = Subject {
+            name: Some("Terminal".into()),
+            ..Subject::default()
+        };
+        match app_verdict(&policy, &target) {
+            Decision::Deny { source, message } => {
+                assert_eq!(source, "builtin");
+                assert!(message.contains("Terminal"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deny_rules_match_bundle_path_and_name() {
+        let dir = temp_dir("deny-matrix");
+        let app = dir.join("app");
+        std::fs::write(&app, b"x").unwrap();
+        let canonical = crate::target::canonical_exe_path(&app);
+        let user = dir.join("user.toml");
+        std::fs::write(
+            &user,
+            format!(
+                "version = 1\ndefault = \"allow\"\n[[deny]]\npath = {:?}\n[[deny]]\nname = \"DenyName\"\n[[deny]]\nbundle_id = \"com.example.Deny\"\n",
+                canonical.display().to_string()
+            ),
+        )
+        .unwrap();
+        let policy = load_paths(Some(&user), None).unwrap();
+
+        for target in [
+            Subject {
+                bundle_id: Some("com.example.Deny".into()),
+                ..Subject::default()
+            },
+            Subject {
+                path: Some(canonical.display().to_string()),
+                ..Subject::default()
+            },
+            Subject {
+                name: Some("denyname".into()),
+                ..Subject::default()
+            },
+        ] {
+            match app_verdict(&policy, &target) {
+                Decision::Deny { source, .. } => assert_eq!(source, "user"),
+                other => panic!("{target:?}: {other:?}"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_and_unreadable_policy_files_are_reported() {
+        let dir = temp_dir("policy-io");
+        let empty = dir.join("empty.toml");
+        std::fs::write(&empty, "   \n").unwrap();
+        assert!(load_paths(Some(&empty), None).is_ok());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let unreadable = dir.join("unreadable.toml");
+            std::fs::write(&unreadable, "version = 1\n").unwrap();
+            std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let error = load_paths(Some(&unreadable), None).unwrap_err();
+            assert_eq!(error.code(), "invalid_arguments");
+            std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let missing_rule = dir.join("missing-rule.toml");
+        std::fs::write(&missing_rule, "version = 1\n[[allow]]\n").unwrap();
+        let error = load_paths(Some(&missing_rule), None).unwrap_err();
+        assert!(
+            error.to_string().contains("bundle_id, path, or name"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pause_window_and_line_helpers_load() {
+        let dir = temp_dir("sections");
+        let user = dir.join("user.toml");
+        std::fs::write(
+            &user,
+            "version = 1\npause_on_user_input = true\n[window]\nclamp = false\n",
+        )
+        .unwrap();
+        let policy = load_paths(Some(&user), None).unwrap();
+        assert!(policy.pause_on_user_input);
+        assert!(!policy.window_clamp());
+        assert_eq!(
+            line_from_display("toml parse error at line 12: bad"),
+            Some(12)
+        );
+        assert_eq!(line_from_display("no marker"), None);
+        assert_eq!(line_from_display("at line x"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn browser_detection_covers_bundle_path_and_names() {
+        assert!(is_browser(Some("com.google.Chrome"), None, None));
+        assert!(is_browser(
+            None,
+            Some(Path::new(
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+            )),
+            None
+        ));
+        for name in [
+            "Google Chrome",
+            "Safari",
+            "Firefox",
+            "Microsoft Edge",
+            "Brave Browser",
+            "Arc",
+        ] {
+            assert!(is_browser(None, None, Some(name)), "{name}");
+        }
+        assert!(!is_browser(Some("com.apple.Notes"), None, Some("Notes")));
+    }
+
+    #[test]
+    fn glob_and_origin_matching_cover_edge_shapes() {
+        assert!(glob_match("abc", "abc"));
+        assert!(!glob_match("abc", "abcd"));
+        assert!(glob_match("a*", "abc"));
+        assert!(glob_match("*c", "abc"));
+        assert!(glob_match("a**c", "abc"));
+        assert!(glob_match("a*b*c", "axbyc"));
+        assert!(!glob_match("a*z", "abc"));
+        assert!(slash_star_origin("https://x/*", "https://x?q=1"));
+        assert!(slash_star_origin("https://x/*", "https://x"));
+        assert!(!slash_star_origin("https://x/y", "https://x"));
+        let patterns = vec!["https://x/*".to_string()];
+        assert_eq!(url_blocked("https://x?q=1", &patterns), Some("https://x/*"));
+        assert!(url_blocked("https://y", &patterns).is_none());
+    }
 }

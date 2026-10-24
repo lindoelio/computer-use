@@ -1124,6 +1124,29 @@ mod tests {
     }
 
     #[test]
+    fn composite_and_scale_helpers_cover_edges() {
+        assert!(composite_layers(&[], 1.0).is_err());
+        assert!(parse_canvas_edge("x", "width").is_err());
+        assert!(parse_canvas_edge("0", "width").is_err());
+        assert_eq!(parse_canvas_edge(" 4 ", "width").unwrap(), 4);
+
+        assert_eq!(fit_inside(10, 10, 20, 20), (10, 10));
+        assert_eq!(fit_inside(100, 50, 20, 20), (20, 10));
+        let image = solid(4, 4, [1, 2, 3, 255]);
+        assert_eq!(resize_to(&image, 4, 4).dimensions(), (4, 4));
+        assert_eq!(resize_to(&image, 2, 2).dimensions(), (2, 2));
+
+        assert_eq!(points_to_px(0, 1.0), 1);
+        assert_eq!(points_to_px(u32::MAX, 4.0), u32::MAX);
+        assert_eq!(points_to_px(2, 2.0), 4);
+
+        assert!(checked_size(0, 1).is_err());
+        assert!(checked_size(MAX_EDGE + 1, 1).is_err());
+        assert!(checked_size(MAX_EDGE, MAX_EDGE).is_err());
+        assert!(checked_size(4, 4).is_ok());
+    }
+
+    #[test]
     fn parse_canvas_accepts_separators() {
         assert_eq!(parse_canvas("1440x900").unwrap(), (1440, 900));
         assert_eq!(parse_canvas("1440X900").unwrap(), (1440, 900));

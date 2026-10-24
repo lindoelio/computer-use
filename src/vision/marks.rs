@@ -314,7 +314,7 @@ fn label_to_pixels(label: &str) -> GlyphPixels {
             break;
         }
         let glyph = glyph_for(ch);
-        if glyph.is_empty() {
+        if glyph.iter().all(|byte| *byte == 0) {
             // Unknown character: fill with a question-mark dot to keep the
             // label position visible without confusing it with a digit.
             fill_unknown(&mut rows, cols);
@@ -580,6 +580,61 @@ mod tests {
             "the overlay rewrote {total_changed} of {} pixels",
             1440 * 682
         );
+    }
+
+    #[test]
+    fn label_pixels_cap_and_unknown_glyph() {
+        let long = label_to_pixels("0123456789");
+        assert!(long.cols <= FONT_WIDTH * MAX_LABEL_CHARS);
+        let unknown = label_to_pixels("x");
+        assert_eq!(unknown.cols, FONT_WIDTH);
+        assert!(unknown.rows[2][1] && unknown.rows[3][1]);
+        for ch in [
+            '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'o', 'O', '-',
+        ] {
+            assert!(!glyph_for(ch).is_empty(), "{ch}");
+        }
+        assert!(glyph_for('x').iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn blend_transparent_and_drawing_outside_the_canvas() {
+        let base = Rgba([1, 2, 3, 4]);
+        assert_eq!(blend(base, Rgba([9, 9, 9, 0])), base);
+        let image = white_square(4);
+        let marks = vec![MarkBox {
+            rect: ImageRect {
+                x: -2,
+                y: -2,
+                width: 6,
+                height: 6,
+            },
+            label: tree_label(0),
+        }];
+        let marked = draw_marks(&image, &marks);
+        assert_eq!(marked.dimensions(), image.dimensions());
+    }
+
+    #[test]
+    fn collect_marks_respects_the_depth_and_line_caps() {
+        let map = ScreenshotMap::identity(100, 100);
+        let mut root = crate::tree::UiNode::bare("AXGroup");
+        root.frame = Some(NodeFrame {
+            x: 0.0,
+            y: 0.0,
+            width: 10.0,
+            height: 10.0,
+        });
+        root.child_count = Some(1);
+        root.children = vec![crate::tree::UiNode::bare("AXButton")];
+        let mut out = Vec::new();
+        let mut index = 0u32;
+        collect_marks(&root, &map, DEPTH_CAP, &mut index, &mut out);
+        assert!(out.len() <= 1, "depth cap must stop the walk");
+        out.clear();
+        let mut index = LINE_CAP as u32;
+        collect_marks(&root, &map, 0, &mut index, &mut out);
+        assert!(out.len() <= 1, "line cap must stop the walk");
     }
 
     #[test]

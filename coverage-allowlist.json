@@ -1,15 +1,14 @@
 {
   "target": 95.0,
-  "threshold": 90.0,
+  "threshold": 95.0,
   "per_file_threshold": 0,
   "roots": [
     "src"
   ],
   "notes": [
     "Only files under roots count; target/ and dependencies never do.",
-    "target is the goal for measurable code (scripts/coverage-gate.py prints the gap).",
-    "threshold is the enforced regression floor; raise it as tests land, then set it to target.",
-    "per_file_threshold is 0 (disabled) while the target is still being worked toward.",
+    "target and threshold are both 95.0: the measured set is above the floor, so the floor is the target.",
+    "per_file_threshold is 0 (disabled); the tail is documented in docs/COVERAGE.md instead of hidden.",
     "These entries cannot execute on the runner; see docs/COVERAGE.md for the reasoning."
   ],
   "allow": [
@@ -168,10 +167,6 @@
     {
       "path": "src/backend/clipboard.rs",
       "reason": "Reads and writes the real system pasteboard; tests inject a stub."
-    },
-    {
-      "path": "src/browser/launch.rs",
-      "reason": "Spawns a managed Chromium; the live CDP suite starts its own browser. Remove this entry when a live test drives `browser launch`."
     },
     {
       "path": "src/test_backend.rs",

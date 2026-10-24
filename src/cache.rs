@@ -653,6 +653,158 @@ mod tests {
         let _ = fs::remove_dir_all(cache.dir());
     }
 
+    #[test]
+    fn missing_empty_and_non_snapshot_files_are_skipped() {
+        let cache = CacheEnv::acquire();
+        let session = Some("skips");
+        assert!(load(session, Some("com.apple.Notes"), 1, 2)
+            .unwrap()
+            .is_none());
+
+        let dir = session_dir(session).unwrap();
+        fs::write(dir.join("notes.txt"), "x").unwrap();
+        fs::write(dir.join(SCREENSHOT_MAP_FILE), "{}").unwrap();
+        fs::write(dir.join(OWNER_FILE), "{}").unwrap();
+        assert!(pending_restores(session).unwrap().is_empty());
+        clear_restores(session, &[1]).unwrap();
+
+        let empty = dir.join("empty.json");
+        fs::write(&empty, "   ").unwrap();
+        assert!(read_snapshot(&empty).unwrap().is_none());
+        assert!(!is_snapshot_file(&dir.join("notes.txt")));
+        assert!(!is_snapshot_file(&dir.join(SCREENSHOT_MAP_FILE)));
+        assert!(!is_snapshot_file(&dir.join(OWNER_FILE)));
+        assert!(is_snapshot_file(&empty));
+
+        let corrupt = dir.join("corrupt.json");
+        fs::write(&corrupt, "not json").unwrap();
+        assert!(read_snapshot(&corrupt)
+            .unwrap_err()
+            .to_string()
+            .contains("not readable"));
+        let _ = fs::remove_dir_all(cache.dir());
+    }
+
+    #[test]
+    fn store_keeps_the_previous_electron_edit() {
+        let cache = CacheEnv::acquire();
+        let session = Some("electron-keep");
+        let mut first = sample(5, 6, "Notes");
+        first.electron = Some(crate::tree::electron_enable(crate::tree::FlagState {
+            manual: Some(true),
+            enhanced: None,
+        }));
+        store(session, &first).unwrap();
+        let mut second = sample(5, 6, "Notes");
+        second.electron = None;
+        store(session, &second).unwrap();
+        let loaded = load(session, Some("com.apple.Notes"), 5, 6)
+            .unwrap()
+            .expect("snapshot");
+        assert!(loaded.electron.is_some());
+        let _ = fs::remove_dir_all(cache.dir());
+    }
+
+    #[test]
+    fn pending_restores_dedupes_by_pid() {
+        let cache = CacheEnv::acquire();
+        let session = Some("pending");
+        let mut first = sample(9, 1, "One");
+        first.electron = Some(crate::tree::electron_enable(crate::tree::FlagState {
+            manual: Some(false),
+            enhanced: Some(true),
+        }));
+        let mut second = sample(9, 2, "Two");
+        second.electron = first.electron.clone();
+        store(session, &first).unwrap();
+        store(session, &second).unwrap();
+        let pending = pending_restores(session).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, 9);
+        let _ = fs::remove_dir_all(cache.dir());
+    }
+
+    #[test]
+    fn prune_options_and_owner_pid_fallbacks() {
+        let options = PruneOptions::default();
+        assert!(!options.dry_run);
+        assert_eq!(options.ttl, DEFAULT_SESSION_TTL);
+
+        let cache = CacheEnv::acquire();
+        let dir = sessions_root().join("456");
+        fs::create_dir_all(&dir).unwrap();
+        assert_eq!(owner_pid(&dir, "456"), Some(456));
+        assert_eq!(owner_pid(&dir, "not-a-pid"), None);
+        let now = SystemTime::now();
+        assert!(session_age(&dir, now) <= now.duration_since(UNIX_EPOCH).unwrap());
+        assert_eq!(
+            session_age(Path::new("/definitely/missing"), now),
+            Duration::MAX
+        );
+        let _ = fs::remove_dir_all(cache.dir());
+    }
+
+    #[test]
+    fn prune_sessions_keeps_live_owners_and_drops_dead_ones() {
+        let cache = CacheEnv::acquire();
+        let root = sessions_root();
+        let dead = root.join("dead");
+        fs::create_dir_all(&dead).unwrap();
+        fs::write(dead.join("snapshot.json"), "{}").unwrap();
+        let owner = SessionOwner {
+            pid: 999_999,
+            created_unix_ms: 1,
+        };
+        fs::write(
+            dead.join(OWNER_FILE),
+            serde_json::to_string(&owner).unwrap(),
+        )
+        .unwrap();
+
+        let live = root.join("live");
+        fs::create_dir_all(&live).unwrap();
+        fs::write(live.join("snapshot.json"), "{}").unwrap();
+        let owner = SessionOwner {
+            pid: std::process::id(),
+            created_unix_ms: 1,
+        };
+        fs::write(
+            live.join(OWNER_FILE),
+            serde_json::to_string(&owner).unwrap(),
+        )
+        .unwrap();
+
+        let fresh = root.join("fresh");
+        fs::create_dir_all(&fresh).unwrap();
+        fs::write(fresh.join("snapshot.json"), "{}").unwrap();
+        fs::write(root.join("loose"), "x").unwrap();
+
+        let report = prune_sessions(
+            &root,
+            &PruneOptions {
+                dry_run: false,
+                ttl: Duration::from_secs(3600),
+                now: SystemTime::now(),
+            },
+            &|pid| pid == std::process::id(),
+        )
+        .unwrap();
+        assert!(report.removed.contains(&"dead".to_string()), "{report:?}");
+        assert!(report.kept.contains(&"live".to_string()), "{report:?}");
+        assert!(!dead.exists());
+        assert!(live.exists());
+        assert!(fresh.exists());
+        let _ = fs::remove_dir_all(cache.dir());
+    }
+
+    #[test]
+    fn sanitize_token_replaces_and_trims() {
+        assert_eq!(sanitize_token("a b/c"), Some("a_b_c".into()));
+        assert_eq!(sanitize_token("___"), None);
+        assert_eq!(sanitize_token(""), None);
+        assert_eq!(sanitize_token("ok.name-1_2"), Some("ok.name-1_2".into()));
+    }
+
     fn sample(pid: i32, window: u32, value: &str) -> Snapshot {
         Snapshot {
             revision: 7,
@@ -679,7 +831,9 @@ mod tests {
 
     #[test]
     fn round_trip_under_xdg_cache_home() {
-        let _guard = CACHE_ENV_LOCK.lock().unwrap();
+        let _guard = CACHE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "computer-use-cache-{}-{}",
             std::process::id(),

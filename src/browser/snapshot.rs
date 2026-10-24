@@ -585,6 +585,76 @@ mod tests {
     }
 
     #[test]
+    fn value_text_covers_every_json_shape() {
+        fn ax(value: serde_json::Value) -> AxValue {
+            serde_json::from_value(serde_json::json!({"type": "string", "value": value}))
+                .expect("AxValue")
+        }
+        assert_eq!(
+            value_text(&ax(serde_json::json!("  hi "))),
+            Some("hi".into())
+        );
+        assert_eq!(value_text(&ax(serde_json::json!("   "))), None);
+        assert_eq!(
+            value_text(&ax(serde_json::json!(true))),
+            Some("true".into())
+        );
+        assert_eq!(value_text(&ax(serde_json::json!(4))), Some("4".into()));
+        assert_eq!(value_text(&ax(serde_json::Value::Null)), None);
+        assert_eq!(value_text(&ax(serde_json::json!([1]))), Some("[1]".into()));
+    }
+
+    #[test]
+    fn render_text_and_diff_cover_truncation_and_changes() {
+        let mut changed = node(1, "button", "Send");
+        changed.disabled = true;
+        changed.checked = Some(false);
+        changed.focused = true;
+        changed.url = Some("https://example.com/".into());
+        changed.value = Some("v\"q".into());
+        changed.depth = 20;
+        let text = render_text("u", "t", "complete", &[changed.clone()], true);
+        assert!(text.contains("… truncated"), "{text}");
+        assert!(text.contains("disabled"), "{text}");
+        assert!(text.contains("unchecked"), "{text}");
+        assert!(text.contains("focused"), "{text}");
+        assert!(text.contains("url=\"https://example.com/\""), "{text}");
+        assert!(text.contains("value=\"v'q\""), "{text}");
+
+        let baseline = BrowserSnapshot {
+            target_id: "t".into(),
+            url: String::new(),
+            title: String::new(),
+            ready_state: String::new(),
+            captured_unix_ms: 0,
+            nodes: vec![node(1, "button", "Save")],
+            text: String::new(),
+            truncated: false,
+        };
+        let mut current = baseline.clone();
+        current.nodes = vec![changed];
+        current.truncated = true;
+        let diff = render_diff(&current, &baseline);
+        assert!(
+            diff.contains("~ ") && diff.contains("\"Save\"") && diff.contains("\"Send\""),
+            "{diff}"
+        );
+        assert!(diff.contains("… truncated"), "{diff}");
+    }
+
+    #[test]
+    fn cache_path_sanitizes_the_target_id() {
+        let cache = crate::cache::CacheEnv::acquire();
+        let path = cache_path(Some("s"), "a/b c").unwrap();
+        assert!(path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with("browser-a_b_c.json"));
+        let _ = std::fs::remove_dir_all(cache.dir());
+    }
+
+    #[test]
     fn refs_are_found_by_name() {
         let snapshot = BrowserSnapshot {
             target_id: "t".into(),

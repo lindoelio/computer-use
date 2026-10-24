@@ -1070,6 +1070,76 @@ mod tests {
     }
 
     #[test]
+    fn selector_and_label_helpers_cover_edges() {
+        assert!(parse_window_selector("   ").is_err());
+        assert!(parse_u32("x", "window id").is_err());
+        assert_eq!(parse_u32("12", "window id").unwrap(), 12);
+        assert_eq!(selector_label(&AppSelector::Pid(3)), "3");
+        assert_eq!(selector_label(&AppSelector::BundleId("a.b".into())), "a.b");
+        assert_eq!(selector_label(&AppSelector::Name("Notes".into())), "Notes");
+        assert_eq!(
+            selector_label(&AppSelector::Path(PathBuf::from("/x"))),
+            "/x"
+        );
+        assert_eq!(window_label(&WindowSelector::Index(2)), "2");
+        assert_eq!(window_label(&WindowSelector::Id(7)), "id:7");
+        assert_eq!(window_label(&WindowSelector::Title("Win".into())), "Win");
+    }
+
+    #[test]
+    fn system_apps_kinds_and_path_matching() {
+        let prohibited = AppInfo {
+            name: "hidden".into(),
+            bundle_id: None,
+            pid: 1,
+            path: None,
+            active: false,
+            hidden: true,
+            activation_policy: ActivationPolicy::Prohibited,
+        };
+        assert!(is_system_app(&prohibited));
+        assert_eq!(app_kind(&prohibited), "system");
+
+        let named = AppInfo {
+            name: "Dock".into(),
+            ..prohibited.clone()
+        };
+        assert!(is_system_app(&named));
+
+        let unknown = AppInfo {
+            activation_policy: ActivationPolicy::Unknown,
+            ..prohibited.clone()
+        };
+        assert_eq!(app_kind(&unknown), "unknown");
+        let accessory = AppInfo {
+            activation_policy: ActivationPolicy::Accessory,
+            ..prohibited.clone()
+        };
+        assert_eq!(app_kind(&accessory), "accessory");
+
+        assert!(app_matches(
+            &AppInfo {
+                name: "Notes".into(),
+                path: Some("/Applications/Notes.app/Contents/MacOS/Notes".into()),
+                ..prohibited.clone()
+            },
+            &AppSelector::Path(PathBuf::from(
+                "/Applications/Notes.app/Contents/MacOS/Notes"
+            ))
+        ));
+        assert!(!paths_match(None, Path::new("/x")));
+        assert!(paths_match(Some("/x"), Path::new("/x")));
+        assert!(!path_names_app(None, "Notes"));
+    }
+
+    #[test]
+    fn expand_tilde_leaves_non_tilde_text_alone() {
+        assert_eq!(expand_tilde("/abs/path"), "/abs/path");
+        assert_eq!(expand_tilde("~user/x"), "~user/x");
+        assert_eq!(expand_tilde("relative"), "relative");
+    }
+
+    #[test]
     fn pending_doctor_names_the_phase() {
         let report = DoctorReport::pending("P13");
         assert!(report.accessibility.is_none());
