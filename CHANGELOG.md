@@ -68,6 +68,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- The coverage gate read paths with the platform separator, so on Windows
+  every file looked like it was outside `src/` and the gate reported "no
+  measurable lines in the report". The relative path is now compared in
+  POSIX form, and the CI fixture proves it with a second source file.
 - `browser launch` could not start Chrome on Linux when the sandbox was
   unavailable (a root shell or a container that denies user namespaces): the
   browser exited before it wrote `DevToolsActivePort`. It now starts with

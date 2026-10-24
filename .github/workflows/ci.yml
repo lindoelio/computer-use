@@ -131,10 +131,11 @@ jobs:
             {"filename": str(root / "src" / "lib.rs"), "summary": {"lines": {"count": 4, "covered": 4, "percent": 100.0}}},
             {"filename": str(root / "target" / "debug" / "generated.rs"), "summary": {"lines": {"count": 100, "covered": 0, "percent": 0.0}}},
             {"filename": "/opt/cargo/registry/src/dep-1.0/src/dep.rs", "summary": {"lines": {"count": 100, "covered": 0, "percent": 0.0}}},
+            {"filename": str(root / "src" / "windows.rs"), "summary": {"lines": {"count": 2, "covered": 2, "percent": 100.0}}},
           ]; Path("cov-fixture.json").write_text(json.dumps({"data": [{"files": files, "totals": {}}]}))'
           out=$(python3 scripts/coverage-gate.py cov-fixture.json --mode report)
           printf '%s\n' "${out}"
-          printf '%s\n' "${out}" | grep -q "4/4 = 100.00%"
+          printf '%s\n' "${out}" | grep -q "6/6 = 100.00%"
           printf '%s\n' "${out}" | grep -q "ignored (not the codebase under test"
           printf '%s\n' "${out}" | grep -q "target/debug/generated.rs"
           printf '%s\n' "${out}" | grep -q "outside the measured roots"

@@ -56,9 +56,11 @@ def repo_relative(filename: str, root: Path) -> str | None:
     never be folded into the total under a bare file name.
     """
     try:
-        return str(Path(filename).resolve().relative_to(root.resolve()))
+        relative = Path(filename).resolve().relative_to(root.resolve())
     except ValueError:
         return None
+    # Windows spells the separator `\`; the roots are written POSIX-style.
+    return relative.as_posix()
 
 
 def main() -> int:

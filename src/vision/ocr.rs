@@ -902,11 +902,12 @@ mod tests {
             image.put_pixel(x as u32, y as u32, color);
         }
 
-        // Build a 400x120 white image and render `HELLO` in black at scale 8x,
-        // so the glyphs are large enough for any Vision version to read.
-        let mut image = RgbaImage::from_pixel(400, 120, Rgba([255, 255, 255, 255]));
+        // Build a 200x60 white image and render `HELLO` in black at scale 4x.
+        // Vision detects text at this size on every macOS version; a larger
+        // one made the runner find no text at all.
+        let mut image = RgbaImage::from_pixel(200, 60, Rgba([255, 255, 255, 255]));
         let ink = Rgba([0, 0, 0, 255]);
-        let scale = 8_u32;
+        let scale = 4_u32;
         let text = "HELLO";
         let origin_x: i32 = 10;
         let origin_y: i32 = 10;
